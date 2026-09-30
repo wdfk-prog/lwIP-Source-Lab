@@ -1,0 +1,15 @@
+# Local build output. It can always be regenerated from the current lwIP submodule.
+/build/
+
+# VS Code C/C++ index cache.
+/.vscode/ipch/
+
+# Local logs produced while experimenting.
+*.log
+
+# Generated GitHub Pages / MkDocs output.
+/site/
+/.venv-docs/
+
+# Local packet captures produced by Stage 2.
+/captures/

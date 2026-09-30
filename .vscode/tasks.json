@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "common: check env",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/check-env.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "common: bootstrap repository",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/bootstrap-repository.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "common: sync upstream master",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/sync-upstream.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "common: configure Debug",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/configure-debug.sh",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "common: build example",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build.sh",
+      "args": ["example"],
+      "problemMatcher": "$gcc",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      }
+    },
+    {
+      "label": "common: build unit",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build.sh",
+      "args": ["unit"],
+      "problemMatcher": "$gcc",
+      "group": "build"
+    }
+  ]
+}

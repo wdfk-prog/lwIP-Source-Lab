@@ -1,0 +1,28 @@
+{
+  // Use the example_app compile database as the default source-index database.
+  // It covers lwIP core plus the Unix port used by the main learning path.
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/example/compile_commands.json",
+
+  // Point CMake Tools at the upstream submodule, but do not auto-configure on
+  // open. The repository scripts add compatibility checks before CMake runs.
+  "cmake.sourceDirectory": "${workspaceFolder}/upstream/lwip",
+  "cmake.buildDirectory": "${workspaceFolder}/build/example",
+  "cmake.configureOnOpen": false,
+  "cmake.configureArgs": [
+    "-DCMAKE_BUILD_TYPE=Debug",
+    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+  ],
+
+  // The project intentionally contains a nested Git repository (the lwIP
+  // submodule). Ask VS Code to discover it so branch/history are visible in
+  // Source Control instead of only showing the parent repository.
+  "git.autoRepositoryDetection": "subFolders",
+  "git.repositoryScanMaxDepth": 3,
+  "git.detectSubmodules": true,
+
+  "editor.insertSpaces": true,
+  "editor.tabSize": 2,
+  "files.associations": {
+    "*.h": "c"
+  }
+}

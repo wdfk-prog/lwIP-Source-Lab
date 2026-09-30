@@ -1,0 +1,37 @@
+site_name: lwIP Source Lab
+site_description: 基于 Linux Host 的 lwIP master 源码阅读、协议实验、抓包与 GDB 调试学习环境
+repo_url: https://github.com/wdfk-prog/lwIP-Source-Lab
+repo_name: wdfk-prog/lwIP-Source-Lab
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+
+nav:
+  - 首页: index.md
+  - 教程系列索引: 00-series-index.md
+  - Stage 1：Linux Host 实验环境: 01-linux-lwip-lab.md
+  - Stage 2：从 main() 到第一次 Ping: 02-netif-tap-first-ping.md
+  - Stage 3：pbuf: 03-pbuf.md
+  - Stage 4：Ethernet / ARP / IPv4 / ICMP: 04-ethernet-arp-ipv4-icmp.md
+  - Stage 5：UDP Raw API: 05-udp-raw-api.md
+  - Stage 6：Netconn 与 Socket: 06-netconn-and-socket-api.md
+  - Stage 7：TCP 三次握手: 07-tcp-handshake.md
+  - Stage 8：TCP 数据面: 08-tcp-data-path.md
+  - Stage 9：TCP 重传: 09-tcp-retransmission.md
+  - Stage 10：TCP 乱序与 SACK: 10-tcp-out-of-order.md
+  - Stage 11：sys_arch 与线程模型: 11-sys-arch.md
+  - Stage 12：内存体系: 12-mem-memp-pbuf.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences

@@ -1,0 +1,41 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "lwIP: unit tests (GDB)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/unit-tests/lwip_unittests",
+      "cwd": "${workspaceFolder}/build/unit-tests",
+      "MIMode": "gdb",
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "preLaunchTask": "common: build unit",
+      "setupCommands": [
+        {
+          "description": "Enable GDB pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "lwIP: example_app (GDB)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/example/contrib/ports/unix/example_app/example_app",
+      "cwd": "${workspaceFolder}/build/example/contrib/ports/unix/example_app",
+      "MIMode": "gdb",
+      "stopAtEntry": true,
+      "externalConsole": false,
+      "preLaunchTask": "common: build example",
+      "setupCommands": [
+        {
+          "description": "Enable GDB pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ]
+}

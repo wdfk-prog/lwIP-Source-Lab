@@ -1,0 +1,4 @@
+[submodule "upstream/lwip"]
+	path = upstream/lwip
+	url = https://github.com/lwip-tcpip/lwip.git
+	branch = master

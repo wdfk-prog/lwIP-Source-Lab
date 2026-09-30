@@ -1,0 +1,8 @@
+{
+  // C/C++ uses compile_commands.json for F12/IntelliSense.
+  // CMake Tools is useful for inspecting the two generated build trees.
+  "recommendations": [
+    "ms-vscode.cpptools",
+    "ms-vscode.cmake-tools"
+  ]
+}
