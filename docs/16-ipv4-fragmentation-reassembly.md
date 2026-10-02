@@ -6,7 +6,7 @@
 
 [TOC]
 
-Stage 4 已经建立 IPv4 的基本收发路径，Stage 12 又补齐了 `pbuf` / `memp` 的资源模型。现在进入协议栈的边界行为：一个原本完整的 IPv4 datagram 在 **输出接口 MTU 装不下** 时怎样被拆开，另一端又怎样把乱序 fragments 恢复成完整 packet。
+Stage 4 已经建立 IPv4 的基本收发路径，Stage 12 又补齐了 `pbuf` / `memp` 的资源模型。现在进入协议栈的边界行为：一个原本完整的 IPv4 datagram 在 **输出接口 MTU 装不下** 时怎样被拆开，另一端又怎样把 fragments 恢复成完整 packet。
 
 本篇只保留这一条主线：
 
@@ -809,39 +809,212 @@ IP_REASS_MAX_PBUFS
 
 这就是为什么 `MEMP_NUM_REASSDATA`、`IP_REASS_MAX_PBUFS`、`PBUF_POOL_SIZE` 必须一起看，而不能只调一个“最大分片数”。
 
-## 22. Host 上一次大 ping 可以同时暴露 RX reassembly 与 TX fragmentation
+## 22. Host 实测：先启动 `198.18.0.200`，再用大 Ping 同时观察 RX reassembly 与 TX fragmentation
 
-当前实验网络仍沿用 Stage 2：
+当前实验网络继续使用 Stage 2 的固定地址：[S8](#source-s8)
 
 ```text
 Linux Host : 198.18.0.1/24
 TAP        : lwip0
 lwIP       : 198.18.0.200/24
+MTU        : 1500
 ```
 
-以下是手工实验入口，本轮没有实际执行，不声称已得到对应运行结果。
+这里最重要的前置条件是：`198.18.0.200` 不是 Linux Host 自己的地址，而是正在运行的 lwIP `example_app` 绑定 `lwip0` 后提供的地址。必须先把 TAP、静态 IPv4 和 `example_app` 启起来，再执行大 Ping；否则 Host 即使把请求分片发到 `lwip0`，另一端也没有 lwIP 实例接收。[S8](#source-s8)
 
-先抓 IPv4 fragments：
+### 22.1 准备 `lwip0` 与 Host 地址
+
+如果 Stage 2 的 TAP 已经存在且地址仍有效，可以直接检查；否则重新创建：
 
 ```sh
-sudo tcpdump -i lwip0 -nn -vv 'ip[6:2] & 0x3fff != 0'
+sudo ip tuntap add dev lwip0 mode tap user "$USER"
+sudo ip addr add 198.18.0.1/24 dev lwip0
+sudo ip link set lwip0 up
 ```
 
-再发送大 Echo Request：
+确认接口、地址、MTU 与路由：
 
 ```sh
-ping -I lwip0 -M dont -s 4000 -c 1 198.18.0.200
+ip -d link show lwip0
+ip -4 addr show lwip0
+ip route get 198.18.0.200
 ```
 
-若 Host 侧将请求拆成 fragments，lwIP 接收路径是：
+实验要求 `lwip0` 的 MTU 为 1500。若不是 1500，执行：
+
+```sh
+sudo ip link set dev lwip0 mtu 1500
+```
+
+`ip route get 198.18.0.200` 应确认目标从 `lwip0` 发送，源地址为 `198.18.0.1`：
 
 ```text
-TAP RX
-→ ip4_input()
-→ ip4_reass()
-→ 完整 ICMP Echo Request
-→ icmp_input()
+198.18.0.200 dev lwip0 src 198.18.0.1
 ```
+
+### 22.2 配置并启动 lwIP `example_app`
+
+先从当前 upstream 模板刷新 Debug build tree：[S8](#source-s8)
+
+```sh
+scripts/configure-debug.sh
+```
+
+随后给 `example_app` 追加固定 IPv4 配置：
+
+```sh
+cat >> upstream/lwip/contrib/examples/example_app/lwipcfg.h <<'STAGE16_CFG'
+
+/* Source Lab: Stage 16 deterministic TAP network. */
+#undef USE_DHCP
+#define USE_DHCP 0
+#undef USE_AUTOIP
+#define USE_AUTOIP 0
+
+#undef LWIP_PORT_INIT_IPADDR
+#define LWIP_PORT_INIT_IPADDR(addr)  IP4_ADDR((addr), 198,18,0,200)
+#undef LWIP_PORT_INIT_GW
+#define LWIP_PORT_INIT_GW(addr)      IP4_ADDR((addr), 198,18,0,1)
+#undef LWIP_PORT_INIT_NETMASK
+#define LWIP_PORT_INIT_NETMASK(addr) IP4_ADDR((addr), 255,255,255,0)
+STAGE16_CFG
+```
+
+直接 build，不要再次运行 `configure-debug.sh`，因为该脚本会重新用 upstream 模板刷新 `lwipcfg.h`：[S8](#source-s8)
+
+```sh
+scripts/build.sh example
+```
+
+终端 A 启动 lwIP：
+
+```sh
+PRECONFIGURED_TAPIF=lwip0 \
+  ./build/example/contrib/ports/unix/example_app/example_app
+```
+
+本轮实际运行输出为：
+
+```text
+Starting lwIP, local interface IP is 198.18.0.200
+ip6 linklocal address: FE80::12:34FF:FE56:78AB
+status_callback==UP, local interface IP is 198.18.0.200
+status_callback==UP, local interface IP is 198.18.0.200
+```
+
+到这里才能确认 `198.18.0.200` 已经由运行中的 lwIP 实例接管。先用普通 Ping 验证基础链路也可以，但进入本节的 fragmentation 实验前，至少必须保持终端 A 中的 `example_app` 持续运行。
+
+### 22.3 用 `tcpdump` 保存 PCAP，而不是只在终端观察
+
+创建抓包目录：
+
+```sh
+mkdir -p captures
+```
+
+终端 B 保存 IPv4 fragments：
+
+```sh
+sudo tcpdump \
+  -i lwip0 \
+  -nn \
+  -s 0 \
+  -U \
+  -w captures/stage16-ipv4-fragmentation.pcap \
+  'ip[6:2] & 0x3fff != 0'
+```
+
+这个 BPF 只保留 IPv4 fragmentation 相关 packet：MF 为 1 的 fragment，或者 Fragment Offset 非 0 的 fragment。ARP 等非 fragment frame 不进入这个 PCAP，因此文件可以直接用于观察本篇关注的字段。
+
+终端 C 产生一个 4000-byte ICMP payload：
+
+```sh
+ping -4 -I lwip0 -M dont -s 4000 -c 1 198.18.0.200
+```
+
+`-s 4000` 指定的是 ICMP data 长度；再加 8-byte ICMP Header 和 20-byte IPv4 Header，原始 IPv4 datagram 总长度为 4028 bytes。`-M dont` 不设置 DF，因而在当前 1500-byte MTU 下允许 Linux 对这个 IPv4 datagram 做本地 fragmentation。[S9](#source-s9)
+
+本轮命令行实测成功返回 Echo Reply：
+
+```text
+PING 198.18.0.200 (198.18.0.200) from 198.18.0.1 lwip0: 4000(4028) bytes of data.
+4008 bytes from 198.18.0.200: icmp_seq=1 ttl=255 time=0.241 ms
+
+--- 198.18.0.200 ping statistics ---
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+```
+
+Ping 成功后停止终端 B 的 `tcpdump`。仓库保留本轮用于分析的真实抓包：[`assets/stage16-ipv4-fragmentation.pcap`](assets/stage16-ipv4-fragmentation.pcap)。[S7](#source-s7)
+
+### 22.4 用 Wireshark 看 6 个真实 fragments
+
+打开抓包：
+
+```sh
+wireshark captures/stage16-ipv4-fragmentation.pcap
+```
+
+可使用显示过滤器：
+
+```text
+ip.flags.mf == 1 || ip.frag_offset > 0
+```
+
+上传 PCAP 中共有 6 个 IPv4 fragment：3 个 Echo Request fragments 从 Host 进入 lwIP，3 个 Echo Reply fragments 从 lwIP 返回 Host。[S7](#source-s7)
+
+| Frame | 方向 | IPv4 Total Length | IP payload | Identification | MF | 原始 Offset 字段 | Payload byte offset | TTL |
+| ---: | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | `198.18.0.1 → 198.18.0.200` | 1500 | 1480 | `0x1fa8` (8104) | 1 | 0 | 0 | 64 |
+| 2 | `198.18.0.1 → 198.18.0.200` | 1500 | 1480 | `0x1fa8` (8104) | 1 | 185 | 1480 | 64 |
+| 3 | `198.18.0.1 → 198.18.0.200` | 1068 | 1048 | `0x1fa8` (8104) | 0 | 370 | 2960 | 64 |
+| 4 | `198.18.0.200 → 198.18.0.1` | 1500 | 1480 | `0x1fa8` (8104) | 1 | 0 | 0 | 255 |
+| 5 | `198.18.0.200 → 198.18.0.1` | 1500 | 1480 | `0x1fa8` (8104) | 1 | 185 | 1480 | 255 |
+| 6 | `198.18.0.200 → 198.18.0.1` | 1068 | 1048 | `0x1fa8` (8104) | 0 | 370 | 2960 | 255 |
+
+IPv4 Fragment Offset 在 Header 中以 8 bytes 为单位，所以 PCAP 中原始字段 `185` 和 `370` 分别对应：[S4](#source-s4)[S7](#source-s7)
+
+```text
+185 × 8 = 1480 bytes
+370 × 8 = 2960 bytes
+```
+
+每个方向的 payload range 因而恰好连续：
+
+```text
+Fragment 1: [   0, 1480)
+Fragment 2: [1480, 2960)
+Fragment 3: [2960, 4008)
+```
+
+总共恢复出 4008-byte IP payload，也就是：
+
+```text
+8-byte ICMP Header + 4000-byte ping data = 4008 bytes
+```
+
+再加 20-byte IPv4 Header，就是 `ping` 输出中的 4028-byte IPv4 datagram。
+
+前三片的 Identification 都是 `0x1fa8`，且前两片 `MF=1`、最后一片 `MF=0`，因此它们构成一个完整 Echo Request datagram。后三片也具有相同的 Identification、offset 分布和 MF 终止关系，构成 Echo Reply datagram。[S4](#source-s4)[S7](#source-s7)
+
+第一片还能够解析出完整 ICMP Header：Request 是 Type 8、Sequence 1；Reply 是 Type 0、Sequence 1。后续 fragments 从 ICMP payload 中部开始，因此抓包工具通常只把第一片显示成完整 ICMP Echo Request/Reply，后续片主要显示为 IPv4 fragment。
+
+### 22.5 这 6 帧怎样对应本篇两条源码主线
+
+Host 发出的前三片进入 lwIP：
+
+```text
+lwip0 / TAP RX
+    ↓
+ip4_input()
+    ↓ 发现 MF / Fragment Offset
+ip4_reass()
+    ↓ 三片齐全
+完整 4028-byte IPv4 datagram
+    ↓
+icmp_input()
+```
+
+这正好实测了 RX reassembly。`ip4_reass()` 在 fragments 未齐时持续返回 `NULL`；第三片补齐 `[2960, 4008)` 后，完整 datagram 才重新回到 `ip4_input()` 的正常 L4 分发路径。[S1](#source-s1)[S7](#source-s7)
 
 `icmp_input()` 生成 Echo Reply 时复用该 packet，并调用：[S1](#source-s1)
 
@@ -850,17 +1023,33 @@ ret = ip4_output_if(p, src, LWIP_IP_HDRINCL,
                     ICMP_TTL, 0, IP_PROTO_ICMP, inp);
 ```
 
-若完整 Reply 仍大于 `netif->mtu`：
+完整 Reply 仍是 4028 bytes，大于 `lwip0` / `netif->mtu=1500`，因此 TX 路径进入：
 
 ```text
 ip4_output_if()
-→ ip4_frag()
-→ 多个 Echo Reply fragments
+    ↓ p->tot_len > netif->mtu
+ip4_frag()
+    ↓
+1500 + 1500 + 1068
+    ↓
+Host reassembly
 ```
 
-因此一次大 Echo 可以同时观察本篇两条源码主线。
+PCAP 后三片就是这条 `ip4_frag()` 路径的真实输出。[S1](#source-s1)[S7](#source-s7)
 
-抓包时重点核对：Identification 是否相同、MF 是否只在非末片为 1、Fragment Offset 是否按 8-byte 单位递增、每片 Total Length 是否等于当前 fragment 自己的长度。
+因此，这一次大 Ping 不再只是“可能同时观察两条源码主线”，而是已经形成完整的双向证据闭环：
+
+```text
+Linux fragmentation
+    ↓
+lwIP ip4_reass()
+    ↓
+ICMP Echo Reply
+    ↓
+lwIP ip4_frag()
+    ↓
+Linux reassembly
+```
 
 ## 23. DF 与 PMTU 属于下一层问题：当前只建立边界
 
@@ -918,7 +1107,7 @@ flowchart TD
 2. **重组发生在 L4 分发之前；ICMP/UDP/TCP 正常看到的是恢复后的完整 IPv4 datagram。**
 3. **reassembly 是有状态、有 timer、有 pbuf/memp 上限的机制，不是简单 memcpy 回一个大数组。**
 
-下一阶段如果继续沿边界行为展开，最自然的是 IPv6 Path MTU / Fragment Header：IPv6 Router 不再像 IPv4 Router 一样沿路分片，fragmentation ownership 会发生明显变化。
+下一阶段回到 IPv4 主线，进入 IGMP / IPv4 multicast：从“一个 datagram 怎样因 MTU 被拆开”切换到“一个 multicast packet 应该交给哪些接收者”。IPv6 的 PMTU / Fragment Header 已在 Stage 15 总览中保留概念边界，需要时再按源码模块深入。
 
 ## 资料来源
 
@@ -966,3 +1155,26 @@ flowchart TD
 - URL/文档：[RFC 1191](https://www.rfc-editor.org/rfc/rfc1191.html)
 - 使用位置：DF 与 PMTU Discovery 的边界说明
 - 支撑内容：DF、ICMP Fragmentation Needed 与 IPv4 Path MTU Discovery 的边界
+
+<a id="source-s7"></a>
+### [S7] Stage 16 真实 IPv4 fragmentation PCAP
+- 类型：用户提供的 Host/TAP 实验抓包
+- 文件：[`assets/stage16-ipv4-fragmentation.pcap`](assets/stage16-ipv4-fragmentation.pcap)
+- 实验网络：Host `198.18.0.1/24`，lwIP `198.18.0.200/24`，TAP `lwip0`，MTU 1500
+- 使用位置：“Host 实测”“Wireshark 6 帧分析”“RX reassembly / TX fragmentation 证据闭环”
+- 支撑内容：双向各 3 个 fragment；Total Length `1500/1500/1068`；Identification `0x1fa8`；raw offset `0/185/370`；Request TTL 64、Reply TTL 255
+
+<a id="source-s8"></a>
+### [S8] Source Lab Stage 2 Host/TAP 启动流程
+- 类型：当前仓库文档与脚本
+- 定位：`docs/02-netif-tap-first-ping.md`、`scripts/configure-debug.sh`、`scripts/build.sh`
+- 使用位置：“准备 lwip0”“配置并启动 example_app”
+- 支撑内容：`198.18.0.1/24 ↔ 198.18.0.200/24` 实验网络、`lwipcfg.h` override 顺序、`PRECONFIGURED_TAPIF=lwip0` 启动入口，以及 configure 后不得再次覆盖 stage-specific 配置的构建契约
+
+<a id="source-s9"></a>
+### [S9] Linux `ping(8)` 的 `-M` / `-s` 语义
+- 类型：Linux / iputils manual
+- URL/文档：[ping(8) — Linux manual page](https://man7.org/linux/man-pages/man8/ping.8.html)
+- 使用位置：“产生 4000-byte ICMP payload”
+- 支撑内容：`-s` 指定 data bytes；`-M dont` 不设置 DF，从而允许本实验在 MTU 1500 路径上产生 IPv4 fragmentation
+

@@ -13,3 +13,10 @@
 - 关键源码结论使用可追溯 Source Map，并链接到固定 upstream commit。
 
 从 [教程系列索引](00-series-index.md) 开始。
+
+## 参考资料
+
+以下资料随文档站一并发布，可直接点击打开 PDF：
+
+- [《以太网工作原理》](other/以太网工作原理.pdf)
+- [《支持 RGMII 和 IEEE 1588v2 的千兆以太网收发器》](other/支持%20RGMII%20和IEEE%201588v2%20的千兆以太网收发器.pdf)
