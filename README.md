@@ -169,6 +169,8 @@ scripts/build.sh all
 | 37 | [从 `httpc_get_file_dns()` 到 Body Callback——HTTP/HTTPS Client、DNS、altcp 与下载数据通路](docs/37-http-https-client.md) | 从 HTTP client 公共入口追踪 DNS、altcp/TCP、GET、Header/Body callback，并用 TLS allocator 把同一条 httpc 主线切换成 HTTPS，建立 REST/配置拉取/OTA 下载的网络侧基础。 |
 | 38 | [从 `lwipopts.h` 到 Port Contract——lwIP 裁剪、构建选择、OS Port 与 Network Port](docs/38-lwip-porting-and-configuration.md) | 从产品能力反推 lwIP feature/resource 配置与源码选择，建立 `lwipopts.h`、`NO_SYS`、`sys_arch`、`netif` 和 Driver 之间的通用移植契约。 |
 | 39 | [从 `lwip_system_init()` 到 `tcpip_input()`——RT-Thread 如何把 lwIP 接进 RTOS 与 Ethernet Device](docs/39-rtthread-lwip-port.md) | 从 RT-Thread 初始化入口追踪 Kconfig/lwipopts、sys_arch、eth_device、erx/etx 与 `tcpip_input()`，把 Stage 38 的 Port Contract 落到真实 RTOS。 |
+| 40 | [从 `socket()` 到 `lwip_socket()`——DFS fd、SAL Socket 与 lwIP Backend](docs/40-rtthread-socket-sal-lwip.md) | 从 BSD Socket 入口追踪 DFS fd、SAL socket、NetDev/backend 选择与 `lwip_socket()`，解释 RT-Thread 怎样把 POSIX 文件描述符语义接到 lwIP Socket/Netconn。 |
+| 41 | [从 NetDev 注册到 `socket_init()`——Default NetDev、Protocol Family 与 lwIP / AT Backend 选择](docs/41-rtthread-netdev-multi-backend.md) | 从 lwIP/AT NetDev 注册追踪 `sal_user_data`、default NetDev、primary/secondary family 匹配与 socket backend 绑定，解释同一 BSD API 如何落到不同网络实现。 |
 
 完整索引见 [docs/00-series-index.md](docs/00-series-index.md)。
 
@@ -191,7 +193,7 @@ Gateway    : 198.18.0.1
 lwIP-Source-Lab/
 ├── .github/workflows/        # CI 与文档 Pages
 ├── .vscode/                  # 仅保留通用 build/debug 入口
-├── docs/                     # Stage 00～39 教程
+├── docs/                     # Stage 00～41 教程
 ├── scripts/                  # 5 个通用脚本 + README
 ├── upstream/
 │   └── lwip/                 # 官方 lwIP submodule

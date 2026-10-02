@@ -4,7 +4,7 @@
 
 Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
 
-## Stage 00～39
+## Stage 00～41
 
 0. [Stage 00：从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](00-ethernet-physical-layer-and-network-stack.md)
    沿物理介质、PHY、MAC、DMA/Driver 到 lwIP netif 建立 Ethernet 收发心智模型，并解释速率协商、抗干扰、冲突与 MAC 过滤。
@@ -86,16 +86,16 @@ Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览
    从产品能力反推 lwIP feature/resource 配置与源码选择，建立 `lwipopts.h`、`NO_SYS`、`sys_arch`、`netif` 和 Driver 之间的通用移植契约。
 39. [Stage 39：从 `lwip_system_init()` 到 `tcpip_input()`——RT-Thread 如何把 lwIP 接进 RTOS 与 Ethernet Device](39-rtthread-lwip-port.md)
    从 RT-Thread 初始化入口追踪 Kconfig/lwipopts、sys_arch、eth_device、erx/etx 与 `tcpip_input()`，把 Stage 38 的 Port Contract 落到真实 RTOS。
+40. [Stage 40：从 `socket()` 到 `lwip_socket()`——DFS fd、SAL Socket 与 lwIP Backend](40-rtthread-socket-sal-lwip.md)
+   从 BSD Socket 入口追踪 DFS fd、SAL socket、NetDev/backend 选择与 `lwip_socket()`，解释 RT-Thread 怎样把 POSIX 文件描述符语义接到 lwIP Socket/Netconn。
+41. [Stage 41：从 NetDev 注册到 `socket_init()`——Default NetDev、Protocol Family 与 lwIP / AT Backend 选择](41-rtthread-netdev-multi-backend.md)
+   从 lwIP/AT NetDev 注册追踪 `sal_user_data`、default NetDev、primary/secondary family 匹配与 socket backend 绑定，解释同一 BSD API 如何落到不同网络实现。
 
 ## 后续方向
 
-Stage 38～39 已经把“标准 lwIP Port Contract”与“RT-Thread 的真实 lwIP 适配”串起来。后续只补 RT-Thread 与 lwIP 相交的 Socket/SAL/NetDev 流程，再进入具体 STM32 Ethernet Driver 与 MCU 上云生命周期：
+Stage 38～41 已经完成“标准 lwIP Port Contract → RT-Thread RTOS/以太网适配 → BSD Socket/DFS/SAL → NetDev 多后端选择”这条软件集成主线。后续开始进入具体 STM32 Ethernet Driver 与 MCU 上云生命周期：
 
 ```text
-Stage 40  RT-Thread Socket / SAL：socket → DFS fd → SAL → lwIP backend
-    ↓
-Stage 41  RT-Thread NetDev / 多网络后端：NetDev → protocol family → lwIP / AT
-    ↓
 Stage 42  STM32 + RT-Thread + lwIP Ethernet Port
     ↓
 Stage 43  STM32 Ethernet DMA：Descriptor / pbuf / Cache / Zero-copy / IRQ

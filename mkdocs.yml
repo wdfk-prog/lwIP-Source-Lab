@@ -54,6 +54,8 @@ nav:
   - Stage 37：HTTP / HTTPS Client: 37-http-https-client.md
   - Stage 38：lwIP 裁剪 / Port Contract: 38-lwip-porting-and-configuration.md
   - Stage 39：RT-Thread / lwIP Port: 39-rtthread-lwip-port.md
+  - Stage 40：Socket / DFS / SAL / lwIP: 40-rtthread-socket-sal-lwip.md
+  - Stage 41：NetDev / Multi-backend: 41-rtthread-netdev-multi-backend.md
 markdown_extensions:
   - admonition
   - attr_list
