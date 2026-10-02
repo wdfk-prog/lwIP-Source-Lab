@@ -2,13 +2,31 @@
 
 # 教程 17：从 `IP_ADD_MEMBERSHIP` 到 `igmp_input()`——IPv4 Multicast、IGMPv2、MAC Filter 与组成员状态机
 
-> 摘要：从 RTP Socket 的 IP_ADD_MEMBERSHIP 入口追踪 IGMPv2 加组、Report/Query/Leave、100 ms Timer、报告抑制与 multicast MAC 映射。
+> 摘要：从 RTP multicast example 的 IP_ADD_MEMBERSHIP 入口追踪 IGMPv2 加组、Report/Query/Leave、定时器与 MAC 映射，并用真实 PCAP 验证调用链。
 
 [TOC]
 
 Stage 16 已经把 IPv4 fragmentation/reassembly 的 MTU 边界闭环。接下来进入另一种完全不同的“一个 packet 对应谁”的问题：**multicast packet 不是发给一个明确的 unicast host，而是发给一个 group；Host 必须告诉本地链路上的 multicast router 自己正在监听哪些组，同时网卡/Driver 还要决定哪些 multicast Ethernet frame 能进入接收路径。**
 
-本篇使用 upstream 自带的 RTP example 作为真实应用入口，而不是从 `igmp_joingroup_netif()` 中间函数凭空开始：[S1](#source-s1)
+本篇使用 upstream 自带的 RTP multicast example 作为真实应用入口，而不是从 `igmp_joingroup_netif()` 中间函数凭空开始。[S1](#source-s1)
+
+RTP（Real-time Transport Protocol）位于应用层，通常承载实时音视频等媒体数据；它常以 UDP 作为下层传输。当前 lwIP example 用一段 MPEG4 bitstream 构造 RTP packet，默认向 IPv4 multicast group `232.0.0.0:4000` 发送数据。[S1](#source-s1)[S5](#source-s5) **RTP 本身不是 IGMP 的一部分**：RTP/UDP 负责 multicast group 中实际传输的数据，IGMP 则负责 IPv4 Host 对 group 的加入、报告和离开。
+
+当前 example 的运行关系是：[S1](#source-s1)
+
+```mermaid
+flowchart TD
+    A["rtp_init()"] --> B["rtp_send_thread()"]
+    A --> C["rtp_recv_thread()"]
+    B --> D["RTP header + MPEG4 payload"]
+    D --> E["UDP -> 232.0.0.0:4000"]
+    C --> F["UDP bind :4000"]
+    F --> G["SO_RCVTIMEO"]
+    G --> H["IP_ADD_MEMBERSHIP 232.0.0.0"]
+    H --> I["IGMP Membership Report"]
+```
+
+因此本文真正要追的控制链从 `rtp_recv_thread()` 的 `IP_ADD_MEMBERSHIP` 开始：
 
 ```text
 rtp_recv_thread()
@@ -36,7 +54,7 @@ IP_DROP_MEMBERSHIP
 Leave Group + resource cleanup
 ```
 
-当前源码基线仍为 `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
+本文使用的本地源码快照中，IGMP、RTP 与 Socket 相关文件和 upstream `master` commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 对应文件一致，因此源码结论继续绑定该 revision。[S1](#source-s1)
 
 本文只解释当前 lwIP `igmp.c` 的 IPv4 host-side IGMP 行为。IPv6 MLD、IGMPv3 source filtering、multicast routing protocol 与交换机 IGMP Snooping 不展开成第二条主线。
 
@@ -92,42 +110,155 @@ netif->flags = NETIF_FLAG_BROADCAST | NETIF_FLAG_ETHARP | NETIF_FLAG_IGMP;
 
 真正加入业务组需要应用发起 join。upstream RTP example 正好提供了这条入口。
 
-## 3. 真实应用入口：`rtp_recv_thread()` 先创建 UDP Socket，再请求 `IP_ADD_MEMBERSHIP`
+## 3. 真实应用入口：先认识 RTP example，再进入 `rtp_recv_thread()` 的 multicast join
 
-`contrib/apps/rtp/rtp.c` 的接收线程创建 UDP socket、bind 到 RTP port，然后构造 `struct ip_mreq`。[S1](#source-s1)
+`contrib/apps/rtp/rtp.c` 把 RTP 作为一个很小的 multicast application example。`rtp_init()` 同时创建发送和接收线程：[S1](#source-s1)
 
 ```c
-sock = lwip_socket(AF_INET, SOCK_DGRAM, 0);
-if (sock >= 0) {
-  memset(&local, 0, sizeof(local));
-  local.sin_family      = AF_INET;
-  local.sin_port        = PP_HTONS(RTP_STREAM_PORT);
-  local.sin_addr.s_addr = PP_HTONL(INADDR_ANY);
-
-  if (lwip_bind(sock, (struct sockaddr *)&local, sizeof(local)) == 0) {
-    ipmreq.imr_multiaddr.s_addr = rtp_stream_address;
-    ipmreq.imr_interface.s_addr = PP_HTONL(INADDR_ANY);
-
-    if (lwip_setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                        &ipmreq, sizeof(ipmreq)) == 0) {
+void
+rtp_init(void)
+{
+  sys_thread_new("rtp_send_thread", rtp_send_thread, NULL, DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
+  sys_thread_new("rtp_recv_thread", rtp_recv_thread, NULL, DEFAULT_THREAD_STACKSIZE, DEFAULT_THREAD_PRIO);
+}
 ```
 
-当前 RTP example 默认：
+两个线程承担不同角色：
+
+| 路径 | 当前 example 做什么 | 与 Stage 17 的关系 |
+| --- | --- | --- |
+| `rtp_send_thread()` | 把 MPEG4 payload 加上 RTP header，经 UDP 发往 `232.0.0.0:4000` | multicast **数据面**示例 |
+| `rtp_recv_thread()` | bind UDP 4000，并通过 `IP_ADD_MEMBERSHIP` 加入 `232.0.0.0` | 本文 IGMP **控制面**入口 |
+
+RTP 的标准固定 Header 包含 sequence number、timestamp、payload type、SSRC 等字段，用来标识媒体 packet 顺序、采样/播放时间基准、payload 类型和同步源。[S5](#source-s5) 当前 lwIP example 保留了这条主干字段：[S1](#source-s1)
+
+```c
+struct rtp_hdr {
+  PACK_STRUCT_FLD_8(u8_t  version);
+  PACK_STRUCT_FLD_8(u8_t  payloadtype);
+  PACK_STRUCT_FIELD(u16_t seqNum);
+  PACK_STRUCT_FIELD(u32_t timestamp);
+  PACK_STRUCT_FIELD(u32_t ssrc);
+} PACK_STRUCT_STRUCT;
+```
+
+Stage 17 不继续展开 RTP codec、jitter buffer 或 RTCP；只需要知道：**RTP/UDP 是 group 里的业务数据，`IP_ADD_MEMBERSHIP` 才是进入 IGMP 的控制入口。**
+
+### 3.1 `rtp_recv_thread()` 的真实顺序里还有一次 `SO_RCVTIMEO`
+
+接收线程并不是 bind 后立刻 join。当前源码的连续路径是：[S1](#source-s1)
+
+```c
+if (lwip_bind(sock, (struct sockaddr *)&local, sizeof(local)) == 0) {
+  /* set recv timeout */
+  timeout = RTP_RECV_TIMEOUT;
+  result = lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+  if (result) {
+    LWIP_DEBUGF(RTP_DEBUG, ("rtp_recv_thread: setsockopt(SO_RCVTIMEO) failed: errno=%d\n", errno));
+  }
+
+  /* prepare multicast "ip_mreq" struct */
+  ipmreq.imr_multiaddr.s_addr = rtp_stream_address;
+  ipmreq.imr_interface.s_addr = PP_HTONL(INADDR_ANY);
+
+  /* join multicast group */
+  if (lwip_setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &ipmreq, sizeof(ipmreq)) == 0) {
+```
+
+当前 RTP example 默认值为：[S1](#source-s1)
 
 ```c
 #define RTP_STREAM_PORT             4000
 #define RTP_STREAM_ADDRESS          inet_addr("232.0.0.0")
+#define RTP_RECV_TIMEOUT            2000
 ```
 
-这里先只关注调用关系：
+所以接收路径实际是：
 
 ```text
-Socket bind port 4000
-        ↓
+UDP socket
+  ↓
+bind 0.0.0.0:4000
+  ↓
+设置 2000 ms receive timeout
+  ↓
+构造 ip_mreq
+  ↓
 IP_ADD_MEMBERSHIP 232.0.0.0
 ```
 
-前者建立 UDP endpoint，后者建立 multicast membership；两者是两个独立步骤。
+这里 `bind()` 与 `IP_ADD_MEMBERSHIP` 仍然是两个独立动作：前者建立 UDP endpoint，后者建立 IPv4 multicast membership。
+
+### 3.2 为什么当前 Ubuntu Host 会打印 `SO_RCVTIMEO errno=22`
+
+实际运行当前 example 时出现了：[S6](#source-s6)
+
+```text
+Starting lwIP, local interface IP is 198.18.0.200
+ip6 linklocal address: FE80::12:34FF:FE56:78AB
+status_callback==UP, local interface IP is 198.18.0.200
+rtp_recv_thread: setsockopt(SO_RCVTIMEO) failed: errno=22
+```
+
+`errno=22` 是 `EINVAL`。这里不是 TAP、IGMP 或 multicast group 配置失败，而是 RTP example 对 `SO_RCVTIMEO` 的参数形式与当前 lwIP 默认 Socket 语义不一致。[S1](#source-s1)[S2](#source-s2)
+
+当前 `example_app/lwipopts.h` 打开了：
+
+```c
+#define LWIP_SO_RCVTIMEO 1
+```
+
+而 `opt.h` 对下面这个选项的默认值是：
+
+```c
+#define LWIP_SO_SNDRCVTIMEO_NONSTANDARD 0
+```
+
+当它为 `0` 时，`sockets.c` 要求 `SO_RCVTIMEO` 使用 `struct timeval`；只有显式把它设为 `1` 时，才采用 lwIP 的非标准 `int` 毫秒形式：[S1](#source-s1)[S2](#source-s2)
+
+```c
+#if LWIP_SO_SNDRCVTIMEO_NONSTANDARD
+#define LWIP_SO_SNDRCVTIMEO_OPTTYPE int
+#else
+#define LWIP_SO_SNDRCVTIMEO_OPTTYPE struct timeval
+#endif
+```
+
+当前 RTP example 却固定传入：
+
+```c
+int timeout;
+timeout = RTP_RECV_TIMEOUT;
+lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                (char *)&timeout, sizeof(timeout));
+```
+
+`sockets.c` 在处理 `SO_RCVTIMEO` 时先检查 `optlen` 是否满足 `LWIP_SO_SNDRCVTIMEO_OPTTYPE`。当前 Host 使用 `struct timeval` 语义，而 example 只传 `sizeof(int)`，因此长度检查返回 `EINVAL`。[S1](#source-s1)
+
+如果需要修正 example，更符合当前默认 Socket 语义的写法是使用 `struct timeval`。下面是**兼容性修正示意，不是 upstream 原文**：
+
+```c
+struct timeval timeout;
+
+timeout.tv_sec = RTP_RECV_TIMEOUT / 1000;
+timeout.tv_usec = (RTP_RECV_TIMEOUT % 1000) * 1000;
+
+lwip_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                &timeout, sizeof(timeout));
+```
+
+也可以把 `LWIP_SO_SNDRCVTIMEO_NONSTANDARD` 设为 `1` 继续使用 `int` 毫秒，但这会改变整个 lwIP Socket 层的 `SO_SNDTIMEO/SO_RCVTIMEO` 参数语义，不应该只为了这个 example 随意切换全局行为。[S2](#source-s2)
+
+更重要的是，当前 RTP source 在 timeout 设置失败后**只打印日志，并不会 return**；执行流仍继续构造 `ip_mreq` 并调用 `IP_ADD_MEMBERSHIP`。[S1](#source-s1) 因此：
+
+```text
+SO_RCVTIMEO errno=22
+        ≠
+IGMP join failed
+```
+
+这也解释了为什么本次运行虽然打印了 timeout warning，后面的 PCAP 仍然捕获到了正确的 IGMP Membership Report。[S6](#source-s6)
+
 
 ## 4. `lwip_setsockopt()` 不一定直接在 application thread 修改 IGMP Core
 
@@ -935,7 +1066,7 @@ MAC hash/perfect filter
 
 这正好连接 Stage 0 的 MAC receive filter：**协议栈 membership 和硬件 receive filter 属于不同层，但 Port 必须把两层协调起来。**
 
-## 33. Host 实验：启用 upstream RTP app，最直接观察 join 产生的 IGMP Report
+## 33. Host 实验：真实运行已经证明 timeout warning 不阻断 IGMP join
 
 当前 `example_app/lwipcfg.h` 默认：
 
@@ -943,53 +1074,111 @@ MAC hash/perfect filter
 #define LWIP_RTP_APP                  0
 ```
 
-若要观察本文真实入口，可以在完成当前 configure 后，把当前实验配置改为：
-
-```c
-#define LWIP_RTP_APP                  1
-```
-
-然后按仓库已有 build 流程重新构建。本文没有执行 build；命令是否成功以本地实际环境为准。
-
-启动 example 前先抓 IGMP：
+本次实验将 RTP app 打开并重新构建，然后在 Host 上启动：[S6](#source-s6)
 
 ```sh
-sudo tcpdump -i lwip0 -nn -vv igmp
+PRECONFIGURED_TAPIF=lwip0 \
+  ./build/example/contrib/ports/unix/example_app/example_app
 ```
 
-如果 `rtp_recv_thread()` 成功运行到前文已经展示过的 membership call site：
+关键输出为：
+
+```text
+Starting lwIP, local interface IP is 198.18.0.200
+ip6 linklocal address: FE80::12:34FF:FE56:78AB
+status_callback==UP, local interface IP is 198.18.0.200
+rtp_recv_thread: setsockopt(SO_RCVTIMEO) failed: errno=22
+```
+
+前面已经从源码解释了 `errno=22` 的来源。这个 warning 出现在 join 之前，但 RTP example 不会因此退出。继续阅读 `rtp_recv_thread()`，下一步仍会执行：
 
 ```c
-lwip_setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, ...)
+lwip_setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                &ipmreq, sizeof(ipmreq));
 ```
 
-预期最先看到的网络证据就是发往 RTP group 的 IGMPv2 Membership Report；随后短 delay timer 还可能再次产生 Report。[S1](#source-s1)
-
-保存 PCAP：
+抓包使用 IGMP filter：[S6](#source-s6)
 
 ```sh
-mkdir -p captures
-sudo tcpdump -i lwip0 -nn -s 0 -U -w captures/stage17-igmp.pcap igmp
+sudo tcpdump -i lwip0 -nn -s 0 -U \
+  -w captures/stage17-igmp.pcap igmp
 ```
 
-实际 packet 数量、时序和 Host 网络环境相关；本文没有运行该实验，因此不把固定帧数写成已确认事实。
+最终实际得到：
 
-## 34. PCAP 应怎样和源码逐字段对应
+```text
+2 packets captured
+2 packets received by filter
+0 packets dropped by kernel
+```
 
-抓到 Membership Report 后，至少建立以下映射：
+这里的 `igmp` 是 BPF filter，所以 PCAP **只包含 IGMP control traffic**。`rtp_send_thread()` 同时产生的 UDP/RTP multicast data 不会进入这个文件。若需要同时观察控制面和数据面，可以使用：
 
-| PCAP 字段 | lwIP 对应 |
-| --- | --- |
-| IPv4 Protocol = 2 | `IP_PROTO_IGMP` → `igmp_input()` |
-| IPv4 TTL = 1 | `IGMP_TTL` |
-| Router Alert option | `igmp_ip_output_if()` 的 `ra[]` |
-| IGMP Type = `0x16` | `IGMP_V2_MEMB_REPORT` |
-| Group Address | `group->group_address` |
-| IGMP checksum | `inet_chksum()` |
-| Destination IPv4 = group | `igmp_send()` 的 `dest` |
-| Destination MAC `01:00:5e:*` | `etharp_output()` multicast mapping |
+```sh
+sudo tcpdump -i lwip0 -nn -vv \
+  'igmp or (udp and host 232.0.0.0 and port 4000)'
+```
 
-这比只看到“有一个 IGMP packet”更重要：报文中的每个关键字段都应该能回到具体结构体、宏和发送函数。
+这样可以把两条路径明确分开：
+
+```text
+控制面：IP_ADD_MEMBERSHIP → IGMP Report
+数据面：RTP → UDP → 232.0.0.0:4000
+```
+
+## 34. 真实 PCAP：两帧 Membership Report 与源码逐字段互证
+
+本次抓包文件已保存在 [`assets/stage17-igmp.pcap`](assets/stage17-igmp.pcap)。它包含两帧、每帧 46 bytes 的 Ethernet frame。[S6](#source-s6)
+
+两帧的关键字段完全一致：
+
+| 字段 | 实际值 | 源码/协议对应 |
+| --- | --- | --- |
+| Ethernet Source | `02:12:34:56:78:ab` | 当前 TAP/netif MAC |
+| Ethernet Destination | `01:00:5e:00:00:00` | `232.0.0.0` 的 IPv4 multicast MAC 映射 |
+| EtherType | `0x0800` | IPv4 |
+| IPv4 Source | `198.18.0.200` | 当前 lwIP interface address |
+| IPv4 Destination | `232.0.0.0` | `group->group_address` |
+| IPv4 IHL | `24 bytes` | 20-byte base header + 4-byte Router Alert |
+| Router Alert | `94 04 00 00` | `igmp_ip_output_if()` 添加的 option |
+| TTL | `1` | `IGMP_TTL` |
+| IPv4 Protocol | `2` | `IP_PROTO_IGMP` |
+| IGMP Type | `0x16` | `IGMP_V2_MEMB_REPORT` |
+| IGMP Max Resp Time | `0` | unsolicited Membership Report |
+| IGMP Group Address | `232.0.0.0` | 当前 RTP multicast group |
+| IGMP Checksum | `0x01ff` | `inet_chksum()` 生成 |
+
+第一帧时间为 `2026-10-02 15:15:10.678452 +08:00`，第二帧为 `15:15:11.077332 +08:00`，间隔约 **398.88 ms**。[S6](#source-s6)
+
+这个间隔可以直接回到 `igmp_joingroup_netif()`：第一次 Report 在 join 时立即由 `igmp_send()` 发出，随后调用：[S1](#source-s1)
+
+```c
+igmp_start_timer(group, IGMP_JOIN_DELAYING_MEMBER_TMR);
+group->group_state = IGMP_GROUP_DELAYING_MEMBER;
+```
+
+`IGMP_JOIN_DELAYING_MEMBER_TMR` 定义为 `500 / IGMP_TMR_INTERVAL`，而 `IGMP_TMR_INTERVAL=100 ms`，因此传入 `igmp_start_timer()` 的 `max_time` 为 5 tick。[S2](#source-s2) Unix Port 定义了 `LWIP_RAND()`；当前 `igmp_start_timer()` 使用 `LWIP_RAND() % max_time`，再把 0 修正为 1，所以这一实现实际得到 1～4 tick，也就是约 **100～400 ms** 的第二次 Report delay。[S1](#source-s1)[S2](#source-s2) 本次约 398.88 ms 的间隔与 4 tick 路径直接对应。
+
+因此，这次实验把前文的 join 发送路径完整闭环：
+
+```mermaid
+sequenceDiagram
+    participant APP as rtp_recv_thread()
+    participant SOCK as lwip_setsockopt()
+    participant IGMP as IGMP Core
+    participant WIRE as lwip0 / PCAP
+
+    APP->>SOCK: SO_RCVTIMEO(int 2000)
+    SOCK-->>APP: EINVAL / errno=22
+    APP->>SOCK: IP_ADD_MEMBERSHIP 232.0.0.0
+    SOCK->>IGMP: igmp_joingroup_netif()
+    IGMP->>WIRE: Report #1 immediately
+    IGMP->>IGMP: start join delay timer
+    IGMP->>WIRE: Report #2 after ~398.88 ms
+```
+
+原来只靠“预期应该看到 Report”的实验，现在已经有真实 packet 证据。尤其可以确认：`SO_RCVTIMEO` warning 与 IGMP join 是两条不同的语义路径，前者失败没有阻断后者。[S6](#source-s6)
+
 
 ## 35. 最终回看：从一个 Socket join 到链路上的 multicast membership
 
@@ -1041,14 +1230,14 @@ local use count
 2. **IGMP/IP**：本 interface 是否属于 group、何时 Report/Leave；
 3. **Ethernet/Driver**：IPv4 group 映射到哪个 multicast MAC，硬件是否放行该 MAC。
 
-下一阶段如果继续沿 multicast 展开，最自然的是 IPv6 MLD：它与 IGMP 的目标相似，但控制消息属于 ICMPv6，group 地址与 Ethernet `33:33:*` 映射、状态和消息格式都不同。
+本系列不再把 IPv6 MLD 扩展成连续源码专题；Stage 15 已保留 IPv4/IPv6 multicast 的工程入口。后续主线继续转向 multi-netif、Driver 与实际产品集成，本文在 IGMPv2 Host membership 边界停止。
 
 ## 资料来源
 
 <a id="source-s1"></a>
 ### [S1] lwIP IGMP、Socket、IPv4/Ethernet 与 Unix TAP 实现
 - 类型：目标版本 upstream 源码；版本：`d08f4773edd0182b7910fc8f046eed82ffcd67c9`
-- 定位：`src/core/ipv4/igmp.c`、`src/core/ipv4/ip4.c`、`src/core/ipv4/etharp.c`、`src/core/netif.c`、`src/api/sockets.c`、`contrib/apps/rtp/rtp.c`、`contrib/ports/unix/port/netif/tapif.c`
+- 定位：`src/core/ipv4/igmp.c`、`src/core/ipv4/ip4.c`、`src/core/ipv4/etharp.c`、`src/core/netif.c`、`src/api/sockets.c`、`contrib/apps/rtp/rtp.c`、`contrib/examples/example_app/lwipopts.h`、`contrib/ports/unix/port/netif/tapif.c`
 - URL/文档：[lwIP upstream @ d08f477](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9)
 - 使用位置：RTP Socket join、线程桥接、IGMP init/join/query/report/leave、IPv4 multicast receive 与 Ethernet mapping
 - 支撑内容：当前 revision 的真实应用入口、Core 调用链、group state、MAC filter callback 边界与 multicast output
@@ -1074,3 +1263,20 @@ local use count
 - URL/文档：[RFC 2236](https://www.rfc-editor.org/rfc/rfc2236.html)
 - 使用位置：Query/Report/Leave、Max Response Time、Report suppression、last reporter、三态 host state machine
 - 支撑内容：IGMPv2 host membership protocol、message destination 与 timer/state 语义
+
+<a id="source-s5"></a>
+### [S5] RFC 3550 — RTP: A Transport Protocol for Real-Time Applications
+- 类型：IETF / RFC Editor；版本：RFC 3550，2003-07
+- URL/文档：[RFC 3550](https://www.rfc-editor.org/rfc/rfc3550.html)
+- 使用位置：RTP 首次出现处、RTP fixed header 字段说明
+- 支撑内容：RTP 的实时媒体传输定位，以及 sequence number、timestamp、payload type、SSRC 等 fixed header 语义
+
+<a id="source-s6"></a>
+### [S6] Stage 17 Linux Host 实验日志与 IGMP PCAP
+- 类型：本地实验
+- 版本/日期：2026-10-02；Ubuntu 24.04；TAP `lwip0`；lwIP `198.18.0.200`
+- 定位：终端启动输出与 `docs/assets/stage17-igmp.pcap`
+- 资源：[`assets/stage17-igmp.pcap`](assets/stage17-igmp.pcap)
+- 使用位置：`SO_RCVTIMEO errno=22` 现象、两帧 IGMPv2 Membership Report、约 398.88 ms 的二次 Report 间隔
+- 支撑内容：证明 timeout warning 未阻断 `IP_ADD_MEMBERSHIP`；确认 Ethernet multicast MAC、Router Alert、TTL=1、Protocol=2、Type=0x16、Group=`232.0.0.0` 与 join delay 实际报文
+
