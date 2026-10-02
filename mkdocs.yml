@@ -14,19 +14,38 @@ theme:
 nav:
   - 首页: index.md
   - 教程系列索引: 00-series-index.md
-  - Stage 1：Linux Host 实验环境: 01-linux-lwip-lab.md
-  - Stage 2：从 main() 到第一次 Ping: 02-netif-tap-first-ping.md
-  - Stage 3：pbuf: 03-pbuf.md
-  - Stage 4：Ethernet / ARP / IPv4 / ICMP: 04-ethernet-arp-ipv4-icmp.md
-  - Stage 5：UDP Raw API: 05-udp-raw-api.md
-  - Stage 6：Netconn 与 Socket: 06-netconn-and-socket-api.md
-  - Stage 7：TCP 三次握手: 07-tcp-handshake.md
-  - Stage 8：TCP 数据面: 08-tcp-data-path.md
-  - Stage 9：TCP 重传: 09-tcp-retransmission.md
+  - Stage 00：Ethernet 从物理信号到 lwIP: 00-ethernet-physical-layer-and-network-stack.md
+  - Stage 01：Linux Host 实验环境: 01-linux-lwip-lab.md
+  - Stage 02：从 main() 到第一次 Ping: 02-netif-tap-first-ping.md
+  - Stage 03：pbuf: 03-pbuf.md
+  - Stage 04：Ethernet / ARP / IPv4 / ICMP: 04-ethernet-arp-ipv4-icmp.md
+  - Stage 05：UDP Raw API: 05-udp-raw-api.md
+  - Stage 06：Netconn 与 Socket: 06-netconn-and-socket-api.md
+  - Stage 07：TCP 三次握手: 07-tcp-handshake.md
+  - Stage 08：TCP 数据面: 08-tcp-data-path.md
+  - Stage 09：TCP 重传: 09-tcp-retransmission.md
   - Stage 10：TCP 乱序与 SACK: 10-tcp-out-of-order.md
   - Stage 11：sys_arch 与线程模型: 11-sys-arch.md
   - Stage 12：内存体系: 12-mem-memp-pbuf.md
-
+  - Stage 13：DHCPv4: 13-dhcpv4.md
+  - Stage 14：DNS: 14-dns.md
+  - Stage 15：IPv4 / IPv6 工程总览: 15-ipv4-ipv6-overview.md
+  - Stage 16：IPv4 Fragmentation / Reassembly: 16-ipv4-fragmentation-reassembly.md
+  - Stage 17：IGMP / IPv4 Multicast: 17-igmp-ipv4-multicast.md
+  - Stage 18：Multi-netif Routing: 18-multi-netif-routing.md
+  - Stage 19：Checksum / Hardware Offload: 19-checksum-hardware-offload.md
+  - Stage 20：Ethernet DMA / Zero-copy: 20-ethernet-dma-zero-copy.md
+  - Stage 21：Descriptor Ring / Backpressure: 21-ethernet-descriptor-ring-backpressure.md
+  - Stage 22：PHY / Link Auto-negotiation: 22-phy-link-autoneg.md
+  - Stage 23：802.1Q VLAN / VLAN Offload: 23-vlan-8021q-offload.md
+  - Stage 24：mDNS / DNS-SD: 24-mdns-dns-sd.md
+  - Stage 25：AutoIP / IPv4 Link-Local: 25-autoip-ipv4-link-local.md
+  - Stage 26：SNMP / MIB2: 26-snmp-mib2.md
+  - Stage 27：lwiperf / 性能瓶颈: 27-lwiperf-performance-bottleneck.md
+  - Stage 28：PPP Core / PPPoS Framing: 28-ppp-core-pppos-framing.md
+  - Stage 29：LCP / Auth / IPCP / IPv6CP: 29-ppp-lcp-auth-ipcp-ipv6cp.md
+  - Stage 30：PPP Address / DNS / Route / Reconnect: 30-ppp-address-dns-route-reconnect.md
+  - Stage 31：SLIP vs PPPoS: 31-slip-vs-pppos.md
 markdown_extensions:
   - admonition
   - attr_list

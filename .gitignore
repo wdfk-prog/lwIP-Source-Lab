@@ -6,6 +6,8 @@
 
 # Local logs produced while experimenting.
 *.log
+# Keep the Stage 13 reference log as a published documentation asset.
+!docs/assets/stage13-dhcp-success.log
 
 # Generated GitHub Pages / MkDocs output.
 /site/

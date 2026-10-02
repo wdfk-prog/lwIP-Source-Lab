@@ -1,0 +1,17 @@
+# dnsmasq
+
+dnsmasq: started, version 2.91 DNS disabled
+dnsmasq-dhcp: DHCP, IP range 198.18.0.100 -- 198.18.0.199, lease time 1h
+dnsmasq-dhcp: DHCP, sockets bound exclusively to interface lwip0
+dnsmasq-dhcp: DHCPDISCOVER(lwip0) 02:12:34:56:78:ab
+dnsmasq-dhcp: DHCPOFFER(lwip0) 198.18.0.149 02:12:34:56:78:ab
+dnsmasq-dhcp: DHCPREQUEST(lwip0) 198.18.0.149 02:12:34:56:78:ab
+dnsmasq-dhcp: DHCPACK(lwip0) 198.18.0.149 02:12:34:56:78:ab
+
+# example_app
+
+Starting lwIP, local interface IP is dhcp-enabled
+ip6 linklocal address: FE80::12:34FF:FE56:78AB
+status_callback==UP, local interface IP is 0.0.0.0
+status_callback==UP, local interface IP is 0.0.0.0
+status_callback==UP, local interface IP is 198.18.0.149
