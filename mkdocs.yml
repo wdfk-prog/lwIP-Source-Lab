@@ -46,6 +46,10 @@ nav:
   - Stage 29：LCP / Auth / IPCP / IPv6CP: 29-ppp-lcp-auth-ipcp-ipv6cp.md
   - Stage 30：PPP Address / DNS / Route / Reconnect: 30-ppp-address-dns-route-reconnect.md
   - Stage 31：SLIP vs PPPoS: 31-slip-vs-pppos.md
+  - Stage 32：HTTPD / altcp: 32-httpd-altcp.md
+  - Stage 33：altcp TLS / HTTPS: 33-altcp-tls-https.md
+  - Stage 34：MQTT: 34-mqtt.md
+  - Stage 35：MQTT over TLS / Reconnect / Keep Alive: 35-mqtt-tls-reconnect-keepalive.md
 markdown_extensions:
   - admonition
   - attr_list

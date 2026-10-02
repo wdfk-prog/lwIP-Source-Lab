@@ -4,7 +4,7 @@
 
 Stage 00 与 Stage 15 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
 
-## Stage 00～31
+## Stage 00～35
 
 0. [Stage 00：从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](00-ethernet-physical-layer-and-network-stack.md)
    沿物理介质、PHY、MAC、DMA/Driver 到 lwIP netif 建立 Ethernet 收发心智模型，并解释速率协商、抗干扰、冲突与 MAC 过滤。
@@ -70,19 +70,27 @@ Stage 00 与 Stage 15 属于 **Theory of Operation / Application Note** 型总�
    从 IPCP/IPv6CP OPENED 追踪 netif 地址、peer DNS、default netif、link up/down、PPPERR 回调、关闭与应用侧重连责任，建立 PPP 网络配置生命周期。
 31. [Stage 31：从 `slipif_init()` 到 `pppos_create()`——SLIP 与 PPPoS 的串口封装、错误检测、协商与工程边界](31-slip-vs-pppos.md)
    从 lwIP 的 SLIP 与 PPPoS 两条真实串口路径对比 framing、Protocol 分发、FCS、地址配置、认证、线程桥接与错误语义，明确最小 IP framing 与完整 PPP 控制面的边界。
+32. [Stage 32：从 `httpd_init()` 到 `http_sent()`——HTTPD、altcp、fsdata 与 HTTP 连接生命周期](32-httpd-altcp.md)
+   从 HTTPD 真实入口追踪 listener、`http_state`、request parser、fsdata、TCP send-buffer 背压与 `http_sent()` ACK 驱动续传，并建立 altcp 与 TCP 的适配边界。
+33. [Stage 33：从 `https_ex_init()` 到 `http_recv()`——altcp、mbedTLS、TLS Handshake 与 HTTPS 数据通路](33-altcp-tls-https.md)
+   从 upstream HTTPS example 追踪 server TLS config、TLS outer/TCP inner、mbedTLS handshake、BIO 收发、明密文转换，以及 handshake 完成后怎样重新进入 Stage 32 的 HTTPD callback。
+34. [Stage 34：从 `mqtt_example_init()` 到 `mqtt_message_received()`——MQTT CONNECT、SUBSCRIBE、PUBLISH 与回调数据通路](34-mqtt.md)
+   从 upstream MQTT example 追踪 client 创建、CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、Packet Identifier、request queue、ring buffer 和 incoming publish callback。
+35. [Stage 35：从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](35-mqtt-tls-reconnect-keepalive.md)
+   沿 `mqtt_client_connect()` 的 TLS 分支追踪 TLS handshake、MQTT CONNECT、Keep Alive、request timeout 与 `mqtt_close()`，明确 lwIP 只通知断线而 reconnect/resubscribe 属于应用层。
 
 ## 后续方向
 
-当前主线在 Stage 31 完成 PPPoS / SLIP 串口网络接口对照。后续按应用协议继续扩展：
+当前主线已在 Stage 32～35 完成 HTTPD、TLS/HTTPS、MQTT 与 MQTT over TLS/Keep Alive/应用侧 Reconnect。下一阶段进入 **MCU 目标板 Port 与真实产品网络集成**：
 
 ```text
-Stage 32+  HTTPD / altcp
+MCU Ethernet/Wi-Fi Driver / netif Port
     ↓
-TLS / HTTPS
+RTOS execution context / DMA / Cache / zero-copy
     ↓
-MQTT / MQTT over TLS
+DHCP/DNS/link-state 与 Cloud connection orchestration
     ↓
-MCU 目标板 Port 与真实产品网络集成
+TLS credential / entropy / RAM budget / reconnect state machine
 ```
 
 IPv6 不再作为连续源码专题展开；Stage 15 已保留 IPv4/IPv6 的工程心智模型、标准资料与 lwIP 源码入口，项目真正需要 IPv6 时再按模块深入。

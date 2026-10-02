@@ -161,6 +161,10 @@ scripts/build.sh all
 | 29 | [从 `lcp_open()` 到 `np_up()`——LCP、PAP/CHAP、IPCP、IPv6CP 与 PPP 协商状态机](docs/29-ppp-lcp-auth-ipcp-ipv6cp.md) | 沿 PPP phase 与 generic FSM 追踪 LCP 配置协商、PAP/CHAP 认证、Network phase、IPCP/IPv6CP 配置与网络协议启用，明确各层职责与 RUNNING 条件。 |
 | 30 | [从 `ipcp_up()` 到 `ppp_link_status_cb()`——PPP 地址、DNS、Default Route、Link Down 与 Reconnect](docs/30-ppp-address-dns-route-reconnect.md) | 从 IPCP/IPv6CP OPENED 追踪 netif 地址、peer DNS、default netif、link up/down、PPPERR 回调、关闭与应用侧重连责任，建立 PPP 网络配置生命周期。 |
 | 31 | [从 `slipif_init()` 到 `pppos_create()`——SLIP 与 PPPoS 的串口封装、错误检测、协商与工程边界](docs/31-slip-vs-pppos.md) | 从 lwIP 的 SLIP 与 PPPoS 两条真实串口路径对比 framing、Protocol 分发、FCS、地址配置、认证、线程桥接与错误语义，明确最小 IP framing 与完整 PPP 控制面的边界。 |
+| 32 | [从 `httpd_init()` 到 `http_sent()`——HTTPD、altcp、fsdata 与 HTTP 连接生命周期](docs/32-httpd-altcp.md) | 从 HTTPD 真实入口追踪监听、连接状态、request parsing、fsdata 文件映射、TCP 背压与 ACK 驱动续传，理解 altcp 怎样解耦 HTTP 与传输层。 |
+| 33 | [从 `https_ex_init()` 到 `http_recv()`——altcp、mbedTLS、TLS Handshake 与 HTTPS 数据通路](docs/33-altcp-tls-https.md) | 从 upstream HTTPS example 追踪 TLS config、TLS outer/TCP inner、mbedTLS handshake、BIO I/O 与解密后的 HTTP callback，理解 HTTPS 如何复用 Stage 32。 |
+| 34 | [从 `mqtt_example_init()` 到 `mqtt_message_received()`——MQTT CONNECT、SUBSCRIBE、PUBLISH 与回调数据通路](docs/34-mqtt.md) | 从 upstream MQTT example 追踪 CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、request queue、ring buffer 与 incoming publish callback。 |
+| 35 | [从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](docs/35-mqtt-tls-reconnect-keepalive.md) | 沿 MQTT TLS 分支追踪 TLS handshake、Keep Alive、request timeout、断线清理和 connection callback，明确应用侧 reconnect/resubscribe 责任。 |
 
 完整索引见 [docs/00-series-index.md](docs/00-series-index.md)。
 
@@ -183,7 +187,7 @@ Gateway    : 198.18.0.1
 lwIP-Source-Lab/
 ├── .github/workflows/        # CI 与文档 Pages
 ├── .vscode/                  # 仅保留通用 build/debug 入口
-├── docs/                     # Stage 00～31 教程
+├── docs/                     # Stage 00～35 教程
 ├── scripts/                  # 5 个通用脚本 + README
 ├── upstream/
 │   └── lwip/                 # 官方 lwIP submodule
