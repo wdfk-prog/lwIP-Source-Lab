@@ -2,9 +2,9 @@
 
 本系列持续跟踪官方 `lwip-tcpip/lwip` 的 `master`。绝大多数源码篇采用 **Source-driven** 主线：从当前行为的真实入口函数、注册入口或外部 API 开始，沿实际调用、数据与状态变化向下追踪。
 
-Stage 00 与 Stage 15 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
+Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
 
-## Stage 00～37
+## Stage 00～39
 
 0. [Stage 00：从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](00-ethernet-physical-layer-and-network-stack.md)
    沿物理介质、PHY、MAC、DMA/Driver 到 lwIP netif 建立 Ethernet 收发心智模型，并解释速率协商、抗干扰、冲突与 MAC 过滤。
@@ -71,27 +71,27 @@ Stage 00 与 Stage 15 属于 **Theory of Operation / Application Note** 型总�
 31. [Stage 31：从 `slipif_init()` 到 `pppos_create()`——SLIP 与 PPPoS 的串口封装、错误检测、协商与工程边界](31-slip-vs-pppos.md)
    从 lwIP 的 SLIP 与 PPPoS 两条真实串口路径对比 framing、Protocol 分发、FCS、地址配置、认证、线程桥接与错误语义，明确最小 IP framing 与完整 PPP 控制面的边界。
 32. [Stage 32：从 `httpd_init()` 到 `http_sent()`——HTTPD、altcp、fsdata 与 HTTP 连接生命周期](32-httpd-altcp.md)
-   从 HTTPD 真实入口追踪 listener、`http_state`、request parser、fsdata、TCP send-buffer 背压与 `http_sent()` ACK 驱动续传，并建立 altcp 与 TCP 的适配边界。
+   从 HTTPD 真实入口追踪监听、连接状态、request parsing、fsdata 文件映射、TCP 背压与 ACK 驱动续传，理解 altcp 怎样解耦 HTTP 与传输层。
 33. [Stage 33：从 `https_ex_init()` 到 `http_recv()`——altcp、mbedTLS、TLS Handshake 与 HTTPS 数据通路](33-altcp-tls-https.md)
-   从 upstream HTTPS example 追踪 server TLS config、TLS outer/TCP inner、mbedTLS handshake、BIO 收发、明密文转换，以及 handshake 完成后怎样重新进入 Stage 32 的 HTTPD callback。
+   从 upstream HTTPS example 追踪 TLS config、TLS outer/TCP inner、mbedTLS handshake、BIO I/O 与解密后的 HTTP callback，理解 HTTPS 如何复用 Stage 32。
 34. [Stage 34：从 `mqtt_example_init()` 到 `mqtt_message_received()`——MQTT CONNECT、SUBSCRIBE、PUBLISH 与回调数据通路](34-mqtt.md)
-   从 upstream MQTT example 追踪 client 创建、CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、Packet Identifier、request queue、ring buffer 和 incoming publish callback。
+   从 upstream MQTT example 追踪 CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、request queue、ring buffer 与 incoming publish callback。
 35. [Stage 35：从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](35-mqtt-tls-reconnect-keepalive.md)
-   沿 `mqtt_client_connect()` 的 TLS 分支追踪 TLS handshake、MQTT CONNECT、Keep Alive、request timeout 与 `mqtt_close()`，明确 lwIP 只通知断线而 reconnect/resubscribe 属于应用层。
+   沿 MQTT TLS 分支追踪 TLS handshake、Keep Alive、request timeout、断线清理和 connection callback，明确应用侧 reconnect/resubscribe 责任。
 36. [Stage 36：从 `sntp_example_init()` 到 `sntp_process()`——SNTP、DHCP/DNS、Timer 与系统时间同步](36-sntp-system-time.md)
-   从 upstream SNTP example 追踪 DHCP/DNS/static Server 来源、UDP request/response、KoD、retry/update Timer 与系统时间 Port，并说明可靠 wall clock 对 TLS 证书有效期验证的工程意义。
+   从 upstream SNTP example 追踪 Server 来源、DNS/UDP request、response 校验、retry/update Timer 与系统时间 Port，并说明可信时间与 TLS certificate validity 的工程关系。
 37. [Stage 37：从 `httpc_get_file_dns()` 到 Body Callback——HTTP/HTTPS Client、DNS、altcp 与下载数据通路](37-http-https-client.md)
-   从 HTTP client 公共入口追踪 DNS、altcp connect、HTTP/1.1 GET、Header/Body callback、transfer completion，并说明 TLS allocator 如何让同一 httpc 路径用于 HTTPS、REST 与 OTA 下载。
+   从 HTTP client 公共入口追踪 DNS、altcp/TCP、GET、Header/Body callback，并用 TLS allocator 把同一条 httpc 主线切换成 HTTPS，建立 REST/配置拉取/OTA 下载的网络侧基础。
+38. [Stage 38：从 `lwipopts.h` 到 Port Contract——lwIP 裁剪、构建选择、OS Port 与 Network Port](38-lwip-porting-and-configuration.md)
+   从产品能力反推 lwIP feature/resource 配置与源码选择，建立 `lwipopts.h`、`NO_SYS`、`sys_arch`、`netif` 和 Driver 之间的通用移植契约。
+39. [Stage 39：从 `lwip_system_init()` 到 `tcpip_input()`——RT-Thread 如何把 lwIP 接进 RTOS 与 Ethernet Device](39-rtthread-lwip-port.md)
+   从 RT-Thread 初始化入口追踪 Kconfig/lwipopts、sys_arch、eth_device、erx/etx 与 `tcpip_input()`，把 Stage 38 的 Port Contract 落到真实 RTOS。
 
 ## 后续方向
 
-Stage 36～37 补齐 SNTP 与 HTTP/HTTPS Client 后，面向 MCU / RTOS / IoT 产品的主要纯软件协议与应用主线基本结束。后续不再按 `src/apps` 目录机械补协议，而是进入 **裁剪/移植 → RT-Thread 集成 → 真实 MCU Ethernet**：
+Stage 38～39 已经把“标准 lwIP Port Contract”与“RT-Thread 的真实 lwIP 适配”串起来。后续只补 RT-Thread 与 lwIP 相交的 Socket/SAL/NetDev 流程，再进入具体 STM32 Ethernet Driver 与 MCU 上云生命周期：
 
 ```text
-Stage 38  lwIP 裁剪与移植：lwipopts / build / OS Port / Network Port
-    ↓
-Stage 39  RT-Thread 如何移植 lwIP：Kconfig / sys_arch / ethernetif / eth_device
-    ↓
 Stage 40  RT-Thread Socket / SAL：socket → DFS fd → SAL → lwIP backend
     ↓
 Stage 41  RT-Thread NetDev / 多网络后端：NetDev → protocol family → lwIP / AT

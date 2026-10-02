@@ -52,6 +52,8 @@ nav:
   - Stage 35：MQTT over TLS / Reconnect / Keep Alive: 35-mqtt-tls-reconnect-keepalive.md
   - Stage 36：SNTP / System Time: 36-sntp-system-time.md
   - Stage 37：HTTP / HTTPS Client: 37-http-https-client.md
+  - Stage 38：lwIP 裁剪 / Port Contract: 38-lwip-porting-and-configuration.md
+  - Stage 39：RT-Thread / lwIP Port: 39-rtthread-lwip-port.md
 markdown_extensions:
   - admonition
   - attr_list

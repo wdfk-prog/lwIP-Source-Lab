@@ -35,7 +35,7 @@ Linux TAP
     ↓
 完成主链后回看整体机制
 
-Theory of Operation 总览篇（Stage 00、15）
+Theory of Operation 总览篇（Stage 00、15、38）
     ↓
 先建立系统位置和完整数据流
     ↓
@@ -167,6 +167,8 @@ scripts/build.sh all
 | 35 | [从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](docs/35-mqtt-tls-reconnect-keepalive.md) | 沿 MQTT TLS 分支追踪 TLS handshake、Keep Alive、request timeout、断线清理和 connection callback，明确应用侧 reconnect/resubscribe 责任。 |
 | 36 | [从 `sntp_example_init()` 到 `sntp_process()`——SNTP、DHCP/DNS、Timer 与系统时间同步](docs/36-sntp-system-time.md) | 从 upstream SNTP example 追踪 Server 来源、DNS/UDP request、response 校验、retry/update Timer 与系统时间 Port，并说明可信时间与 TLS certificate validity 的工程关系。 |
 | 37 | [从 `httpc_get_file_dns()` 到 Body Callback——HTTP/HTTPS Client、DNS、altcp 与下载数据通路](docs/37-http-https-client.md) | 从 HTTP client 公共入口追踪 DNS、altcp/TCP、GET、Header/Body callback，并用 TLS allocator 把同一条 httpc 主线切换成 HTTPS，建立 REST/配置拉取/OTA 下载的网络侧基础。 |
+| 38 | [从 `lwipopts.h` 到 Port Contract——lwIP 裁剪、构建选择、OS Port 与 Network Port](docs/38-lwip-porting-and-configuration.md) | 从产品能力反推 lwIP feature/resource 配置与源码选择，建立 `lwipopts.h`、`NO_SYS`、`sys_arch`、`netif` 和 Driver 之间的通用移植契约。 |
+| 39 | [从 `lwip_system_init()` 到 `tcpip_input()`——RT-Thread 如何把 lwIP 接进 RTOS 与 Ethernet Device](docs/39-rtthread-lwip-port.md) | 从 RT-Thread 初始化入口追踪 Kconfig/lwipopts、sys_arch、eth_device、erx/etx 与 `tcpip_input()`，把 Stage 38 的 Port Contract 落到真实 RTOS。 |
 
 完整索引见 [docs/00-series-index.md](docs/00-series-index.md)。
 
@@ -189,7 +191,7 @@ Gateway    : 198.18.0.1
 lwIP-Source-Lab/
 ├── .github/workflows/        # CI 与文档 Pages
 ├── .vscode/                  # 仅保留通用 build/debug 入口
-├── docs/                     # Stage 00～37 教程
+├── docs/                     # Stage 00～39 教程
 ├── scripts/                  # 5 个通用脚本 + README
 ├── upstream/
 │   └── lwip/                 # 官方 lwIP submodule
