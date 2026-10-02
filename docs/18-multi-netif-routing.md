@@ -1,219 +1,85 @@
 <meta name="referrer" content="no-referrer" />
 
-# 教程 18：从 `udp_sendto()` 到 `netif->output()`——Multi-netif 路由选择、Default Netif、Gateway 与 IPv6 Source Selection
+# 教程 18：从 `udp_sendto()` 到 `etharp_output()`——Multi-netif IPv4 路由、Default Netif、Gateway 与下一跳
 
-> 摘要：从 UDP/TCP 真实发送入口追踪多 netif 出口选择、默认接口、IPv4 Gateway、IPv6 ND 路由与源地址选择，并说明显式绑定接口和 route hook 的边界。
+> 摘要：从 UDP/TCP 发送入口追踪 IPv4 multi-netif 出口选择、默认接口、源地址与 Gateway 下一跳，厘清 route 与 ARP 的职责边界。
 
 [TOC]
 
-Stage 2 已建立 `netif`，Stage 4 走通过 IPv4/ARP，Stage 15 已从整体上解释 IPv6 ND、RA 与 SLAAC。此前实验基本只有一个 Unix TAP，所以“包从哪张网卡出去”没有形成真正的问题。
+Stage 2 已建立 `netif`，Stage 4 已走通 IPv4/ARP，Stage 5 已从 `udp_sendto()` 进入 UDP Raw API。此前 Unix Host 实验基本只有一个 TAP，因此“一个 IPv4 packet 到底从哪张网卡出去”一直没有真正暴露出来。
 
-Stage 18 开始把 `netif` 从“一个接口对象”提升为“多个候选出口”。当前源码基线仍为 `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
+Stage 18 把问题收敛到一条 IPv4 主线：**应用没有显式固定接口时，lwIP 怎样选择 outgoing `netif`；选定接口以后，又怎样判断这一跳应该直接 ARP destination，还是 ARP 该接口的 gateway。** 当前源码基线仍为 upstream `master` commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
 
-本篇只回答一条主线：**应用没有显式指定接口时，lwIP 如何根据 destination、source、interface 状态和 IPv4/IPv6 路由信息选择 outgoing `netif`，又如何在选定 `netif` 后确定真正的下一跳。**
-
-需要先把两个动作分开：
+这里必须从一开始就把两个动作分开：
 
 ```text
 route selection
-    = 选哪一个 netif
+    = 选哪一个 outgoing netif
 
 next-hop selection
-    = 已经选定 netif 后，直接发给 destination，还是发给 gateway/router
+    = 已经选定 netif 后，
+      当前 Ethernet 链路上的下一跳是谁
 ```
 
-IPv4 中这两步主要落在 `ip4_route()` 与 `etharp_output()`；IPv6 中则主要落在 `ip6_route()` 与 ND6 的 Destination/Prefix/Default Router 机制。[S1](#source-s1)[S4](#source-s4)
+对于本文的 Ethernet/IPv4 路径，前者主要由 `ip4_route()` 决定，后者主要在 `etharp_output()` 中决定。[S1](#source-s1)
 
-当前 Unix `example_app` 仍只创建一个静态 `struct netif`，随后立刻调用 `netif_set_default()`，因此本篇的 multi-netif 行为主要由 Core 源码证明；文中的双接口拓扑是用于推演和后续实验扩展的阅读模型，不声称当前仓库已经运行过双 TAP 实验。[S2](#source-s2)
+## 1. 从 `udp_sendto()` 开始：发包前先要得到一个 outgoing `netif`
 
-## 1. 当前 Unix example 为什么以前看不到“路由选择”
-
-进入 `contrib/ports/unix/example_app/default_netif.c` 的 `init_default_netif()`。当前实现只有一个文件静态 `struct netif netif`，初始化后直接设为 default：[S2](#source-s2)
+重新进入 Stage 5 已经使用过的公共 API `udp_sendto()`。当前源码在启用 checksum-on-copy 时把它转入 `udp_sendto_chksum()`；无论具体条件编译怎样展开，后面的发送主体都首先要得到一个 `struct netif *netif`。[S1](#source-s1)
 
 ```c
-static struct netif netif;
-
-#if LWIP_IPV4
-#define NETIF_ADDRS ipaddr, netmask, gw,
-void init_default_netif(const ip4_addr_t *ipaddr, const ip4_addr_t *netmask, const ip4_addr_t *gw)
-#else
-#define NETIF_ADDRS
-void init_default_netif(void)
-#endif
+err_t
+udp_sendto(struct udp_pcb *pcb, struct pbuf *p,
+           const ip_addr_t *dst_ip, u16_t dst_port)
 {
-#if NO_SYS
-netif_add(&netif, NETIF_ADDRS NULL, tapif_init, netif_input);
-#else
-  netif_add(&netif, NETIF_ADDRS NULL, tapif_init, tcpip_input);
-#endif
-  netif_set_default(&netif);
+#if LWIP_CHECKSUM_ON_COPY && CHECKSUM_GEN_UDP
+  return udp_sendto_chksum(pcb, p, dst_ip, dst_port, 0, 0);
+}
+
+/** @ingroup udp_raw
+ * Same as udp_sendto(), but with checksum */
+err_t
+udp_sendto_chksum(struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *dst_ip,
+                  u16_t dst_port, u8_t have_chksum, u16_t chksum)
+{
+#endif /* LWIP_CHECKSUM_ON_COPY && CHECKSUM_GEN_UDP */
+  struct netif *netif;
+```
+
+本文只跟踪 IPv4 单播。继续阅读 `udp_sendto_chksum()` 中的接口选择主干。下面是按这一执行条件裁剪后的**阅读版**，不是未经修改的上游完整函数；它删除了本文不需要的 multicast override 分支，只保留接口选择的主干：[S1](#source-s1)
+
+```c
+/* 执行路径阅读版：只保留本文 IPv4 单播主线 */
+if (pcb->netif_idx != NETIF_NO_INDEX) {
+  netif = netif_get_by_index(pcb->netif_idx);
+} else {
+  netif = ip_route(&pcb->local_ip, dst_ip);
+}
+
+if (netif == NULL) {
+  return ERR_RTE;
 }
 ```
 
-在只有一张 `netif` 时：
-
-```text
-application
-    ↓
-route lookup
-    ↓
-唯一 netif
-```
-
-很多“路由算法”因此看起来像没有发生。
-
-但当前 `opt.h` 中 `LWIP_SINGLE_NETIF` 默认是 `0`，Core 默认仍保留 multi-netif 数据结构和算法；只有项目显式配置 `LWIP_SINGLE_NETIF=1` 时，才把很多遍历路径编译成 single-netif 快路径。[S1](#source-s1)
-
-```c
-#if !defined LWIP_SINGLE_NETIF || defined __DOXYGEN__
-#define LWIP_SINGLE_NETIF               0
-#endif
-```
-
-所以当前 Unix example 是“应用只创建了一张网卡”，不是“lwIP Core 只支持一张网卡”。
-
-## 2. 多张 `netif` 在 Core 里首先是一条链表
-
-进入 `netif_add()`。完成 driver init、地址和 interface number 初始化后，新接口会插入 `netif_list` 头部：[S1](#source-s1)
-
-```c
-#if !LWIP_SINGLE_NETIF
-  /* add this netif to the list */
-  netif->next = netif_list;
-  netif_list = netif;
-#endif /* "LWIP_SINGLE_NETIF */
-```
-
-`NETIF_FOREACH()` 对应的就是这条单向链表：[S1](#source-s1)
-
-```c
-#if LWIP_SINGLE_NETIF
-#define NETIF_FOREACH(netif) if (((netif) = netif_default) != NULL)
-#else /* LWIP_SINGLE_NETIF */
-/** The list of network interfaces. */
-extern struct netif *netif_list;
-#define NETIF_FOREACH(netif) for ((netif) = netif_list; (netif) != NULL; (netif) = (netif)->next)
-#endif /* LWIP_SINGLE_NETIF */
-/** The default network interface. */
-extern struct netif *netif_default;
-```
-
-这里先得到两个完全不同的对象：
-
-| 对象 | 含义 |
-| --- | --- |
-| `netif_list` | 所有已注册接口的链表，用于遍历候选 `netif` |
-| `netif_default` | 没有更具体 route 时使用的默认接口 |
-
-`netif_default` 不是链表头的同义词，也不是“唯一接口”。
-
-由于新 `netif` 插入链表头部，默认 IPv4 route 的“第一个匹配”行为会受接口添加顺序影响；这是后文分析 overlapping subnet 时必须记住的实现细节。[S1](#source-s1)
-
-## 3. `netif_set_default()` 只指定 fallback，不替代正常 route lookup
-
-进入 `netif_set_default()`。它的核心动作很简单：[S1](#source-s1)
-
-```c
-void
-netif_set_default(struct netif *netif)
-{
-  LWIP_ASSERT_CORE_LOCKED();
-
-  if (netif == NULL) {
-    /* remove default route */
-    mib2_remove_route_ip4(1, netif);
-  } else {
-    /* install default route */
-    mib2_add_route_ip4(1, netif);
-  }
-  netif_default = netif;
-  LWIP_DEBUGF(NETIF_DEBUG, ("netif: setting default interface %c%c\n",
-                            netif ? netif->name[0] : '\'', netif ? netif->name[1] : '\''));
-}
-```
-
-因此：
-
-```text
-netif_set_default(en1)
-```
-
-只意味着：
-
-> 在 Core 的普通 route 规则没有找到更具体出口时，可以退回 `en1`。
-
-它并不意味着所有 packet 都强制从 `en1` 发送。
-
-假设存在：
-
-```text
-en0 = 192.0.2.2/24,   gw 192.0.2.1
-en1 = 198.51.100.2/24, gw 198.51.100.1
-netif_default = en1
-```
-
-那么 destination `192.0.2.99` 仍应该命中 `en0` 的 local subnet；只有无法命中任何更具体路径的 destination 才退回 `en1`。
-
-## 4. 从真实发送入口开始：`udp_sendto()` 先决定“是否允许自动选路”
-
-Stage 5 已经介绍过 UDP Raw API。现在重新进入 `udp_sendto()`，只看 multi-netif 新问题。
-
-真正执行主体是 `udp_sendto_chksum()`。该函数在构造 UDP header 之前先决定 outgoing `netif`：[S1](#source-s1)
-
-```c
-  if (pcb->netif_idx != NETIF_NO_INDEX) {
-    netif = netif_get_by_index(pcb->netif_idx);
-  } else {
-#if LWIP_MULTICAST_TX_OPTIONS
-    netif = NULL;
-    if (ip_addr_ismulticast(dst_ip)) {
-      if (pcb->mcast_ifindex != NETIF_NO_INDEX) {
-        netif = netif_get_by_index(pcb->mcast_ifindex);
-      }
-#if LWIP_IPV4
-      else
-#if LWIP_IPV6
-        if (IP_IS_V4(dst_ip))
-#endif /* LWIP_IPV6 */
-        {
-          if (!ip4_addr_isany_val(pcb->mcast_ip4) &&
-              !ip4_addr_eq(&pcb->mcast_ip4, IP4_ADDR_BROADCAST)) {
-            netif = ip4_route_src(ip_2_ip4(&pcb->local_ip), &pcb->mcast_ip4);
-          }
-        }
-#endif /* LWIP_IPV4 */
-    }
-
-    if (netif == NULL)
-#endif /* LWIP_MULTICAST_TX_OPTIONS */
-    {
-      /* find the outgoing network interface for this packet */
-      netif = ip_route(&pcb->local_ip, dst_ip);
-    }
-  }
-```
-
-这段代码建立了 multi-netif 发送的第一层优先级：
+因此 UDP 在真正构造并向下发送 datagram 前，先面对一个非常具体的问题：
 
 ```mermaid
 flowchart TD
-    A["udp_sendto()"] --> B{"pcb->netif_idx fixed?"}
-    B -->|yes| C["netif_get_by_index()"]
-    B -->|no| D{"multicast interface override?"}
-    D -->|yes| E["selected multicast netif"]
-    D -->|no| F["ip_route(local_ip, dst_ip)"]
-    C --> G["udp_sendto_if()"]
-    E --> G
-    F --> G
+    A["udp_sendto() / udp_sendto_chksum()"] --> B{"pcb->netif_idx 已固定?"}
+    B -->|是| C["netif_get_by_index()"]
+    B -->|否| D["普通 route lookup"]
+    C --> E["得到 outgoing netif"]
+    D --> E
+    E --> F["udp_sendto_if()"]
 ```
 
-所以 automatic route lookup 并不是不可绕过的。如果 PCB 已经绑定 interface，UDP 会优先直接使用该 `netif`。
+这意味着自动路由并不是所有发送都必须经过的步骤。PCB 如果已经绑定接口，UDP 可以直接使用那张 `netif`。
 
-## 5. `SO_BINDTODEVICE` 为什么会直接改变 UDP/TCP route
+## 2. `SO_BINDTODEVICE` 为什么能绕过普通 route lookup
 
-Socket API 的 `SO_BINDTODEVICE` 最终不是把 interface name 存在 Socket 自己的字符串字段里，而是找到 `netif` 后把 interface index 写进协议 PCB。[S1](#source-s1)
+Socket API 的 `SO_BINDTODEVICE` 最终会把接口约束写进协议 PCB，而不是只在 Socket 层保存一个接口名。[S1](#source-s1)
 
-继续阅读 `lwip_setsockopt_impl()` 的 `SO_BINDTODEVICE` 分支：[S1](#source-s1)
+继续阅读 `lwip_setsockopt_impl()` 的 `SO_BINDTODEVICE` 分支。它先通过 `netif_find()` 找到接口，再根据协议类型调用 `tcp_bind_netif()`、`udp_bind_netif()` 或 `raw_bind_netif()`：[S1](#source-s1)
 
 ```c
         case SO_BINDTODEVICE: {
@@ -270,93 +136,134 @@ udp_bind_netif(struct udp_pcb *pcb, const struct netif *netif)
 }
 ```
 
-TCP 的 `tcp_bind_netif()` 使用同一思路：把 `netif_get_index(netif)` 存进 PCB。[S1](#source-s1)
+因此下面三个概念不能混为一谈：
 
-这解释了为什么“绑定本地 IP”和“绑定网卡”不能混为一谈：
-
-| 操作 | 约束对象 | 主要效果 |
+| 动作 | 约束对象 | 主要效果 |
 | --- | --- | --- |
-| bind local IP | source address | 指定/限制源 IP |
-| `SO_BINDTODEVICE` / `*_bind_netif()` | `netif_idx` | 直接固定 ingress/egress interface |
-| normal route lookup | destination/source + route state | 自动选择 outgoing `netif` |
+| `bind()` 到本地 IPv4 | source address | 限制/指定源 IPv4 |
+| `SO_BINDTODEVICE` / `*_bind_netif()` | `pcb->netif_idx` | 固定 outgoing interface |
+| 普通 route lookup | destination + route state | 自动选择 outgoing `netif` |
 
-## 6. TCP 也遵守同一原则：固定接口优先，否则调用 `ip_route()`
+## 3. 为什么当前 Unix example 平时感觉不到 multi-netif route
 
-进入 `tcp_connect()`。在 SYN 还没有发出前，TCP 已先解析 route：[S1](#source-s1)
+当前 `contrib/ports/unix/example_app/default_netif.c` 只有一个文件静态 `struct netif netif`。`init_default_netif()` 创建它以后立即设成 default：[S2](#source-s2)
 
 ```c
-  if (pcb->netif_idx != NETIF_NO_INDEX) {
-    netif = netif_get_by_index(pcb->netif_idx);
-  } else {
-    /* check if we have a route to the remote host */
-    netif = ip_route(&pcb->local_ip, &pcb->remote_ip);
-  }
-  if (netif == NULL) {
-    /* Don't even try to send a SYN packet if we have no route since that will fail. */
-    return ERR_RTE;
-  }
+static struct netif netif;
 
-  /* check if local IP has been assigned to pcb, if not, get one */
-  if (ip_addr_isany(&pcb->local_ip)) {
-    const ip_addr_t *local_ip = ip_netif_get_local_ip(netif, ipaddr);
-    if (local_ip == NULL) {
-      return ERR_RTE;
-    }
-    ip_addr_copy(pcb->local_ip, *local_ip);
-  }
+#if LWIP_IPV4
+#define NETIF_ADDRS ipaddr, netmask, gw,
+void init_default_netif(const ip4_addr_t *ipaddr, const ip4_addr_t *netmask, const ip4_addr_t *gw)
+#else
+#define NETIF_ADDRS
+void init_default_netif(void)
+#endif
+{
+#if NO_SYS
+netif_add(&netif, NETIF_ADDRS NULL, tapif_init, netif_input);
+#else
+  netif_add(&netif, NETIF_ADDRS NULL, tapif_init, tcpip_input);
+#endif
+  netif_set_default(&netif);
+}
 ```
 
-这里顺序非常重要：
+只有一张接口时，运行时看起来往往就是：
 
 ```text
-先选 outgoing netif
-        ↓
-再在这个 netif 上决定 local source address
-        ↓
-最后才开始真正 TCP connect / SYN 路径
+application
+    ↓
+route lookup
+    ↓
+唯一 netif
 ```
 
-对于 IPv6，这一顺序与 RFC 6724 的 source-address candidate model是一致方向：候选源地址主要来自 outgoing interface；lwIP 的具体实现范围由后文 `ip6_select_source_address()` 体现。[S6](#source-s6)
-
-## 7. `ip_route()` 是 IPv4/IPv6 的统一分发门
-
-dual-stack 构建下，`ip_route()` 只是一个宏，根据 destination address type 分发到 IPv4 或 IPv6：[S1](#source-s1)
+但 Core 默认仍保留 multi-netif 数据结构。`netif_add()` 会把新接口挂入 `netif_list`，`netif_default` 则单独保存默认出口。[S1](#source-s1)
 
 ```c
-#define ip_route(src, dest) \
-        (IP_IS_V6(dest) ? \
-        ip6_route(ip_2_ip6(src), ip_2_ip6(dest)) : \
-        ip4_route_src(ip_2_ip4(src), ip_2_ip4(dest)))
+#if LWIP_SINGLE_NETIF
+#define NETIF_FOREACH(netif) if (((netif) = netif_default) != NULL)
+#else /* LWIP_SINGLE_NETIF */
+/** The list of network interfaces. */
+extern struct netif *netif_list;
+#define NETIF_FOREACH(netif) for ((netif) = netif_list; (netif) != NULL; (netif) = (netif)->next)
+#endif /* LWIP_SINGLE_NETIF */
+/** The default network interface. */
+extern struct netif *netif_default;
 ```
 
-到这里两条 route 算法正式分叉：
+这两个对象的职责不同：
 
-```mermaid
-flowchart LR
-    A["UDP/TCP/RAW output"] --> B["ip_route(src, dest)"]
-    B --> C{"destination family"}
-    C -->|IPv4| D["ip4_route_src() / ip4_route()"]
-    C -->|IPv6| E["ip6_route()"]
-    D --> F["outgoing netif"]
-    E --> F
-```
+| 对象 | 含义 |
+| --- | --- |
+| `netif_list` | 所有候选网络接口，route lookup 可以遍历 |
+| `netif_default` | 没有更具体路径时的 fallback interface |
 
-后面的差异不能用“IPv6 就是 IPv4 地址变长”解释。
+`netif_default` 不是“唯一接口”，也不是“链表第一项”。
 
-## 8. IPv4 默认 route：先扫描所有接口的直连 subnet
+## 4. `netif_set_default()` 设置的是 fallback interface，不是 Gateway
 
-如果没有配置 `LWIP_HOOK_IP4_ROUTE_SRC`，`ip4_route_src(src, dest)` 在头文件中直接退化为：
+进入 `netif_set_default()`：[S1](#source-s1)
 
 ```c
+void
+netif_set_default(struct netif *netif)
+{
+  LWIP_ASSERT_CORE_LOCKED();
+
+  if (netif == NULL) {
+    /* remove default route */
+    mib2_remove_route_ip4(1, netif);
+  } else {
+    /* install default route */
+    mib2_add_route_ip4(1, netif);
+  }
+  netif_default = netif;
+  LWIP_DEBUGF(NETIF_DEBUG, ("netif: setting default interface %c%c\n",
+                            netif ? netif->name[0] : '\'', netif ? netif->name[1] : '\''));
+}
+```
+
+假设有两张接口：
+
+```text
+en0 = 192.0.2.2/24,    gw = 192.0.2.1
+en1 = 198.51.100.2/24, gw = 198.51.100.1
+
+netif_default = en1
+```
+
+这里有两个名字很容易混淆：
+
+| 名称 | 当前回答的问题 |
+| --- | --- |
+| `netif_default = en1` | 没有更具体 route 时，**从哪张接口出去** |
+| `en1->gw = 198.51.100.1` | 已经决定从 en1 出去且目标不在本地链路时，**这一跳交给谁** |
+
+因此 `netif_default` 和 default gateway 不是同一个东西。
+
+## 5. IPv4 自动 route：默认先扫描所有接口的直连 subnet
+
+对于本文的 IPv4 发送路径，普通 route 最终进入 `ip4_route_src()` / `ip4_route()`。如果项目没有定义 source-routing hook，`ip4_route_src()` 直接退化为 `ip4_route(dest)`：[S1](#source-s1)
+
+```c
+#ifdef LWIP_HOOK_IP4_ROUTE_SRC
+#define LWIP_IPV4_SRC_ROUTING   1
+#else
+#define LWIP_IPV4_SRC_ROUTING   0
+#endif
+
+struct netif *ip4_route(const ip4_addr_t *dest);
+#if LWIP_IPV4_SRC_ROUTING
+struct netif *ip4_route_src(const ip4_addr_t *src, const ip4_addr_t *dest);
+#else /* LWIP_IPV4_SRC_ROUTING */
 #define ip4_route_src(src, dest) ip4_route(dest)
+#endif /* LWIP_IPV4_SRC_ROUTING */
 ```
 
-所以默认 IPv4 route 不使用 source address。[S1](#source-s1)
-
-进入 `ip4_route()`。当前默认算法先线性遍历 `netif_list`：[S1](#source-s1)
+进入 `ip4_route()`。默认算法先遍历 `netif_list`，只考虑处于 up/link-up 且拥有有效 IPv4 地址的接口，然后检查 destination 是否落在该接口的本地 subnet：[S1](#source-s1)
 
 ```c
-  /* iterate through netifs */
   NETIF_FOREACH(netif) {
     /* is the netif up, does it have a link and a valid address? */
     if (netif_is_up(netif) && netif_is_link_up(netif) && !ip4_addr_isany_val(*netif_ip4_addr(netif))) {
@@ -374,54 +281,46 @@ flowchart LR
   }
 ```
 
-因此双接口拓扑：
+例如：
 
 ```text
-en0  192.0.2.2/24
-en1  198.51.100.2/24
+en0 = 192.0.2.2/24
+en1 = 198.51.100.2/24
+
+destination = 192.0.2.80
 ```
 
-面对：
+`192.0.2.80` 与 `en0` 同属 `192.0.2.0/24`，因此 `ip4_route()` 直接返回 `en0`。此时根本不需要使用 `netif_default`。
 
-```text
-192.0.2.99
-```
+### 5.1 默认实现不是一个完整的 longest-prefix route table
 
-`ip4_route()` 会检查：
-
-```text
-dest & netmask
-==
-netif->ip_addr & netmask
-```
-
-匹配到 `192.0.2.0/24` 的 `en0` 后立即返回。
-
-### 8.1 一个重要限制：默认 IPv4 Core 不是 longest-prefix routing table
-
-默认代码不是：
-
-```text
-收集全部匹配 route
-→ 比较 prefix length
-→ 选择 longest prefix
-```
-
-而是：
+当前默认代码的行为是：
 
 ```text
 NETIF_FOREACH
-→ 找到第一个 subnet match
-→ return
+    ↓
+第一个 subnet match
+    ↓
+立即 return
 ```
 
-再结合 `netif_add()` 把新接口插到 `netif_list` 头部，可以推出一个直接工程结论：**如果多个 IPv4 `netif` 的 subnet 重叠，默认 route 结果可能受 `netif` 链表顺序影响。**[S1](#source-s1)
+它不是：
 
-这属于当前 lwIP 默认实现策略，不应泛化成完整 IP routing table 行为。需要 policy route、metric 或真正的 longest-prefix route table 时，应进入 route hook / 外部 route table，而不是依赖接口添加顺序。
+```text
+收集所有匹配项
+    ↓
+比较 prefix length / metric
+    ↓
+选择最佳 route
+```
 
-## 9. IPv4 没有直连匹配时：Hook 之后才退到 `netif_default`
+而 `netif_add()` 又会把新接口插到 `netif_list` 头部，因此 overlapping subnet 场景下，默认结果可能受接口链表顺序影响。[S1](#source-s1)
 
-继续阅读 `ip4_route()`。普通 subnet 没有命中后，Core 才尝试 route hook：[S1](#source-s1)
+需要真正的静态路由表、metric、policy 或 longest-prefix match 时，应通过 route hook 接入项目自己的 route table，而不是依赖接口添加顺序。
+
+## 6. 没有直连匹配时，`ip4_route()` 才退到 `netif_default`
+
+普通 subnet 没命中后，`ip4_route()` 先给项目 route hook 接管机会：[S1](#source-s1)
 
 ```c
 #ifdef LWIP_HOOK_IP4_ROUTE_SRC
@@ -437,7 +336,7 @@ NETIF_FOREACH
 #endif
 ```
 
-继续阅读 `ip4_route()` 的最后 fallback。之后才检查 `netif_default`：[S1](#source-s1)
+继续阅读 `ip4_route()` 的最后 fallback：[S1](#source-s1)
 
 ```c
   if ((netif_default == NULL) || !netif_is_up(netif_default) || !netif_is_link_up(netif_default) ||
@@ -452,24 +351,37 @@ NETIF_FOREACH
   return netif_default;
 ```
 
-所以前面的双接口模型中：
+现在使用贯穿本文的目标地址：
 
 ```text
-destination = 203.0.113.8
-netif_default = en1
+destination = 203.0.113.80
 ```
 
-如果没有 hook 提供其它 route，`ip4_route()` 最终只返回：
+它既不属于 `192.0.2.0/24`，也不属于 `198.51.100.0/24`，因此没有 direct subnet match。没有额外 route hook 时：
 
 ```text
+203.0.113.80
+    ↓
+no direct subnet match
+    ↓
+netif_default
+    ↓
 en1
 ```
 
-注意：到这一步**只选出了 interface，还没有决定 Ethernet frame 发给谁的 MAC**。
+注意，此时 `ip4_route()` 只回答了：
 
-## 10. `ip4_output()` 返回 route 后，source address 才与 netif 对齐
+> **这个 packet 从 en1 出去。**
 
-`ip4_output()` 的调用顺序非常清楚：[S1](#source-s1)
+它还没有回答：
+
+> **en1 在 Ethernet 上应该把 frame 交给谁。**
+
+这正是 Gateway 下一步才出现的原因。
+
+## 7. `ip4_output()` 先用 route 选接口，再让 source address 与接口对齐
+
+`ip4_output()` 会调用 `ip4_route_src()` 取得接口，然后把该 `netif` 传给 `ip4_output_if()`：[S1](#source-s1)
 
 ```c
 err_t
@@ -491,7 +403,7 @@ ip4_output(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *dest,
 }
 ```
 
-进入 `ip4_output_if()`。如果 caller 的 source 是 `0.0.0.0`/ANY，它会使用刚选出的 `netif` 的 IPv4 地址：[S1](#source-s1)
+进入 `ip4_output_if()`。如果 caller 没有指定 source IPv4，它使用刚选出的接口地址：[S1](#source-s1)
 
 ```c
   const ip4_addr_t *src_used = src;
@@ -502,7 +414,7 @@ ip4_output(struct pbuf *p, const ip4_addr_t *src, const ip4_addr_t *dest,
   }
 ```
 
-所以自动 route 与自动 source 的关系是：
+因此普通自动发送可以先建立这条关系：
 
 ```text
 destination
@@ -513,23 +425,77 @@ outgoing netif
     ↓
 netif->ip_addr
     ↓
-IPv4 source address
+source IPv4
 ```
 
-## 11. IPv4 的 Gateway 为什么不在 `ip4_route()` 里选
+对于 `203.0.113.80` 的例子，route 返回 `en1` 后，如果 source 原本是 ANY，最终 source 就会使用 `198.51.100.2`。
 
-这是 multi-netif 最容易产生误解的地方。
+## 8. 为什么 `203.0.113.80 → en1` 之后突然又跟 Gateway 有关系
 
-`ip4_route()` 返回 `en1` 后，packet 最终进入：
+这是本篇最关键的跨层边界。
+
+已知：
 
 ```text
-ip4_output_if()
-→ netif->output(netif, p, dest)
+en1 IP      = 198.51.100.2
+en1 netmask = 255.255.255.0 (/24)
+en1 gateway = 198.51.100.1
+
+destination = 203.0.113.80
 ```
 
-Ethernet netif 的 `output` 通常是 `etharp_output()`。这里才判断 destination 是否在已选 `netif` 的本地 subnet。[S1](#source-s1)
+`/24` 表示 `en1` 当前直接连接的 IPv4 subnet 是：
 
-继续阅读 `etharp_output()` 的 unicast 分支：[S1](#source-s1)
+```text
+198.51.100.0/24
+```
+
+`203.0.113.80` 不属于这个 subnet，因此它是 **off-link destination**：目标 IP 不是当前 Ethernet 链路上的直接邻居。
+
+这时不能把两个“目的”混成一个概念：
+
+| 层次 | 当前目的 |
+| --- | --- |
+| IPv4 最终目的 | `203.0.113.80` |
+| 当前 Ethernet 下一跳 | `198.51.100.1`，即 en1 的 gateway |
+
+ARP 解决的是**当前二层链路上某个 IPv4 下一跳对应哪个 MAC**。既然 `203.0.113.80` 不在 en1 的本地 subnet，当前主机不能指望通过本地 ARP 直接得到远端主机的 MAC；它必须先把这个 IP packet 交给本地链路上可达的路由器 `198.51.100.1`。
+
+因此完整关系不是：
+
+```text
+203.0.113.80
+    ↓
+ARP 203.0.113.80
+```
+
+而是：
+
+```mermaid
+flowchart TD
+    A["最终 IPv4 destination = 203.0.113.80"] --> B["route selection"]
+    B --> C["outgoing netif = en1"]
+    C --> D{"destination 属于 198.51.100.0/24 ?"}
+    D -->|是| E["next hop = destination"]
+    D -->|否| F["next hop = en1->gw = 198.51.100.1"]
+    E --> G["ARP next-hop IPv4 → MAC"]
+    F --> G
+```
+
+所以 Gateway 不是在替换最终目的地址，而是在回答：
+
+> **这个远端 IPv4 packet 离开本机的第一跳应该先交给谁？**
+
+## 9. 进入 `etharp_output()`：off-link 时把 ARP 对象改成 `netif->gw`
+
+`ip4_output_if_src()` 最终调用：
+
+```c
+  LWIP_DEBUGF(IP_DEBUG, ("ip4_output_if: call netif->output()\n"));
+  return netif->output(netif, p, dest);
+```
+
+Ethernet netif 的 IPv4 `output` 通常指向 `etharp_output()`。进入它的 unicast 路径后，函数再次拿 destination 与**已经选定 netif** 的地址/掩码比较。[S1](#source-s1)
 
 ```c
     if (!ip4_addr_net_eq(ipaddr, netif_ip4_addr(netif), netif_ip4_netmask(netif)) &&
@@ -554,56 +520,152 @@ Ethernet netif 的 `output` 通常是 `etharp_output()`。这里才判断 destin
     }
 ```
 
-所以 destination `203.0.113.8` 的完整路径是：
-
-```mermaid
-flowchart TD
-    A["dest = 203.0.113.8"] --> B["ip4_route()"]
-    B --> C["no direct subnet match"]
-    C --> D["netif_default = en1"]
-    D --> E["ip4_output_if(..., en1)"]
-    E --> F["etharp_output(en1, dest)"]
-    F --> G{"dest on en1 local subnet?"}
-    G -->|no| H["dst_addr = en1->gw = 198.51.100.1"]
-    H --> I["ARP / Ethernet next-hop MAC"]
-```
-
-这说明：
+在 `203.0.113.80` 这个例子里：
 
 ```text
-IP destination = 203.0.113.8
-Ethernet next hop = gateway 198.51.100.1
+ipaddr = 203.0.113.80
+netif  = en1
+
+en1 local subnet = 198.51.100.0/24
 ```
 
-IP header 的 destination 不会因此改成 gateway。Gateway 只改变二层下一跳。
+条件成立，于是：
 
-## 12. IPv4 Advanced Routing 需要同时考虑“选 netif”和“选 gateway”
+```text
+dst_addr = en1->gw
+         = 198.51.100.1
+```
 
-`opt.h` 对两个 hook 的边界写得很明确：[S1](#source-s1)
+继续阅读 `etharp_output()`。后面的 ARP cache lookup / `etharp_query()` 使用的是 `dst_addr`，因此实际被解析成 MAC 的 IPv4 地址已经变成 gateway：[S1](#source-s1)
+
+```c
+    for (i = 0; i < ARP_TABLE_SIZE; i++) {
+      if ((arp_table[i].state >= ETHARP_STATE_STABLE) &&
+#if ETHARP_TABLE_MATCH_NETIF
+          (arp_table[i].netif == netif) &&
+#endif
+          (ip4_addr_eq(dst_addr, &arp_table[i].ipaddr))) {
+        ETHARP_SET_ADDRHINT(netif, i);
+        return etharp_output_to_arp_index(netif, q, i);
+      }
+    }
+    return etharp_query(netif, dst_addr, q);
+```
+
+因此真正发生的是：
+
+```text
+ARP target IPv4 = 198.51.100.1
+                  ↑
+                  gateway
+```
+
+而不是 ARP `203.0.113.80`。
+
+## 10. Gateway 只改变二层下一跳，IP header 的 destination 仍然是 `203.0.113.80`
+
+为了确认 Gateway 没有把最终 IP 目的地址改掉，需要回到 `ip4_output_if_src()` 构造 IPv4 header 的位置。
+
+继续阅读 `ip4_output_if_src()`。在调用 `netif->output()` 之前，代码已经把原始 `dest` 写入 IPv4 header：[S1](#source-s1)
+
+```c
+    /* dest cannot be NULL here */
+    ip4_addr_copy(iphdr->dest, *dest);
+```
+
+继续阅读 `ip4_output_if_src()` 的末尾，随后才进入：
+
+```c
+  return netif->output(netif, p, dest);
+```
+
+而 `etharp_output()` 做的事情，是根据这个 `dest` 决定 `dst_addr` 应该指向 destination 本身还是 gateway，再把 `dst_addr` 解析成 Ethernet destination MAC。
+
+因此线上第一跳的 packet/frame 可以理解为：
+
+```text
+IPv4 Header
+--------------------------------
+Src IP = 198.51.100.2
+Dst IP = 203.0.113.80
+
+Ethernet Header
+--------------------------------
+Src MAC = en1 MAC
+Dst MAC = 198.51.100.1 对应的 Gateway MAC
+```
+
+Gateway 收到 frame 后查看 IPv4 header，仍然知道真正目标是 `203.0.113.80`，于是继续执行下一跳转发。
+
+这就是为什么：
+
+```text
+最终 IP destination
+≠
+当前 Ethernet next hop
+```
+
+## 11. 同网段 destination 为什么完全不需要 Gateway
+
+把 destination 改成：
+
+```text
+198.51.100.80
+```
+
+它属于 en1 的 `198.51.100.0/24`。此时：
+
+```text
+ip4_route()
+    ↓
+subnet match en1
+    ↓
+etharp_output(en1, 198.51.100.80)
+    ↓
+仍然是 on-link
+    ↓
+dst_addr 保持为 destination
+    ↓
+ARP 198.51.100.80
+```
+
+最终：
+
+```text
+IPv4 destination = 198.51.100.80
+Ethernet next hop = 198.51.100.80 自己
+```
+
+所以是否使用 Gateway，不是由“用了 default netif”决定，而是由：
+
+> **destination 对于当前已经选定的 netif 来说，是 on-link 还是 off-link。**
+
+## 12. 一个真正的 IPv4 route entry 往往需要同时回答“接口”和“下一跳”
+
+lwIP 给 advanced routing 留了两个不同 hook：[S1](#source-s1)
 
 ```text
 LWIP_HOOK_IP4_ROUTE / LWIP_HOOK_IP4_ROUTE_SRC
     → 返回 outgoing netif
 
 LWIP_HOOK_ETHARP_GET_GW
-    → 已经知道 outgoing netif 后，为当前 destination 返回 gateway IPv4
+    → outgoing netif 已知后，
+      为当前 destination 返回 next-hop gateway IPv4
 ```
 
-因此一个真正的 IPv4 route table entry 通常至少包含：
+这正好对应真实静态路由项通常需要表达的三个核心字段：
 
 ```text
 prefix / mask
 outgoing netif
-gateway 或 on-link 标记
+gateway 或 on-link
 ```
 
-只实现 route hook、却让所有 off-link destination 都继续使用 `netif->gw`，并不能完整表达多个 gateway 的静态路由表。
+只实现 route hook，虽然能让 `203.0.113.80` 走某张指定接口，但如果后面的 `etharp_output()` 仍一律使用该接口自己的 `netif->gw`，就无法表达“同一接口针对不同 prefix 使用不同 gateway”的完整路由策略。
 
-当前 lwIP Core 并没有内建一个通用 IPv4 longest-prefix route table；`opt.h` 明确把 advanced routing table 留给应用/port，通过 hook 接入。[S1](#source-s1)
+## 13. `LWIP_HOOK_IP4_ROUTE_SRC`：source 也可以参与接口选择
 
-## 13. Source-based IPv4 routing：`LWIP_HOOK_IP4_ROUTE_SRC`
-
-默认 `ip4_route()` 只看 destination，但如果定义 `LWIP_HOOK_IP4_ROUTE_SRC`，`ip4_route_src()` 会在 source 已知时优先让 hook 决策：[S1](#source-s1)
+如果项目定义了 `LWIP_HOOK_IP4_ROUTE_SRC`，`ip4_route_src()` 会先把 source 与 destination 一起交给 hook：[S1](#source-s1)
 
 ```c
 struct netif *
@@ -620,578 +682,230 @@ ip4_route_src(const ip4_addr_t *src, const ip4_addr_t *dest)
 }
 ```
 
-这允许 policy 类规则表达：
+这允许项目表达类似：
 
 ```text
 source A + destination X → en0
 source B + destination X → en1
 ```
 
-但实际 route table、metric、policy rule 仍由项目自己实现；hook 只是 Core 的注入点。
+但 route table、metric 和 policy rule 仍是项目自己的实现；hook 只是 lwIP Core 留出的决策注入点。
 
-## 14. IPv6 `ip6_route()` 不能简单复制 IPv4 的 subnet scan
+## 14. TCP 在发 SYN 以前也必须先完成同一类接口选择
 
-IPv6 route 多了 zone、scope、RA prefix、default router 和 source address 的关系。
-
-源码注释已经给出了当前 `ip6_route()` 的优先级：[S1](#source-s1)
-
-```text
-1. single netif fast path
-2. zoned destination
-3. scoped source/destination
-4. destination subnet match
-5. router-announced route
-6. source-address matching netif
-7. netif_default
-```
-
-这不是完整通用 IPv6 route-table 规范，而是当前 lwIP Core 的默认路由策略。
-
-## 15. IPv6 第一优先级：Zone 可以直接限定 interface
-
-link-local 地址如 `fe80::/10`、interface/link-local multicast 都存在 scope/zone 问题。
-
-如果 destination 已经带 zone，`ip6_route()` 会遍历 netif，并只允许匹配该 zone 的 interface：[S1](#source-s1)
+进入 `tcp_connect()`。TCP 在真正发 SYN 之前先检查 PCB 是否固定接口，否则做 route lookup；得到 `netif` 后，如果 local IP 仍是 ANY，再从该接口获得 source address。[S1](#source-s1)
 
 ```c
-  if (ip6_addr_has_zone(dest)) {
-    IP6_ADDR_ZONECHECK(dest);
-    NETIF_FOREACH(netif) {
-      if (ip6_addr_test_zone(dest, netif) &&
-          netif_is_up(netif) && netif_is_link_up(netif)) {
-        return netif;
-      }
-    }
-    return NULL;
-  }
-```
-
-因此：
-
-```text
-fe80::1234%en0
-```
-
-里的 `%en0` 不是打印装饰，它参与 route boundary。
-
-如果明确 zone 指向 `en0`，Core 不会因为 `en1` 也有 IPv6 connectivity 就随意改走 `en1`。这正是 scoped address 必须与 interface scope 一致的原因。
-
-## 16. IPv6 对 scoped source 也会限制 outgoing netif
-
-当 destination/source 属于 scope-sensitive 地址时，`ip6_route()` 会根据 source zone，或者根据“哪个 netif 真正拥有这个 source address”来选择 interface。[S1](#source-s1)
-
-执行逻辑可压缩为：
-
-```mermaid
-flowchart TD
-    A["scoped destination/source"] --> B{"source has zone?"}
-    B -->|yes| C["find netif matching source zone"]
-    B -->|no| D["scan local IPv6 addresses"]
-    D --> E["find netif owning source address"]
-    C --> F["selected netif"]
-    E --> F
-    C -->|none| G["return NULL"]
-    E -->|none| G
-```
-
-这一分支的重要语义是：zone boundary 比 default route 更强。如果 scoped source/destination 无法找到合法 interface，函数返回 `NULL`，而不是继续无条件 fallback 到另一张网卡。
-
-## 17. IPv6 unscoped destination：Hook、静态地址 subnet、RA route 依次参与
-
-对于 global/ULA 等不受前面 scope 分支限制的地址，`ip6_route()` 先允许项目 hook 接管：[S1](#source-s1)
-
-```c
-#ifdef LWIP_HOOK_IP6_ROUTE
-  netif = LWIP_HOOK_IP6_ROUTE(src, dest);
-  if (netif != NULL) {
-    return netif;
-  }
-#endif
-```
-
-然后检查 destination 是否匹配某个 interface 上的有效 IPv6 地址/静态 subnet：[S1](#source-s1)
-
-```c
-  NETIF_FOREACH(netif) {
-    if (!netif_is_up(netif) || !netif_is_link_up(netif)) {
-      continue;
-    }
-    for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
-      if (ip6_addr_isvalid(netif_ip6_addr_state(netif, i)) &&
-          ip6_addr_net_eq(dest, netif_ip6_addr(netif, i)) &&
-          (netif_ip6_addr_isstatic(netif, i) ||
-          ip6_addr_nethost_eq(dest, netif_ip6_addr(netif, i)))) {
-        return netif;
-      }
-    }
-  }
-```
-
-这里的“static address 可隐含 /64 local subnet、dynamic address 不自动意味着 on-link prefix”与 RFC 5942 的 IPv6 subnet model 对应；lwIP 源码也在这里明确引用 RFC 5942。[S1](#source-s1)[S5](#source-s5)
-
-## 18. RA 学到的 on-link prefix/default router 进入 `nd6_find_route()`
-
-如果上面的本地静态地址规则没有命中，`ip6_route()` 继续调用：[S1](#source-s1)
-
-```c
-  /* Get the netif for a suitable router-announced route. */
-  netif = nd6_find_route(dest);
-  if (netif != NULL) {
-    return netif;
-  }
-```
-
-进入 `nd6_find_route()`。它先检查 RA/ND6 维护的 on-link `prefix_list`：[S1](#source-s1)
-
-```c
-  for (i = 0; i < LWIP_ND6_NUM_PREFIXES; ++i) {
-    netif = prefix_list[i].netif;
-    if ((netif != NULL) && ip6_addr_net_eq(&prefix_list[i].prefix, ip6addr) &&
-        netif_is_up(netif) && netif_is_link_up(netif)) {
-      return netif;
-    }
-  }
-```
-
-继续阅读 `nd6_find_route()`。如果 destination 不在已知 on-link prefix 中，才继续选 default router：[S1](#source-s1)
-
-```c
-  i = nd6_select_router(ip6addr, NULL);
-  if (i >= 0) {
-    LWIP_ASSERT("selected router must have a neighbor entry",
-      default_router_list[i].neighbor_entry != NULL);
-    return default_router_list[i].neighbor_entry->netif;
-  }
-
-  return NULL;
-```
-
-RFC 4861 的 next-hop determination 同样区分 on-link destination 与 off-link destination，并使用 Prefix List、Default Router List、Destination Cache 和 Neighbor Cache。[S4](#source-s4)
-
-因此 IPv6 multi-netif 不只是遍历 `netif->gw`；RA/ND6 runtime state 本身会参与 route。
-
-## 19. `nd6_select_router()` 会把 router 的 `netif` 带回 route layer
-
-Stage 15 已介绍 Neighbor Cache。这里关注 multi-netif 新语义。
-
-`default_router_list[]` 的 router entry 关联 Neighbor Cache，而 Neighbor Cache entry 又关联实际 `netif`。`nd6_select_router()` 只从符合 interface 状态要求的 router 中选择，并优先 reachable router。[S1](#source-s1)[S4](#source-s4)
-
-核心判断是：
-
-```c
-      router_netif = default_router_list[i].neighbor_entry->netif;
-      if ((router_netif != NULL) && (netif != NULL ? netif == router_netif :
-          (netif_is_up(router_netif) && netif_is_link_up(router_netif)))) {
-        if (default_router_list[i].neighbor_entry->state != ND6_INCOMPLETE) {
-          if (default_router_list[i].neighbor_entry->state == ND6_REACHABLE) {
-            return i;
-          } else if (valid_router < 0) {
-            valid_router = i;
-          }
-        }
-      }
-```
-
-如果没有已知 reachable router，当前实现还会对 incomplete/unknown router 进行 round-robin fallback；源码注释明确对应 RFC 4861 Section 6.3.6。[S1](#source-s1)[S4](#source-s4)
-
-所以 IPv6 中：
-
-```text
-Router Advertisement / ND6 state
-        ↓
-default_router_list[]
-        ↓
-neighbor_entry->netif
-        ↓
-ip6_route() selected netif
-```
-
-形成了比 IPv4 `netif->gw` 更动态的 interface 决策来源。
-
-## 20. IPv6 route 仍然保留 source-address matching 与 default fallback
-
-`nd6_find_route()` 也没有找到 route 时，`ip6_route()` 还会尝试“哪个 netif 拥有显式 source address”：[S1](#source-s1)
-
-```c
-  if (!ip6_addr_isany(src)) {
-    NETIF_FOREACH(netif) {
-      if (!netif_is_up(netif) || !netif_is_link_up(netif)) {
-        continue;
-      }
-      for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
-        if (ip6_addr_isvalid(netif_ip6_addr_state(netif, i)) &&
-            ip6_addr_eq(src, netif_ip6_addr(netif, i))) {
-          return netif;
-        }
-      }
-    }
-  }
-```
-
-回到 `ip6_route()`。最后才是 `netif_default`：[S1](#source-s1)
-
-```c
-  if ((netif_default == NULL) || !netif_is_up(netif_default) || !netif_is_link_up(netif_default)) {
-    return NULL;
-  }
-  return netif_default;
-```
-
-因此“指定 source address”可能反过来影响 IPv6 outgoing interface，这也是 IPv6 source/interface 关系比默认 IPv4 route 更紧密的原因。
-
-## 21. `ip6_output()`：选出 interface 后才做源地址选择
-
-进入 `ip6_output()`：[S1](#source-s1)
-
-```c
-  if (dest != LWIP_IP_HDRINCL) {
-    netif = ip6_route(src, dest);
+  if (pcb->netif_idx != NETIF_NO_INDEX) {
+    netif = netif_get_by_index(pcb->netif_idx);
   } else {
-    ip6hdr = (struct ip6_hdr *)p->payload;
-    ip6_addr_copy_from_packed(src_addr, ip6hdr->src);
-    ip6_addr_copy_from_packed(dest_addr, ip6hdr->dest);
-    netif = ip6_route(&src_addr, &dest_addr);
-    dest = &dest_addr;
+    /* check if we have a route to the remote host */
+    netif = ip_route(&pcb->local_ip, &pcb->remote_ip);
   }
-
   if (netif == NULL) {
-    LWIP_DEBUGF(IP6_DEBUG, ("ip6_output: no route for %"X16_F":%"X16_F":%"X16_F":%"X16_F":%"X16_F":%"X16_F":%"X16_F":%"X16_F"\n",
-        IP6_ADDR_BLOCK1(dest),
-        IP6_ADDR_BLOCK2(dest),
-        IP6_ADDR_BLOCK3(dest),
-        IP6_ADDR_BLOCK4(dest),
-        IP6_ADDR_BLOCK5(dest),
-        IP6_ADDR_BLOCK6(dest),
-        IP6_ADDR_BLOCK7(dest),
-        IP6_ADDR_BLOCK8(dest)));
-    IP6_STATS_INC(ip6.rterr);
+    /* Don't even try to send a SYN packet if we have no route since that will fail. */
     return ERR_RTE;
   }
 
-  return ip6_output_if(p, src, dest, hl, tc, nexth, netif);
-```
-
-进入 `ip6_output_if()`。如果 source 是 IPv6 ANY，才调用 `ip6_select_source_address(netif, dest)`：[S1](#source-s1)
-
-```c
-  const ip6_addr_t *src_used = src;
-  if (dest != LWIP_IP_HDRINCL) {
-    if (src != NULL && ip6_addr_isany(src)) {
-      src_used = ip_2_ip6(ip6_select_source_address(netif, dest));
-      if ((src_used == NULL) || ip6_addr_isany(src_used)) {
-        LWIP_DEBUGF(IP6_DEBUG | LWIP_DBG_LEVEL_SERIOUS, ("ip6_output: No suitable source address for packet.\n"));
-        IP6_STATS_INC(ip6.rterr);
-        return ERR_RTE;
-      }
+  /* check if local IP has been assigned to pcb, if not, get one */
+  if (ip_addr_isany(&pcb->local_ip)) {
+    const ip_addr_t *local_ip = ip_netif_get_local_ip(netif, ipaddr);
+    if (local_ip == NULL) {
+      return ERR_RTE;
     }
+    ip_addr_copy(pcb->local_ip, *local_ip);
   }
 ```
 
-这再次确认顺序：
-
-```mermaid
-flowchart LR
-    A["destination + optional source"] --> B["ip6_route()"]
-    B --> C["outgoing netif"]
-    C --> D{"source = :: ?"}
-    D -->|yes| E["ip6_select_source_address(netif, dest)"]
-    D -->|no| F["keep explicit source"]
-    E --> G["ip6_output_if_src()"]
-    F --> G
-```
-
-RFC 6724 将 source selection 定义为从候选源地址集合中选择合适源地址；其推荐 candidate set 主要来自 outgoing interface。[S6](#source-s6)
-
-## 22. `ip6_select_source_address()` 当前实现具体比较什么
-
-当前 lwIP 并没有实现 RFC 6724 的全部 source selection rule。函数注释明确说明：[S1](#source-s1)
+因此 UDP 与 TCP 在 multi-netif 上共享同一层核心认知：
 
 ```text
-Rules 1, 2, 3: fully implemented
-Rules 4, 5, 5.5: not applicable
-Rule 6: not implemented
-Rule 7: not applicable
-Rule 8: limited to /64 subnet match vs non-match
+固定 netif?
+    ↓ 否
+自动 route
+    ↓
+outgoing netif
+    ↓
+source address
+    ↓
+协议继续发送
 ```
 
-进入 `ip6_select_source_address()` 后，它只扫描**已经选定的 `netif`** 上 `LWIP_IPV6_NUM_ADDRESSES` 个本地地址槽。[S1](#source-s1)
+## 15. 用三个 destination 把 direct route、default interface 与 Gateway 一次区分
 
-候选过滤首先要求 address state 有效：
-
-```c
-  for (i = 0; i < LWIP_IPV6_NUM_ADDRESSES; i++) {
-    /* Consider only valid (= preferred and deprecated) addresses. */
-    if (!ip6_addr_isvalid(netif_ip6_addr_state(netif, i))) {
-      continue;
-    }
-```
-
-后面主要比较：
-
-- candidate scope 是否适合 destination scope；
-- `PREFERRED` 相对 `DEPRECATED`；
-- 是否与 destination 有当前实现支持的 /64 match；
-- exact same address 可立即胜出。[S1](#source-s1)[S6](#source-s6)
-
-因此 multi-netif 与 multi-address 是两个连续但不同的问题：
+继续使用双接口阅读模型：
 
 ```text
-多个 netif 中先选一个
-        ↓
-该 netif 的多个 IPv6 address 中再选 source
+en0 = 192.0.2.2/24,    gw = 192.0.2.1
+en1 = 198.51.100.2/24, gw = 198.51.100.1, netif_default
 ```
 
-## 23. IPv6 的下一跳由 ND6 再次决定，不等于 `ip6_route()` 返回 router
-
-`ip6_route()` 返回的是 `netif`，不是 gateway IPv6 address。
-
-Stage 15 的 `nd6_get_next_hop_entry()` 在已知 `netif` 后才判断 destination 是否 on-link。如果 on-link，next hop 就是 destination；否则通过 `LWIP_HOOK_ND6_GET_GW` 或 `nd6_select_router()` 选择 router。[S1](#source-s1)
-
-当前源码核心路径：[S1](#source-s1)
-
-```c
-      if (ip6_addr_islinklocal(ip6addr) ||
-          nd6_is_prefix_in_netif(ip6addr, netif)) {
-        /* Destination in local link. */
-        dest->pmtu = netif_mtu6(netif);
-        ip6_addr_copy(dest->next_hop_addr, dest->destination_addr);
-#ifdef LWIP_HOOK_ND6_GET_GW
-      } else if ((next_hop_addr = LWIP_HOOK_ND6_GET_GW(netif, ip6addr)) != NULL) {
-        /* Next hop for destination provided by hook function. */
-        dest->pmtu = netif->mtu;
-        ip6_addr_set(&dest->next_hop_addr, next_hop_addr);
-#endif /* LWIP_HOOK_ND6_GET_GW */
-      } else {
-        /* We need to select a router. */
-        i = nd6_select_router(ip6addr, netif);
-        if (i < 0) {
-          ip6_addr_set_any(&dest->destination_addr);
-          return ERR_RTE;
-        }
-        dest->pmtu = netif_mtu6(netif);
-        ip6_addr_copy(dest->next_hop_addr, default_router_list[i].neighbor_entry->next_hop_address);
-      }
-```
-
-所以 IPv6 也必须坚持“两步模型”：
-
-```text
-ip6_route()
-    → outgoing netif
-
-ND6 next-hop determination
-    → destination itself or router
-```
-
-## 24. IPv4 与 IPv6 route 的核心差异放到同一张表
-
-| 维度 | IPv4 默认实现 | IPv6 默认实现 |
-| --- | --- | --- |
-| Core route 入口 | `ip4_route_src()` / `ip4_route()` | `ip6_route()` |
-| source 默认是否参与 interface route | 否，除非 `LWIP_HOOK_IP4_ROUTE_SRC` | 是，尤其 scoped/source matching |
-| 直连判定 | `netif->ip_addr + netmask` | zone/scope、static /64、RA on-link prefix |
-| 默认出口 | `netif_default` | `netif_default` |
-| 动态 router 信息 | 默认 route Core 不维护 | ND6 `default_router_list[]` |
-| gateway/next-hop 决策 | `etharp_output()` 中 `netif->gw` / hook | ND6 Destination/Prefix/Default Router |
-| advanced routing hook | IP4 route + ARP gateway hooks | IP6 route + ND6 gateway hooks |
-| 内建通用 LPM route table | 无 | Core 无；contrib 有可选 static route addon |
-
-这张表的重点不是比较“谁更先进”，而是说明两条源码链不能互相套用。
-
-## 25. contrib 已经给了 IPv6 static routing 的参考实现
-
-当前 upstream `contrib/addons/ipv6_static_routing/` 提供了一个很有价值的参考：它没有修改 `ip6.c`，而是通过 hook 接入自己的 static route table。[S3](#source-s3)
-
-README 明确建议：
-
-```text
-LWIP_HOOK_IP6_ROUTE
-    → ip6_static_route()
-
-LWIP_HOOK_ND6_GET_GW
-    → ip6_get_gateway()
-```
-
-这正好对应前面的“两步模型”。
-
-其 `ip6_add_route_entry()` 在插入 route 时按 prefix length 降序排列：[S3](#source-s3)
-
-```c
-  for (i = LWIP_IPV6_NUM_ROUTE_ENTRIES - 1;
-       i > 0 && (ip6_prefix->prefix_len > static_route_table[i - 1].prefix.prefix_len); i--) {
-    SMEMCPY(&static_route_table[i], &static_route_table[i - 1], sizeof(struct ip6_route_entry));
-  }
-
-insert:
-  SMEMCPY(&static_route_table[i].prefix, ip6_prefix, sizeof(struct ip6_prefix));
-  static_route_table[i].netif = netif;
-  static_route_table[i].gateway = gateway;
-```
-
-随后 `ip6_find_route_entry()` 从头线性搜索，因为 table 已按 prefix length 降序排列，第一个匹配自然形成 longest-prefix-match。[S3](#source-s3)
-
-```c
-  for(i = 0; i < LWIP_IPV6_NUM_ROUTE_ENTRIES; i++) {
-    if (memcmp(ip6_dest_addr, &static_route_table[i].prefix.addr,
-        static_route_table[i].prefix.prefix_len / 8) == 0) {
-      idx = i;
-      break;
-    }
-  }
-```
-
-这与默认 IPv4 “遍历 `netif_list` 后第一个 subnet match”形成鲜明对比。
-
-## 26. 用双 `netif` 拓扑把三种 IPv4 route 一次区分
-
-建立纯阅读拓扑：
-
-```text
-en0 = 192.0.2.2/24,    gw 192.0.2.1
-en1 = 198.51.100.2/24, gw 198.51.100.1, netif_default
-```
-
-三种 destination 对应三条不同路径：
+### 15.1 `192.0.2.80`：direct match 到 en0
 
 ```text
 192.0.2.80
-→ ip4_route() 命中 en0 subnet
+→ ip4_route() 命中 en0 的 192.0.2.0/24
+→ outgoing netif = en0
 → etharp_output(en0)
-→ ARP destination itself
-
-198.51.100.80
-→ ip4_route() 命中 en1 subnet
-→ etharp_output(en1)
-→ ARP destination itself
-
-203.0.113.80
-→ 无 direct match
-→ netif_default = en1
-→ etharp_output(en1)
-→ off-link，ARP en1->gw = 198.51.100.1
+→ destination 对 en0 是 on-link
+→ ARP 192.0.2.80
 ```
 
-如果 Socket 再通过 `SO_BINDTODEVICE("en0")` 固定接口，`udp_sendto()` 会直接使用 `en0`，普通 `ip_route()` 不再决定 interface；off-link next hop 随后变成 `en0->gw`。因此 interface binding 不是“route preference”，而是更强的 interface 约束。[S1](#source-s1)
-
-## 27. `ERR_RTE` 要先区分 interface selection 还是 next-hop selection
-
-同一个错误码可能来自不同阶段：
+### 15.2 `198.51.100.80`：direct match 到 en1
 
 ```text
-ip4_route()/ip6_route() 返回 NULL
-→ 没找到 outgoing netif
-
-IPv4 已选 netif，但 off-link 且 netif->gw 为空
-→ etharp_output() 返回 ERR_RTE
-
-IPv6 已选 netif，但 ND6 无 on-link route / gateway hook / default router
-→ next-hop 解析返回 ERR_RTE
+198.51.100.80
+→ ip4_route() 命中 en1 的 198.51.100.0/24
+→ outgoing netif = en1
+→ etharp_output(en1)
+→ destination 对 en1 是 on-link
+→ ARP 198.51.100.80
 ```
 
-当前 Unix example 只有一个静态 `netif`；要实际观察多接口选择，需要扩展为两个 TAP/netif。该双 TAP 运行结果本篇未执行，不把它写成已验证证据。[S2](#source-s2)
+### 15.3 `203.0.113.80`：没有 direct match，先选 default interface，再选 Gateway
 
-## 28. 完整心智模型：route、source、gateway 不是一个动作
+```text
+203.0.113.80
+→ ip4_route() 无 direct subnet match
+→ netif_default = en1
+→ outgoing netif = en1
+→ etharp_output(en1)
+→ 203.0.113.80 对 en1 是 off-link
+→ next hop = en1->gw = 198.51.100.1
+→ ARP 198.51.100.1
+→ Ethernet frame 发给 Gateway MAC
+→ IPv4 dst 仍然是 203.0.113.80
+```
 
-经过前面的源码链，可以把一次普通发送压缩为下面四阶段：
+这里最容易漏掉的中间判断就是：
+
+```text
+已经选出 en1
+≠
+已经决定 ARP 谁
+```
+
+`ip4_route()` 的结果是 interface；`etharp_output()` 才在该 interface 上决定 next hop。
+
+如果 Socket 通过 `SO_BINDTODEVICE("en0")` 固定接口，则普通 route lookup 被绕过，但 next-hop 判断仍然存在：`203.0.113.80` 对 en0 同样是 off-link，所以后续会使用 `en0->gw = 192.0.2.1`。[S1](#source-s1)
+
+## 16. `ERR_RTE` 也要区分“没选出接口”还是“选出接口但没有 Gateway”
+
+同一个 `ERR_RTE` 可以来自不同阶段：
+
+```text
+阶段 A：interface selection
+ip4_route() 返回 NULL
+→ 没有可用 outgoing netif
+
+阶段 B：next-hop selection
+已经得到 outgoing netif
+但 destination 是 off-link
+且该 netif 没有可用 gateway
+→ etharp_output() 返回 ERR_RTE
+```
+
+因此多网口设备出现 `ERR_RTE` 时，不能只问“路由有没有找到”，还要继续确认：
+
+```text
+route 返回了哪张 netif？
+        ↓
+目标对这张 netif 是 on-link 还是 off-link？
+        ↓
+off-link 时 next-hop gateway 从哪里来？
+```
+
+当前 Unix example 只有一个静态 `netif`；要真实观察 `en0/en1` 自动选择，需要后续把 Host 实验扩展为双 TAP/netif。本篇的双接口拓扑用于源码推演，不把它写成已经执行过的运行证据。[S2](#source-s2)
+
+## 17. 把 Stage 18 压缩成四步：Route、Source、Next Hop、ARP
+
+完成源码链后，一次普通 IPv4 发送可以压缩成下面四层决策：
 
 ```mermaid
 flowchart TD
-    A["UDP / TCP / RAW wants to send"] --> B{"PCB bound to netif?"}
-    B -->|yes| C["fixed outgoing netif"]
-    B -->|no| D["ip4_route / ip6_route"]
-    D --> E["outgoing netif"]
-    C --> F["source address selection / validation"]
-    E --> F
-    F --> G["IP output on selected netif"]
-    G --> H["ARP or ND6 next-hop selection"]
-    H --> I["link-layer output"]
+    A["UDP / TCP wants to send IPv4"] --> B{"PCB fixed netif?"}
+    B -->|是| C["outgoing netif 已确定"]
+    B -->|否| D["ip4_route_src() / ip4_route()"]
+    D --> C
+    C --> E["确定 source IPv4"]
+    E --> F{"destination 对该 netif 是 on-link?"}
+    F -->|是| G["next hop = destination"]
+    F -->|否| H["next hop = gateway"]
+    G --> I["ARP next-hop IPv4 → MAC"]
+    H --> I
+    I --> J["Ethernet output"]
 ```
 
-其中：
+四步分别回答：
 
-1. **PCB/interface binding** 可以绕过自动 interface route；
-2. **route selection** 只回答“哪张 `netif`”；
-3. **source selection** 在 selected `netif` 的约束下决定 source IP；
-4. **next-hop selection** 再回答 destination 是直接邻居还是 gateway/router；
-5. 最后才进入 ARP/ND6、MAC address 与 Driver TX。
+1. **Route selection**：这个 packet 从哪张 `netif` 出去；
+2. **Source selection**：该 packet 使用哪个本地 IPv4；
+3. **Next-hop selection**：当前链路上直接交给 destination 还是 gateway；
+4. **ARP**：把那个 next-hop IPv4 解析成 Ethernet MAC。
 
-理解这五步以后，多网口设备上的很多问题就可以被精确定位：
+因此下面几种故障也属于不同层：
 
 ```text
-选错接口
+选错 netif
 ≠
-选错源地址
+选错 source IPv4
 ≠
 gateway 配错
 ≠
-ARP/ND 邻居解析失败
+ARP 解析失败
 ```
 
-## 29. 下一阶段的自然边界：Checksum / Hardware Offload
-
-Stage 18 到这里已经完成“一个 packet 选择哪个 software interface、哪个 source、哪个 next hop”的闭环。
-
-再向下进入 Driver 时，下一个新的独立问题是：
+而 `203.0.113.80 → en1 → 198.51.100.1` 的真正含义现在可以精确表达成：
 
 ```text
-IP/TCP/UDP checksum
-哪些由 lwIP 计算
-哪些可以由硬件生成/验证
-netif checksum flags 如何影响行为
-DMA descriptor/offload 又在哪一层接管
+203.0.113.80
+    = 最终 IPv4 destination
+
+en1
+    = outgoing interface
+
+198.51.100.1
+    = en1 上的当前 next-hop gateway
 ```
 
-这属于新的 Driver/硬件边界，不继续塞进 multi-netif routing 主线。
+## 18. 下一阶段：从选定接口进入 Checksum / Hardware Offload
+
+Stage 18 到这里完成的是软件协议栈发送前半程：
+
+```text
+destination
+→ outgoing netif
+→ source IPv4
+→ next-hop IPv4
+→ ARP / destination MAC
+```
+
+再继续向 Driver 下钻时，新的独立问题变成：
+
+```text
+IP/TCP/UDP checksum 谁计算
+netif checksum flags 怎样控制软件计算
+MAC/DMA 硬件 offload 在哪一层接管
+```
+
+这属于 Stage 19 的 Checksum / Hardware Offload 主线。
 
 ## 资料来源
 
 <a id="source-s1"></a>
-### [S1] lwIP Core 路由、协议输出与 netif 源码
+### [S1] lwIP Core IPv4 route、协议输出、ARP 与 Socket/PCB 源码
 - 类型：目标版本上游源码
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
-- 定位：`src/core/netif.c`：`netif_add()`、`netif_set_default()`；`src/core/ipv4/ip4.c`：`ip4_route_src()`、`ip4_route()`、`ip4_output()`、`ip4_output_if()`；`src/core/ipv4/etharp.c`：`etharp_output()`；`src/core/ipv6/ip6.c`：`ip6_route()`、`ip6_select_source_address()`、`ip6_output()`、`ip6_output_if()`；`src/core/ipv6/nd6.c`：`nd6_find_route()`、`nd6_select_router()`、next-hop path；`src/core/udp.c`、`src/core/tcp.c`、`src/core/tcp_out.c`、`src/api/sockets.c`
+- 定位：`src/core/netif.c`：`netif_add()`、`netif_set_default()`；`src/include/lwip/ip4.h`：`ip4_route_src()` 配置；`src/core/ipv4/ip4.c`：`ip4_route_src()`、`ip4_route()`、`ip4_output()`、`ip4_output_if()`、`ip4_output_if_src()`；`src/core/ipv4/etharp.c`：`etharp_output()`；`src/core/udp.c`：`udp_sendto()`、`udp_sendto_chksum()`、`udp_bind_netif()`；`src/core/tcp.c`：`tcp_connect()`；`src/api/sockets.c`：`SO_BINDTODEVICE`
 - URL/文档：[lwIP upstream commit](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9)
-- 使用位置：route 主链、PCB 固定接口、IPv4 gateway、IPv6 ND/source selection
-- 支撑内容：证明接口选择顺序、default fallback、next-hop 分层和 source selection
+- 使用位置：IPv4 interface selection、default fallback、source address、Gateway/next-hop、ARP、PCB interface binding
+- 支撑内容：证明 route 只返回 outgoing `netif`，而 `etharp_output()` 会在 off-link 场景把 ARP/二层下一跳切换为 gateway；同时证明 IPv4 header 的 destination 在进入 link output 前保持原始目标地址
 
 <a id="source-s2"></a>
-### [S2] Unix example 默认 netif 与 lwIP 配置头
-- 类型：目标版本上游示例与配置
+### [S2] Unix example 默认 netif 与 lwIP netif 配置
+- 类型：目标版本上游 example 与配置
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
 - 定位：`contrib/ports/unix/example_app/default_netif.c`；`src/include/lwip/netif.h`；`src/include/lwip/opt.h`
 - URL/文档：[Unix example_app](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/contrib/ports/unix/example_app)
-- 使用位置：“当前 Unix example”“netif list/default”“双 TAP 边界”
-- 支撑内容：证明 Unix example 的单 netif 现状与 `netif_list/netif_default` 语义
-
-<a id="source-s3"></a>
-### [S3] lwIP contrib IPv6 Static Routing Addon
-- 类型：上游 contrib 参考实现
-- 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
-- 定位：`contrib/addons/ipv6_static_routing/README`、`ip6_route_table.c`、`ip6_route_table.h`
-- URL/文档：[IPv6 static routing addon](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/contrib/addons/ipv6_static_routing)
-- 使用位置：“IPv6 static routing 参考实现”
-- 支撑内容：证明 route/gateway hook 组合以及 prefix-length 降序 lookup
-
-<a id="source-s4"></a>
-### [S4] RFC 4861：IPv6 Neighbor Discovery
-- 类型：IETF 标准
-- 版本：RFC 4861，September 2007
-- URL/文档：[RFC 4861 - Neighbor Discovery for IP version 6](https://www.rfc-editor.org/rfc/rfc4861.html)
-- 使用位置：RA route、default router、IPv6 next-hop
-- 支撑内容：说明 Prefix/Default Router/Destination/Neighbor Cache 的角色
-
-<a id="source-s5"></a>
-### [S5] RFC 5942：IPv6 Subnet Model
-- 类型：IETF 标准
-- 版本：RFC 5942，July 2010
-- URL/文档：[RFC 5942 - IPv6 Subnet Model](https://www.rfc-editor.org/rfc/rfc5942.html)
-- 使用位置：IPv6 static/dynamic subnet 语义
-- 支撑内容：说明 IPv6 address 不自动建立 on-link prefix
-
-<a id="source-s6"></a>
-### [S6] RFC 6724：IPv6 Source Address Selection
-- 类型：IETF 标准
-- 版本：RFC 6724，September 2012
-- URL/文档：[RFC 6724 - Default Address Selection for IPv6](https://www.rfc-editor.org/rfc/rfc6724.html)
-- 使用位置：TCP local source、`ip6_select_source_address()`
-- 支撑内容：说明 IPv6 source candidate set 与选择规则背景
+- 使用位置：“当前 Unix example”“netif_list/netif_default”“双接口阅读模型边界”
+- 支撑内容：证明当前 Unix example 只创建一个默认 netif，而 lwIP Core 仍保留 multi-netif 数据结构与默认接口语义
