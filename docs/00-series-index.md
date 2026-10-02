@@ -4,7 +4,7 @@
 
 Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
 
-## Stage 00～41
+## Stage 00～45
 
 0. [Stage 00：从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](00-ethernet-physical-layer-and-network-stack.md)
    沿物理介质、PHY、MAC、DMA/Driver 到 lwIP netif 建立 Ethernet 收发心智模型，并解释速率协商、抗干扰、冲突与 MAC 过滤。
@@ -94,18 +94,29 @@ Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览
    以 STM32H750 Art-Pi + LAN8720A 为具体硬件案例，从 RT-Thread device init 追到 HAL ETH/RMII、`eth_device`、lwIP `netif` 和 `tcpip_input()`，建立 MCU Ethernet Port 的完整落地链。
 43. [Stage 43：从 `ETH_IRQHandler()` 到 `HAL_ETH_Transmit()`——STM32H7 Ethernet DMA、Descriptor、Cache 与 Zero-copy 边界](43-stm32h7-ethernet-dma-cache-zero-copy.md)
    沿同一 STM32H750 驱动的 RX/TX 数据面追踪 DMA descriptor OWN、IRQ、buffer refill、D-Cache clean/invalidate、RX pbuf copy、TX scatter-gather 与 zero-copy 生命周期边界。
+44. [Stage 44：从 `phy_monitor_thread_entry()` 到 `dhcp_network_changed()`——STM32H750 PHY Link、Auto-negotiation 与 DHCP 恢复](44-stm32-phy-link-dhcp-recovery.md)
+   沿 PHY monitor、BMSR latch-low、Auto-negotiation、MAC speed/duplex 重配置、`eth_device_linkchange()`、lwIP Link flag 与 DHCP reboot/discover 追踪网线插拔后的恢复链。
+45. [Stage 45：从 Link Up 到 MQTT Reconnect——STM32 + RT-Thread + lwIP MCU Cloud Lifecycle](45-mcu-cloud-lifecycle.md)
+   把 Link Ready、IP/DNS/Time Ready、TLS、MQTT CONNECT、Keep Alive、backoff 与 resubscribe 串成产品状态机，明确协议栈自动行为和应用层长期运行责任。
 
-## 后续方向
+## 系列主线完成后的边界
 
-Stage 42～43 已经把前面的通用 Port/RT-Thread 桥接继续落到了 STM32H750 + LAN8720A：先建立 BSP/HAL/`eth_device`/`netif` 的具体 Port，再沿同一驱动把 DMA descriptor、Cache 与 pbuf 数据面走通。后续只剩链路生命周期与完整上云闭环：
+Stage 44～45 已经把 STM32 Ethernet 的 PHY/Link 生命周期继续向上接到完整 Cloud Lifecycle。至此主线从物理链路、DMA/Driver、lwIP Core、RT-Thread Port，一直延伸到 DHCP、DNS、SNTP、TLS、MQTT 与应用侧 reconnect/resubscribe，形成完整闭环。
+
+后续不再为了增加编号机械扩展 lwIP `src/apps` 或 RT-Thread 全量源码。新的专题只有在真实项目需要时再单独展开，例如：
 
 ```text
-Stage 44  PHY / Link 生命周期：MDIO / Auto-Negotiation / Link / DHCP Recovery
-    ↓
-Stage 45  完整 MCU Cloud Lifecycle：DHCP → DNS → SNTP → TLS → MQTT → Reconnect
+具体新 MCU / 新 PHY / 新 Ethernet MAC
+    → 复用 Stage 38～44 的 Port / Driver / Link 方法
+
+新的云平台 / OTA / 设备管理协议
+    → 复用 Stage 34～37 + Stage 45 的 DNS / Time / TLS / Lifecycle 方法
+
+RT-Thread Kernel / Device / DFS / SAL / NetDev 全量源码
+    → 转入独立 RT-Thread Source Lab
 ```
 
-当前 lwIP 系列仍只解释与 lwIP/网络数据面直接相交的 RT-Thread 和 STM32 驱动路径；RT-Thread Device Framework、BSP Framework、内核对象与完整驱动框架留给独立 RT-Thread Source Lab。
+当前 lwIP 系列仍只解释与网络协议、Port、真实 Ethernet 数据面和上云生命周期直接相交的 RT-Thread/STM32 路径；RT-Thread 内核对象、Device Framework、BSP Framework 与完整驱动框架留给独立 RT-Thread Source Lab。
 
 IPv6 不再作为连续源码专题展开；Stage 15 已保留 IPv4/IPv6 的工程心智模型、标准资料与 lwIP 源码入口，项目真正需要 IPv6 时再按模块深入。
 

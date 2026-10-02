@@ -173,6 +173,8 @@ scripts/build.sh all
 | 41 | [从 NetDev 注册到 `socket_init()`——Default NetDev、Protocol Family 与 lwIP / AT Backend 选择](docs/41-rtthread-netdev-multi-backend.md) | 从 lwIP/AT NetDev 注册追踪 `sal_user_data`、default NetDev、primary/secondary family 匹配与 socket backend 绑定，解释同一 BSD API 如何落到不同网络实现。 |
 | 42 | [从 `rt_hw_stm32_eth_init()` 到 `tcpip_input()`——STM32H750 + RT-Thread + lwIP Ethernet Port](docs/42-stm32h750-rtthread-lwip-ethernet-port.md) | 以 STM32H750 Art-Pi + LAN8720A 为真实案例，追踪 BSP/HAL、`eth_device`、`netif`、RX/TX bridge 与 `tcpip_input()`，把通用 Port Contract 落到具体 MCU Ethernet。 |
 | 43 | [从 `ETH_IRQHandler()` 到 `HAL_ETH_Transmit()`——STM32H7 Ethernet DMA、Descriptor、Cache 与 Zero-copy 边界](docs/43-stm32h7-ethernet-dma-cache-zero-copy.md) | 沿 STM32H750 Ethernet RX/TX 数据面追踪 DMA descriptor OWN、D-Cache 一致性、RX copy、TX scatter-gather 与当前 zero-copy 边界。 |
+| 44 | [从 `phy_monitor_thread_entry()` 到 `dhcp_network_changed()`——STM32H750 PHY Link、Auto-negotiation 与 DHCP 恢复](docs/44-stm32-phy-link-dhcp-recovery.md) | 沿 LAN8720A Link/Auto-negotiation、STM32 MAC 重配置、RT-Thread `eth_device` 与 lwIP `netif` 追踪网线插拔后的 Link 与 DHCP 恢复。 |
+| 45 | [从 Link Up 到 MQTT Reconnect——STM32 + RT-Thread + lwIP MCU Cloud Lifecycle](docs/45-mcu-cloud-lifecycle.md) | 把 Link、DHCP、DNS、SNTP、TLS、MQTT 与 reconnect/resubscribe 组织成完整 MCU 上云状态链，明确协议栈自动恢复与应用编排边界。 |
 
 完整索引见 [docs/00-series-index.md](docs/00-series-index.md)。
 
@@ -195,7 +197,7 @@ Gateway    : 198.18.0.1
 lwIP-Source-Lab/
 ├── .github/workflows/        # CI 与文档 Pages
 ├── .vscode/                  # 仅保留通用 build/debug 入口
-├── docs/                     # Stage 00～43 教程
+├── docs/                     # Stage 00～45 教程
 ├── scripts/                  # 5 个通用脚本 + README
 ├── upstream/
 │   └── lwip/                 # 官方 lwIP submodule

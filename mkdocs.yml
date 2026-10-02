@@ -58,6 +58,8 @@ nav:
   - Stage 41：NetDev / Multi-backend: 41-rtthread-netdev-multi-backend.md
   - Stage 42：STM32H750 / RT-Thread / lwIP Ethernet Port: 42-stm32h750-rtthread-lwip-ethernet-port.md
   - Stage 43：STM32H7 Ethernet DMA / Cache / Zero-copy: 43-stm32h7-ethernet-dma-cache-zero-copy.md
+  - Stage 44：PHY / Link / DHCP Recovery: 44-stm32-phy-link-dhcp-recovery.md
+  - Stage 45：MCU Cloud Lifecycle: 45-mcu-cloud-lifecycle.md
 markdown_extensions:
   - admonition
   - attr_list
