@@ -165,6 +165,8 @@ scripts/build.sh all
 | 33 | [从 `https_ex_init()` 到 `http_recv()`——altcp、mbedTLS、TLS Handshake 与 HTTPS 数据通路](docs/33-altcp-tls-https.md) | 从 upstream HTTPS example 追踪 TLS config、TLS outer/TCP inner、mbedTLS handshake、BIO I/O 与解密后的 HTTP callback，理解 HTTPS 如何复用 Stage 32。 |
 | 34 | [从 `mqtt_example_init()` 到 `mqtt_message_received()`——MQTT CONNECT、SUBSCRIBE、PUBLISH 与回调数据通路](docs/34-mqtt.md) | 从 upstream MQTT example 追踪 CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、request queue、ring buffer 与 incoming publish callback。 |
 | 35 | [从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](docs/35-mqtt-tls-reconnect-keepalive.md) | 沿 MQTT TLS 分支追踪 TLS handshake、Keep Alive、request timeout、断线清理和 connection callback，明确应用侧 reconnect/resubscribe 责任。 |
+| 36 | [从 `sntp_example_init()` 到 `sntp_process()`——SNTP、DHCP/DNS、Timer 与系统时间同步](docs/36-sntp-system-time.md) | 从 upstream SNTP example 追踪 Server 来源、DNS/UDP request、response 校验、retry/update Timer 与系统时间 Port，并说明可信时间与 TLS certificate validity 的工程关系。 |
+| 37 | [从 `httpc_get_file_dns()` 到 Body Callback——HTTP/HTTPS Client、DNS、altcp 与下载数据通路](docs/37-http-https-client.md) | 从 HTTP client 公共入口追踪 DNS、altcp/TCP、GET、Header/Body callback，并用 TLS allocator 把同一条 httpc 主线切换成 HTTPS，建立 REST/配置拉取/OTA 下载的网络侧基础。 |
 
 完整索引见 [docs/00-series-index.md](docs/00-series-index.md)。
 
@@ -187,7 +189,7 @@ Gateway    : 198.18.0.1
 lwIP-Source-Lab/
 ├── .github/workflows/        # CI 与文档 Pages
 ├── .vscode/                  # 仅保留通用 build/debug 入口
-├── docs/                     # Stage 00～35 教程
+├── docs/                     # Stage 00～37 教程
 ├── scripts/                  # 5 个通用脚本 + README
 ├── upstream/
 │   └── lwip/                 # 官方 lwIP submodule

@@ -4,7 +4,7 @@
 
 Stage 00 与 Stage 15 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
 
-## Stage 00～35
+## Stage 00～37
 
 0. [Stage 00：从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](00-ethernet-physical-layer-and-network-stack.md)
    沿物理介质、PHY、MAC、DMA/Driver 到 lwIP netif 建立 Ethernet 收发心智模型，并解释速率协商、抗干扰、冲突与 MAC 过滤。
@@ -78,20 +78,34 @@ Stage 00 与 Stage 15 属于 **Theory of Operation / Application Note** 型总�
    从 upstream MQTT example 追踪 client 创建、CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、Packet Identifier、request queue、ring buffer 和 incoming publish callback。
 35. [Stage 35：从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](35-mqtt-tls-reconnect-keepalive.md)
    沿 `mqtt_client_connect()` 的 TLS 分支追踪 TLS handshake、MQTT CONNECT、Keep Alive、request timeout 与 `mqtt_close()`，明确 lwIP 只通知断线而 reconnect/resubscribe 属于应用层。
+36. [Stage 36：从 `sntp_example_init()` 到 `sntp_process()`——SNTP、DHCP/DNS、Timer 与系统时间同步](36-sntp-system-time.md)
+   从 upstream SNTP example 追踪 DHCP/DNS/static Server 来源、UDP request/response、KoD、retry/update Timer 与系统时间 Port，并说明可靠 wall clock 对 TLS 证书有效期验证的工程意义。
+37. [Stage 37：从 `httpc_get_file_dns()` 到 Body Callback——HTTP/HTTPS Client、DNS、altcp 与下载数据通路](37-http-https-client.md)
+   从 HTTP client 公共入口追踪 DNS、altcp connect、HTTP/1.1 GET、Header/Body callback、transfer completion，并说明 TLS allocator 如何让同一 httpc 路径用于 HTTPS、REST 与 OTA 下载。
 
 ## 后续方向
 
-当前主线已在 Stage 32～35 完成 HTTPD、TLS/HTTPS、MQTT 与 MQTT over TLS/Keep Alive/应用侧 Reconnect。下一阶段进入 **MCU 目标板 Port 与真实产品网络集成**：
+Stage 36～37 补齐 SNTP 与 HTTP/HTTPS Client 后，面向 MCU / RTOS / IoT 产品的主要纯软件协议与应用主线基本结束。后续不再按 `src/apps` 目录机械补协议，而是进入 **裁剪/移植 → RT-Thread 集成 → 真实 MCU Ethernet**：
 
 ```text
-MCU Ethernet/Wi-Fi Driver / netif Port
+Stage 38  lwIP 裁剪与移植：lwipopts / build / OS Port / Network Port
     ↓
-RTOS execution context / DMA / Cache / zero-copy
+Stage 39  RT-Thread 如何移植 lwIP：Kconfig / sys_arch / ethernetif / eth_device
     ↓
-DHCP/DNS/link-state 与 Cloud connection orchestration
+Stage 40  RT-Thread Socket / SAL：socket → DFS fd → SAL → lwIP backend
     ↓
-TLS credential / entropy / RAM budget / reconnect state machine
+Stage 41  RT-Thread NetDev / 多网络后端：NetDev → protocol family → lwIP / AT
+    ↓
+Stage 42  STM32 + RT-Thread + lwIP Ethernet Port
+    ↓
+Stage 43  STM32 Ethernet DMA：Descriptor / pbuf / Cache / Zero-copy / IRQ
+    ↓
+Stage 44  PHY / Link 生命周期：MDIO / Auto-Negotiation / Link / DHCP Recovery
+    ↓
+Stage 45  完整 MCU Cloud Lifecycle：DHCP → DNS → SNTP → TLS → MQTT → Reconnect
 ```
+
+Stage 39～41 中的 RT-Thread 只追与 lwIP 相交的流程，达到能够解释网络调用链的深度即停止；RT-Thread Kernel、DFS、Device Framework、SAL/NetDev 全量源码与 BSP/Driver Framework 留给独立 RT-Thread Source Lab。
 
 IPv6 不再作为连续源码专题展开；Stage 15 已保留 IPv4/IPv6 的工程心智模型、标准资料与 lwIP 源码入口，项目真正需要 IPv6 时再按模块深入。
 
