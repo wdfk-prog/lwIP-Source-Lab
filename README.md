@@ -147,7 +147,7 @@ scripts/build.sh all
 | 15 | [IPv4 与 IPv6——从网络层工作原理到嵌入式工程取舍](docs/15-ipv4-ipv6-overview.md) | 从前 14 篇已经建立的 IPv4 主线出发，对照 IPv6 的地址、邻居发现、自动配置、ICMP、分片、DNS 与过渡机制，并说明 MCU、Linux 与云场景需要掌握到什么程度。 |
 | 16 | [从 MTU 到 `ip4_frag()` / `ip4_reass()`——IPv4 分片、重组、超时与内存压力](docs/16-ipv4-fragmentation-reassembly.md) | 沿 IPv4 发送与接收源码链，理解 MTU 如何触发分片、Offset/MF/ID 如何组织片段，以及 lwIP 怎样排序、重组、超时清理并限制资源占用。 |
 | 17 | [从 `IP_ADD_MEMBERSHIP` 到 `igmp_input()`——IPv4 Multicast、IGMPv2、MAC Filter 与组成员状态机](docs/17-igmp-ipv4-multicast.md) | 从 RTP Socket 的 IP_ADD_MEMBERSHIP 入口追踪 IGMPv2 加组、Report/Query/Leave、100 ms Timer、报告抑制与 multicast MAC 映射。 |
-| 18 | [从 `udp_sendto()` 到 `etharp_output()`——Multi-netif IPv4 路由、Default Netif、Gateway 与下一跳](docs/18-multi-netif-routing.md) | 从 UDP/TCP 发送入口追踪 IPv4 multi-netif 出口选择、默认接口、源地址与 Gateway 下一跳，厘清 route、next hop 与 ARP 的职责边界。 |
+| 18 | [从 `udp_sendto()` 到 `netif->output()`——Multi-netif 路由选择、Default Netif、Gateway 与 IPv6 Source Selection](docs/18-multi-netif-routing.md) | 从 UDP/TCP 真实发送入口追踪多 netif 出口选择、默认接口、IPv4 Gateway、IPv6 ND 路由与源地址选择，并说明显式绑定接口和 route hook 的边界。 |
 | 19 | [从 `ip_chksum_pseudo()` 到 `netif->linkoutput()`——lwIP 校验和、Checksum Offload 与驱动边界](docs/19-checksum-hardware-offload.md) | 沿 UDP/TCP 的真实收发路径解释 lwIP Internet checksum、pseudo header、per-netif checksum 控制，并明确软件校验和与 MAC/DMA 硬件卸载之间的驱动职责边界。 |
 | 20 | [从 `netif->linkoutput()` 到 `pbuf_custom`——Ethernet Driver、DMA Buffer、所有权与 Zero-copy](docs/20-ethernet-dma-zero-copy.md) | 从 lwIP 的 linkoutput 边界进入真实 Ethernet Driver，追踪 pbuf chain、DMA buffer、custom pbuf、Cache 一致性与 zero-copy 的所有权闭环。 |
 | 21 | [从 DMA Descriptor Ring 到 `netif->input()`——ISR、Polling、TX Completion 与 Backpressure](docs/21-ethernet-descriptor-ring-backpressure.md) | 沿真实 Ethernet Driver 边界解释 TX/RX descriptor ring、OWN 状态、ISR 与 polling、资源回收、RX starvation 和 backpressure 如何影响 lwIP。 |
@@ -171,6 +171,8 @@ scripts/build.sh all
 | 39 | [从 `lwip_system_init()` 到 `tcpip_input()`——RT-Thread 如何把 lwIP 接进 RTOS 与 Ethernet Device](docs/39-rtthread-lwip-port.md) | 从 RT-Thread 初始化入口追踪 Kconfig/lwipopts、sys_arch、eth_device、erx/etx 与 `tcpip_input()`，把 Stage 38 的 Port Contract 落到真实 RTOS。 |
 | 40 | [从 `socket()` 到 `lwip_socket()`——DFS fd、SAL Socket 与 lwIP Backend](docs/40-rtthread-socket-sal-lwip.md) | 从 BSD Socket 入口追踪 DFS fd、SAL socket、NetDev/backend 选择与 `lwip_socket()`，解释 RT-Thread 怎样把 POSIX 文件描述符语义接到 lwIP Socket/Netconn。 |
 | 41 | [从 NetDev 注册到 `socket_init()`——Default NetDev、Protocol Family 与 lwIP / AT Backend 选择](docs/41-rtthread-netdev-multi-backend.md) | 从 lwIP/AT NetDev 注册追踪 `sal_user_data`、default NetDev、primary/secondary family 匹配与 socket backend 绑定，解释同一 BSD API 如何落到不同网络实现。 |
+| 42 | [从 `rt_hw_stm32_eth_init()` 到 `tcpip_input()`——STM32H750 + RT-Thread + lwIP Ethernet Port](docs/42-stm32h750-rtthread-lwip-ethernet-port.md) | 以 STM32H750 Art-Pi + LAN8720A 为真实案例，追踪 BSP/HAL、`eth_device`、`netif`、RX/TX bridge 与 `tcpip_input()`，把通用 Port Contract 落到具体 MCU Ethernet。 |
+| 43 | [从 `ETH_IRQHandler()` 到 `HAL_ETH_Transmit()`——STM32H7 Ethernet DMA、Descriptor、Cache 与 Zero-copy 边界](docs/43-stm32h7-ethernet-dma-cache-zero-copy.md) | 沿 STM32H750 Ethernet RX/TX 数据面追踪 DMA descriptor OWN、D-Cache 一致性、RX copy、TX scatter-gather 与当前 zero-copy 边界。 |
 
 完整索引见 [docs/00-series-index.md](docs/00-series-index.md)。
 
@@ -193,7 +195,7 @@ Gateway    : 198.18.0.1
 lwIP-Source-Lab/
 ├── .github/workflows/        # CI 与文档 Pages
 ├── .vscode/                  # 仅保留通用 build/debug 入口
-├── docs/                     # Stage 00～41 教程
+├── docs/                     # Stage 00～43 教程
 ├── scripts/                  # 5 个通用脚本 + README
 ├── upstream/
 │   └── lwip/                 # 官方 lwIP submodule

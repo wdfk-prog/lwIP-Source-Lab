@@ -56,6 +56,8 @@ nav:
   - Stage 39：RT-Thread / lwIP Port: 39-rtthread-lwip-port.md
   - Stage 40：Socket / DFS / SAL / lwIP: 40-rtthread-socket-sal-lwip.md
   - Stage 41：NetDev / Multi-backend: 41-rtthread-netdev-multi-backend.md
+  - Stage 42：STM32H750 / RT-Thread / lwIP Ethernet Port: 42-stm32h750-rtthread-lwip-ethernet-port.md
+  - Stage 43：STM32H7 Ethernet DMA / Cache / Zero-copy: 43-stm32h7-ethernet-dma-cache-zero-copy.md
 markdown_extensions:
   - admonition
   - attr_list

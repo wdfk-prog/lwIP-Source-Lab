@@ -42,8 +42,8 @@ Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览
    沿 IPv4 发送与接收源码链，理解 MTU 如何触发分片、Offset/MF/ID 如何组织片段，以及 lwIP 怎样排序、重组、超时清理并限制资源占用。
 17. [Stage 17：从 `IP_ADD_MEMBERSHIP` 到 `igmp_input()`——IPv4 Multicast、IGMPv2、MAC Filter 与组成员状态机](17-igmp-ipv4-multicast.md)
    从 RTP Socket 的 IP_ADD_MEMBERSHIP 入口追踪 IGMPv2 加组、Report/Query/Leave、100 ms Timer、报告抑制与 multicast MAC 映射。
-18. [Stage 18：从 `udp_sendto()` 到 `etharp_output()`——Multi-netif IPv4 路由、Default Netif、Gateway 与下一跳](18-multi-netif-routing.md)
-   从 UDP/TCP 发送入口追踪 IPv4 multi-netif 出口选择、默认接口、源地址与 Gateway 下一跳，厘清 route、next hop 与 ARP 的职责边界。
+18. [Stage 18：从 `udp_sendto()` 到 `netif->output()`——Multi-netif 路由选择、Default Netif、Gateway 与 IPv6 Source Selection](18-multi-netif-routing.md)
+   从 UDP/TCP 真实发送入口追踪多 netif 出口选择、默认接口、IPv4 Gateway、IPv6 ND 路由与源地址选择，并说明显式绑定接口和 route hook 的边界。
 19. [Stage 19：从 `ip_chksum_pseudo()` 到 `netif->linkoutput()`——lwIP 校验和、Checksum Offload 与驱动边界](19-checksum-hardware-offload.md)
    沿 UDP/TCP 的真实收发路径解释 lwIP Internet checksum、pseudo header、per-netif checksum 控制，并明确软件校验和与 MAC/DMA 硬件卸载之间的驱动职责边界。
 20. [Stage 20：从 `netif->linkoutput()` 到 `pbuf_custom`——Ethernet Driver、DMA Buffer、所有权与 Zero-copy](20-ethernet-dma-zero-copy.md)
@@ -90,22 +90,22 @@ Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览
    从 BSD Socket 入口追踪 DFS fd、SAL socket、NetDev/backend 选择与 `lwip_socket()`，解释 RT-Thread 怎样把 POSIX 文件描述符语义接到 lwIP Socket/Netconn。
 41. [Stage 41：从 NetDev 注册到 `socket_init()`——Default NetDev、Protocol Family 与 lwIP / AT Backend 选择](41-rtthread-netdev-multi-backend.md)
    从 lwIP/AT NetDev 注册追踪 `sal_user_data`、default NetDev、primary/secondary family 匹配与 socket backend 绑定，解释同一 BSD API 如何落到不同网络实现。
+42. [Stage 42：从 `rt_hw_stm32_eth_init()` 到 `tcpip_input()`——STM32H750 + RT-Thread + lwIP Ethernet Port](42-stm32h750-rtthread-lwip-ethernet-port.md)
+   以 STM32H750 Art-Pi + LAN8720A 为具体硬件案例，从 RT-Thread device init 追到 HAL ETH/RMII、`eth_device`、lwIP `netif` 和 `tcpip_input()`，建立 MCU Ethernet Port 的完整落地链。
+43. [Stage 43：从 `ETH_IRQHandler()` 到 `HAL_ETH_Transmit()`——STM32H7 Ethernet DMA、Descriptor、Cache 与 Zero-copy 边界](43-stm32h7-ethernet-dma-cache-zero-copy.md)
+   沿同一 STM32H750 驱动的 RX/TX 数据面追踪 DMA descriptor OWN、IRQ、buffer refill、D-Cache clean/invalidate、RX pbuf copy、TX scatter-gather 与 zero-copy 生命周期边界。
 
 ## 后续方向
 
-Stage 38～41 已经完成“标准 lwIP Port Contract → RT-Thread RTOS/以太网适配 → BSD Socket/DFS/SAL → NetDev 多后端选择”这条软件集成主线。后续开始进入具体 STM32 Ethernet Driver 与 MCU 上云生命周期：
+Stage 42～43 已经把前面的通用 Port/RT-Thread 桥接继续落到了 STM32H750 + LAN8720A：先建立 BSP/HAL/`eth_device`/`netif` 的具体 Port，再沿同一驱动把 DMA descriptor、Cache 与 pbuf 数据面走通。后续只剩链路生命周期与完整上云闭环：
 
 ```text
-Stage 42  STM32 + RT-Thread + lwIP Ethernet Port
-    ↓
-Stage 43  STM32 Ethernet DMA：Descriptor / pbuf / Cache / Zero-copy / IRQ
-    ↓
 Stage 44  PHY / Link 生命周期：MDIO / Auto-Negotiation / Link / DHCP Recovery
     ↓
 Stage 45  完整 MCU Cloud Lifecycle：DHCP → DNS → SNTP → TLS → MQTT → Reconnect
 ```
 
-Stage 39～41 中的 RT-Thread 只追与 lwIP 相交的流程，达到能够解释网络调用链的深度即停止；RT-Thread Kernel、DFS、Device Framework、SAL/NetDev 全量源码与 BSP/Driver Framework 留给独立 RT-Thread Source Lab。
+当前 lwIP 系列仍只解释与 lwIP/网络数据面直接相交的 RT-Thread 和 STM32 驱动路径；RT-Thread Device Framework、BSP Framework、内核对象与完整驱动框架留给独立 RT-Thread Source Lab。
 
 IPv6 不再作为连续源码专题展开；Stage 15 已保留 IPv4/IPv6 的工程心智模型、标准资料与 lwIP 源码入口，项目真正需要 IPv6 时再按模块深入。
 
