@@ -2,20 +2,56 @@
 
 # 教程 09：从 `tcp_slowtmr()` 到 Fast Retransmit——TCP 超时重传与重复 ACK
 
-> 摘要：从 Stage 8 的待确认队列继续追踪，理解 lwIP 如何用重传超时与重复 ACK 两类 loss signal 触发重传，并改变 congestion-control 状态与发送队列。
+> 摘要：沿 lwIP 的 RTO 与 Fast Retransmit 源码路径，映射 RFC 定义的丢包恢复机制到 timer、ACK 判定、发送队列与拥塞控制状态。
 
 [TOC]
 
-本文源码块采用统一约定：除非代码块前明确标注为“上游连续源码片段”，其余 C 代码块一律视为按当前 revision 裁剪的“执行路径阅读版”。阅读版只删除与当前主线无关的注释、条件编译或旁支，不重排保留语句，也不使用省略号伪装缺失源码；示意代码会另行标注。
 
-Stage 8 的正常路径是：segment 从 `unsent` 发出，进入 `unacked`，随后被新的累计 ACK 清理。如果 ACK 没有按预期推进，TCP 必须回答另一个问题：**什么时候可以推断某个 segment 丢了，并重新发送？**
+Stage 8 已经建立了 TCP（Transmission Control Protocol，传输控制协议）正常发送路径：应用写入的字节被组织成 segment，发送后进入 `unacked`（lwIP 保存“已经发出但尚未被累计确认”的 segment 队列），对端返回累计 ACK（Acknowledgment，确认号）后，已确认 segment 才能释放。Stage 9 研究的是这个正常闭环被“丢包或确认长期不推进”打断后，TCP 怎样判断需要重传，以及 lwIP 用哪些 timer、PCB（Protocol Control Block，协议控制块）字段和队列动作实现恢复。
 
-lwIP 主要有两条不同的证据链：
+## 阅读源码前：建议提前阅读
 
-1. 等待时间达到 retransmission timeout；
-2. 连续收到满足条件的 duplicate ACK，在 timeout 之前触发 fast retransmit。
+下面资料用于校准协议语义和抓包术语，但不是继续阅读本文的强制前置条件。这里先给出阅读用途：第一份资料讲“如何从往返时延得到重传等待时间”，第二份讲“重复确认怎样触发快速重传与拥塞恢复”，第三份讲 Wireshark 怎样给这些现象打分析标签。后文会在进入源码前把对应术语逐一解释。
 
-两者都会重新发送数据，但触发条件、队列动作和 congestion-control 状态并不相同。[S1](#source-s1)[S2](#source-s2)
+1. [RFC 6298 — Computing TCP's Retransmission Timer](https://www.rfc-editor.org/rfc/rfc6298.html)：用于理解 TCP 怎样测量往返时延，并据此决定“等多久仍收不到确认就该重传”；建议重点看等待时间如何更新，以及连续超时为什么要逐步拉长下一次等待。[S4](#source-s4)
+2. [RFC 5681 — TCP Congestion Control](https://www.rfc-editor.org/rfc/rfc5681.html)：用于理解“连续收到相同确认号”为什么可作为丢包信号，以及快速重传后 sender 为什么还要进入一段拥塞恢复过程并调整发送窗口。[S5](#source-s5)
+3. [Wireshark User's Guide — TCP Analysis](https://www.wireshark.org/docs/wsug_html_chunked/ChAdvTCPAnalysis.html)：用于理解抓包中的 `Retransmission`、`Fast Retransmission`、`Dup ACK` 等分析标签；这些标签是分析器判断，不等同于 lwIP 内部 PCB 状态。[S8](#source-s8)
+
+## 先建立丢包恢复模型：RTO 与 duplicate ACK 是两条不同的证据路径
+
+**RTT（Round-Trip Time，往返时间）**表示一个 TCP segment 发出后，到与它相关的 ACK 返回所经历的往返时延。TCP 不应把重传等待时间写成固定常量，因此会根据 RTT 样本维护 **RTO（Retransmission Timeout，重传超时）**：某批已发送数据在 RTO 内始终没有得到足够的 ACK 推进，就认为“等待已经超过当前网络时延模型能够解释的范围”，进入 timeout retransmission。[S4](#source-s4)
+
+另一条证据来自 **duplicate ACK（重复 ACK）**。TCP 的累计 ACK 表示“这个 ACK 之前的连续 sequence space 已收到，下一步仍然期望 ACK 值指向的 byte”。如果后续数据已经到达，但中间出现一个 gap，receiver 会反复确认同一个 next expected sequence number。连续 duplicate ACK 因而可以在 RTO 到期前暴露“前面很可能缺了一段”。RFC 5681 把第三个 duplicate ACK 作为 Fast Retransmit 的经典触发条件。[S5](#source-s5)
+
+这里还会反复出现两个拥塞控制字段：**`cwnd`（congestion window，拥塞窗口）**限制 sender 因拥塞控制允许同时在途的数据量；**`ssthresh`（slow-start threshold，慢启动阈值）**决定 slow start 与 congestion avoidance 的边界。**Fast Recovery（快速恢复）**是 Fast Retransmit 之后的一段拥塞控制阶段：sender 不必像 timeout 那样完全回到最保守的起点，而是利用仍在返回的 duplicate ACK 维持受控发送，直到新的累计 ACK 证明缺口已经跨过去。丢包既是可靠性问题，也是拥塞信号，因此 timeout 与 Fast Retransmit 都会改变这些字段，但恢复策略不同。[S5](#source-s5)
+
+把两条恢复路径放在同一张协议导航图中：
+
+```mermaid
+flowchart TD
+    A["segment 已发送并进入 unacked"] --> B{"累计 ACK 是否推进？"}
+    B -->|是| C["释放已确认 segment，继续正常发送"]
+    B -->|否| D{"连续 duplicate ACK 是否达到 Fast Retransmit 条件？"}
+    D -->|是| E["Fast Retransmit：重传疑似缺失 segment"]
+    E --> F["进入 Fast Recovery，调整 cwnd / ssthresh"]
+    D -->|否| G{"RTO 是否到期？"}
+    G -->|否| H["继续等待 ACK 或后续 timer"]
+    G -->|是| I["RTO retransmission：重传最老未确认数据"]
+    I --> J["RTO backoff，收缩拥塞窗口"]
+```
+
+这张图只描述协议恢复逻辑。进入源码后，关键映射如下：
+
+| 协议动作/状态 | lwIP 关键位置 | 主要对象/字段 | 下一步 |
+| --- | --- | --- | --- |
+| 已发送但未累计确认 | `tcp_output()` 之后的发送队列 | `pcb->unacked` | 等待 ACK 或 timer |
+| RTO 计时推进 | `tcp_slowtmr()` | `rtime`、`rto` | 判断 `rtime >= rto` |
+| timeout 重传 | `tcp_rexmit_rto_prepare()` / `tcp_rexmit_rto_commit()` | `unacked`、`unsent`、`nrtx`、`rto_end` | 重新交给 output path |
+| duplicate ACK 计数 | `tcp_receive()` | `dupacks` | 达到阈值后触发 fast path |
+| Fast Retransmit / Recovery | `tcp_rexmit_fast()` | `TF_INFR`、`cwnd`、`ssthresh` | 等待后续新 ACK 退出 recovery |
+| RTT/RTO 更新 | ACK 推进路径 | `rttest`、`rtseq`、`sa`、`sv`、`rto` | 为后续 timeout 提供新的等待尺度 |
+
+下面从这些状态真正落在 lwIP 中的位置开始：`unacked`。
 
 ## 1. 重传从 `unacked` 开始
 
@@ -296,7 +332,7 @@ unsent:   A -> B -> C -> D -> E
 
 队列重排之后，`TF_RTO` 记录“当前处于 RTO recovery”，`rto_end` 记录这轮 recovery 覆盖到的 sequence 边界，而 `rttest = 0` 停止当前 RTT sample。发生重传后，一个 ACK 已经无法唯一说明它确认的是原始发送还是重传副本，因此不能继续把这个 ACK 当成无歧义 RTT 样本。
 
-## 5. timeout 之后，发送窗口状态也会收缩
+## 5. lwIP 怎样落实 timeout 后的拥塞窗口收缩
 
 `tcp_slowtmr()` 在 prepare 与 commit 之间修改 congestion-control 状态：[S1](#source-s1)
 
@@ -321,7 +357,7 @@ cwnd 回到一个 MSS
 
 `cwnd` 与 `snd_wnd` 的区别在 Stage 8 已经建立：前者由本地 congestion control 管理，后者来自 peer 的 flow-control advertisement。这里取两者较小值来形成 loss 后的阈值基础。[S1](#source-s1)[S5](#source-s5)
 
-## 6. RTO backoff 为什么会让下一次等待更久
+## 6. lwIP 怎样把 RFC 6298 的 RTO backoff 落到 `rto`
 
 prepare 成功后，`tcp_slowtmr()` 不会沿用第一次 timeout 的等待长度。当前代码根据 `nrtx` 选择 `tcp_backoff[]` 中的指数，并把平滑 RTT 基值左移相应位数：[S1](#source-s1)
 
@@ -376,6 +412,8 @@ tcp_rexmit_rto_commit(struct tcp_pcb *pcb)
 `tcp_rexmit_rto_prepare()` 只负责把 `unacked` 重新排进 `unsent` 并建立 RTO recovery 状态；`tcp_slowtmr()` 在两者之间先调整 `rto/cwnd/ssthresh`；`tcp_rexmit_rto_commit()` 最后增加重传次数并调用正常的 `tcp_output()`。
 
 这样重新发送的数据仍然受到 Stage 8 已经读过的正常发送窗口规则约束，而不是绕过 `cwnd` / `snd_wnd` 直接把所有旧 segment 一次性发出去。
+
+到这里，RTO timeout 这条恢复路径已经闭环：timer 判断超时，`prepare()`/`commit()` 重排发送队列，并同步更新重传与拥塞状态。下面切换到协议总图中的另一条 loss signal——**duplicate ACK**；这条路径不等待 RTO 到期，而是根据 ACK 序列提前推断 gap。
 
 ## 8. Duplicate ACK 是另一种 loss signal
 
@@ -476,7 +514,7 @@ if (pcb->unacked != NULL && !(pcb->flags & TF_INFR)) {
 
 这里和 RTO 的队列动作有本质区别：RTO prepare 把**全部** `unacked` 合回 `unsent`；Fast Retransmit 首先重排第一个 `unacked`。`TF_INFR` 防止同一个 recovery episode 重复执行首次 fast retransmit。
 
-## 10. RTO 与 Fast Retransmit 不要混成同一种“重发”
+## 10. 两种标准 recovery 在 lwIP 中落到不同队列动作
 
 | 维度 | RTO | Fast Retransmit |
 | --- | --- | --- |
@@ -489,7 +527,9 @@ if (pcb->unacked != NULL && !(pcb->flags & TF_INFR)) {
 
 所以看到“同一个 SEQ 又发送了一次”只能证明发生了 retransmission，不能单凭这一帧判断到底是 timeout 还是 fast retransmit。必须结合 ACK 序列和 PCB 状态判断。
 
-## 11. Round-Trip Time 如何影响 `rto`
+RTO retransmission 与 Fast Retransmit 两条重传触发路径到这里都已经出现。最后还需要回到它们共同依赖的时间尺度：ACK 正常推进时，lwIP 怎样从 RTT 样本重新计算后续 `rto`。
+
+## 11. lwIP 的 RTT estimator 如何回到 `rto`
 
 TCP 不能把每条网络路径都假设成固定延迟。lwIP PCB 保存平滑后的往返时间估计状态 `sa`、variation 状态 `sv`，并据此得到正常情况下的 `rto`；新 ACK 推进时会重置 `rto` 到由这些估计推导的值。[S3](#source-s3)[S6](#source-s6)
 
@@ -579,3 +619,9 @@ Stage 10 会继续研究另一类 ACK 现象的来源：如果接收端实际收
 - URL/文档：[`src/core/timeouts.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/timeouts.c)、[`src/include/lwip/priv/tcp_priv.h`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/include/lwip/priv/tcp_priv.h)
 - 使用位置：`sys_timeouts_init()` 跳过 TCP、`TCP_REG()`、`tcp_timer_needed()`、`tcpip_tcp_timer()`、250 ms reschedule
 - 支撑内容：证明 TCP timer 不是 boot 时永久启动，也没有独立 timer thread，而是 active/TIME-WAIT PCB 出现后通过通用 timeout scheduler 按需运行
+<a id="source-s8"></a>
+### [S8] Wireshark TCP Analysis
+- URL/文档：[Wireshark User's Guide — TCP Analysis](https://www.wireshark.org/docs/wsug_html_chunked/ChAdvTCPAnalysis.html)
+- 使用位置：源码前抓包前置阅读、Retransmission/Fast Retransmission/Dup ACK/Out-Of-Order 标签的边界说明
+- 支撑内容：Wireshark 对 TCP analysis flags 的识别条件；用于帮助把抓包现象与 RFC/lwIP 状态分层，不作为 lwIP 内部状态的直接证据
+

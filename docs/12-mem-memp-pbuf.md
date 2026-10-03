@@ -6,20 +6,42 @@
 
 [TOC]
 
-本文源码块采用统一约定：除非代码块前明确标注为“上游连续源码片段”，其余 C 代码块一律视为按当前 revision 裁剪的“执行路径阅读版”。阅读版只删除与当前主线无关的注释、条件编译或旁支，不重排保留语句，也不使用省略号伪装缺失源码；示意代码会另行标注。
 
-前面的文章已经遇到很多“分配失败”入口：
+前面的文章已经遇到很多“分配失败”入口：`pbuf_alloc()`、`udp_new()`、`tcp_new()`、`netconn_new()`、`tcpip_inpkt()`。这里的 **allocator（内存分配器）**泛指“根据某种资源策略取得并回收内存/对象”的机制。如果把这些入口全部理解成同一个 `malloc()`，就会误判资源瓶颈：一个系统可能还有 variable-size heap 空间，却已经耗尽 TCP PCB 这类固定对象池；也可能控制对象充足，却因为 packet buffer pool 不够而无法接收新帧。
+
+## 阅读源码前：建议提前阅读
+
+1. [lwIP 2.1.x — Packet buffers (PBUF)](https://www.nongnu.org/lwip/2_1_x/group__pbuf.html)：用于理解 packet buffer 的四类主要存储/引用策略、pbuf chain 与 payload ownership；具体的 `PBUF_RAM/PBUF_POOL/PBUF_REF/PBUF_ROM` 名称会在下节逐一落到 allocator。[S9](#source-s9)
+2. [lwIP 2.1.x — Heap and memory pools](https://www.nongnu.org/lwip/2_1_x/group__lwip__opts__mem.html)：用于理解 `MEM_SIZE`、`MEM_LIBC_MALLOC`、`MEMP_MEM_MALLOC` 等 allocator 配置如何改变 backend。[S10](#source-s10)
+3. [`src/core/mem.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/mem.c) 与 [`src/core/memp.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/memp.c)：用于对照本文后续实际阅读的 variable-size allocator 与 typed pool 实现。[S1](#source-s1)[S2](#source-s2)
+
+## 先建立统一资源模型：`mem`、`memp`、`pbuf` 不是三个互斥 allocator
+
+**`mem`** 是 lwIP 的 variable-size memory allocator abstraction。默认配置可以使用 lwIP 自带 heap，也可以通过配置切换到 libc/custom allocator；因此 `mem_malloc()` 描述的是“需要一块可变长度内存”的语义，而不是永远等于某个固定实现。[S1](#source-s1)[S8](#source-s8)
+
+**`memp`** 是 typed fixed-size pool 体系。每一种 `MEMP_*` 类型描述一种对象类别，例如 UDP PCB、TCP PCB、TCP segment、Netconn 或 tcpip message。典型配置会为不同类型保留独立数量预算，所以某一类对象耗尽不代表其他 pool 也同时耗尽。[S2](#source-s2)
+
+**`pbuf`** 则是 packet buffer API 与 ownership policy。它根据 pbuf type 把“需要怎样的数据缓冲区”路由到不同底层来源：`PBUF_RAM` 通常需要一块可写、长度随 packet 变化的连续 allocation；`PBUF_POOL` 从 packet pool 获取一个或多个 buffer；`PBUF_REF` / `PBUF_ROM` 主要创建 pbuf metadata 去引用外部 payload，其 payload lifetime 不能按普通 `PBUF_RAM` 处理。[S3](#source-s3)[S9](#source-s9)
+
+因此三者的关系不是：
 
 ```text
-pbuf_alloc(PBUF_RAM / PBUF_POOL)
-udp_new()
-tcp_new()/tcp_alloc()
-tcp_listen()
-netconn_new()
-tcpip_inpkt()
+mem vs memp vs pbuf，三选一
 ```
 
-如果把它们都理解成“heap malloc”，会直接误判资源瓶颈。当前 lwIP 把内存管理拆成三个互相关联、但语义不同的层次：`mem`、`memp` 与 `pbuf`。[S1](#source-s1)[S2](#source-s2)[S3](#source-s3)
+而是：
+
+```text
+调用者先表达“我要什么对象/packet ownership”
+        ↓
+pbuf 或具体协议对象 API 决定资源类别
+        ↓
+最终落到 mem、某个 MEMP_* pool，或外部 payload 引用
+```
+
+后文还会区分两个很容易混淆的配置：**`PBUF_POOL_SIZE`** 是 packet pool 中 payload buffer 的数量；**`MEMP_NUM_PBUF`** 是 `MEMP_PBUF` metadata pool 的数量。二者名字都含 PBUF，但并不是同一个池。[S2](#source-s2)[S6](#source-s6)
+
+下面不按 allocator 文件顺序讲，而是先从已经在前文真实出现过的 allocation call 反查：每一次分配最终落到了哪里。
 
 ## 1. 先从三个已经见过的真实 allocation call 对比
 
@@ -205,13 +227,19 @@ pool 空了就返回 `NULL`，`memp_malloc()` 自己不会去借另一个类型�
 
 这张表最重要的不是记数字，而是说明 resource budgeting 要按对象类型做。比如高并发 TCP connection 可能先碰 `MEMP_TCP_PCB`；高吞吐 RX burst 可能先压 `PBUF_POOL`；大量 pending TX segments 又可能先消耗 `MEMP_TCP_SEG`。
 
-## 5. `pbuf` 为什么横跨 `mem` 和 `memp`
+## 5. `pbuf` type 怎样决定底层 allocator 与 payload ownership
 
-`pbuf` 是 packet-buffer abstraction，本身并不是第三套底层 heap。`pbuf_alloc(layer, length, type)` 内部的 `switch(type)` 明确把不同 pbuf policy 路由到不同 allocator。[S3](#source-s3)
+四种 pbuf type 在这里要同时看“数据存在哪里”和“谁负责 payload 生命周期”：`PBUF_RAM` 让 lwIP 为 metadata 与 payload 准备可写的 variable-size allocation；`PBUF_POOL` 从 packet pool 取得一个或多个 element；`PBUF_REF` / `PBUF_ROM` 的 pbuf metadata 来自 `MEMP_PBUF`，payload 则引用外部存储，因此外部 owner 必须保证引用期间 payload 仍然有效。[S3](#source-s3)[S9](#source-s9) 下面继续沿 `pbuf_alloc()` 看这四类 policy 怎样映射到前面的 `mem/memp` 资源域。
+
+| pbuf policy | 当前 allocator 路径 | 资源压力落点 |
+| --- | --- | --- |
+| `PBUF_RAM` | `mem_malloc()` | variable heap / configured backend |
+| `PBUF_POOL` | `MEMP_PBUF_POOL` | packet pool element 数量与 element size |
+| `PBUF_REF` / `PBUF_ROM` | `MEMP_PBUF` metadata | pbuf metadata pool；payload 由外部 owner 管理 |
 
 ### 5.1 `PBUF_POOL`：循环从 `MEMP_PBUF_POOL` 取 element
 
-当前源码不是只调用一次 `memp_malloc()`，而是按剩余长度循环构造 pbuf chain：[S3](#source-s3)
+当前源码按剩余长度循环构造 pbuf chain，而不是假设一个 pool element 永远容纳整包：[S3](#source-s3)
 
 ```c
 case PBUF_POOL: {
@@ -220,78 +248,13 @@ case PBUF_POOL: {
   p = NULL;
   last = NULL;
   rem_len = length;
-  do {
-    u16_t qlen;
-    q = (struct pbuf *)memp_malloc(MEMP_PBUF_POOL);
-    if (q == NULL) {
-      PBUF_POOL_IS_EMPTY();
-      if (p) {
-        pbuf_free(p);
-      }
-      return NULL;
-    }
-    qlen = LWIP_MIN(rem_len,
-                    (u16_t)(PBUF_POOL_BUFSIZE_ALIGNED - LWIP_MEM_ALIGN_SIZE(offset)));
-    pbuf_init_alloced_pbuf(q,
-                           LWIP_MEM_ALIGN((void *)((u8_t *)q + SIZEOF_STRUCT_PBUF + offset)),
-                           rem_len, qlen, type, 0);
-    if (p == NULL) {
-      p = q;
-    } else {
-      last->next = q;
-    }
-    last = q;
-    rem_len = (u16_t)(rem_len - qlen);
-    offset = 0;
-  } while (rem_len > 0);
-  break;
-}
 ```
 
-如果中途某个 pool element 分配失败，当前已经建立的 chain 会先 `pbuf_free(p)` 回滚，而不是把半条 packet chain 留给调用者。这也是为什么一个大 frame 可能因为 pool 中“剩余 element 个数不足”而整体 allocation 失败。
+每次从 `MEMP_PBUF_POOL` 取得 element，再按当前 element 可承载长度推进 `rem_len`；因此大 packet 可以消耗多个 pool element。官方 PBUF 文档也明确 `PBUF_POOL` 可能返回 pbuf chain，而不是单节点。[S9](#source-s9)
 
-### 5.2 `PBUF_RAM`：一次 variable-size `mem_malloc()`
+### 5.2 `PBUF_RAM` 与引用型 pbuf 的差异只保留 allocator 映射
 
-`PBUF_RAM` 走的是另一条路径：[S3](#source-s3)
-
-```c
-case PBUF_RAM: {
-  mem_size_t payload_len =
-      (mem_size_t)(LWIP_MEM_ALIGN_SIZE(offset) + LWIP_MEM_ALIGN_SIZE(length));
-  mem_size_t alloc_len =
-      (mem_size_t)(LWIP_MEM_ALIGN_SIZE(SIZEOF_STRUCT_PBUF) + payload_len);
-
-  if ((payload_len < LWIP_MEM_ALIGN_SIZE(length)) ||
-      (alloc_len < LWIP_MEM_ALIGN_SIZE(length))) {
-    return NULL;
-  }
-
-  p = (struct pbuf *)mem_malloc(alloc_len);
-  if (p == NULL) {
-    return NULL;
-  }
-  pbuf_init_alloced_pbuf(p,
-                         LWIP_MEM_ALIGN((void *)((u8_t *)p + SIZEOF_STRUCT_PBUF + offset)),
-                         length, length, type, 0);
-  break;
-}
-```
-
-所以 `PBUF_RAM` 消耗的是 variable heap；metadata、headroom 和 payload backing memory 位于同一次 allocation 中。
-
-### 5.3 `PBUF_REF` / `PBUF_ROM`：只分配 metadata
-
-这两类 payload 由外部 owner 提供，`pbuf_alloc_reference()` 只从 `MEMP_PBUF` 获取 `struct pbuf` metadata：[S3](#source-s3)
-
-```c
-p = (struct pbuf *)memp_malloc(MEMP_PBUF);
-if (p == NULL) {
-  return NULL;
-}
-pbuf_init_alloced_pbuf(p, payload, length, length, type, 0);
-```
-
-因此“REF/ROM 是 zero-copy”不能理解成“完全不占 lwIP resource”。payload 可以不复制，但 metadata 仍消耗 `MEMP_PBUF`；如果外部 buffer lifetime 不足以覆盖异步排队时间，还必须通过 `pbuf_take()` 等方式转成自有数据。
+`PBUF_RAM` 的关键实现事实是一次 `mem_malloc()` 覆盖 pbuf metadata、headroom 与 payload；`PBUF_REF/PBUF_ROM` 则通过 `MEMP_PBUF` 分配 metadata，payload 不由普通 pbuf allocator 复制/持有。[S3](#source-s3) 更细的 payload lifetime 已在 Stage 3 讲过，Stage 20 还会把引用型/custom pbuf 接到 DMA buffer ownership，因此这里不再重复 packet-lifetime 教程。
 
 ## 6. `PBUF_POOL_SIZE` 与 `MEMP_NUM_PBUF` 不是同一个池
 
@@ -493,25 +456,17 @@ lwIP 的 stats 配置可以记录 `mem`、`memp`、protocol 等统计；pool sta
 
 这种分类比盲目增大 `MEM_SIZE` 更接近真正的 sizing 问题。
 
-## 12. 三个配置可以改变 allocator 模型
+## 12. 改变 allocator backend 后，资源模型为什么必须重算
 
-最后再看三个会改变底层实现的选项，因为到这里已经知道默认路径是什么。[S8](#source-s8)
+`MEM_LIBC_MALLOC`、`MEM_CUSTOM_ALLOCATOR` 与 `MEMP_MEM_MALLOC` 会直接改变“谁真正提供内存”和“typed pool 是否仍有独立硬上限”。因此前面建立的 internal heap + typed fixed pools 模型只适用于对应配置，切换 backend 后必须重新判断 allocation source、线程/中断上下文约束和资源上限。[S8](#source-s8)[S10](#source-s10)
 
-### 12.1 `MEM_LIBC_MALLOC`
+| 配置 | 改变什么 | 需要重新检查的假设 |
+| --- | --- | --- |
+| `MEM_LIBC_MALLOC` | `mem` 改用 libc allocator | `MEM_SIZE` 不再等价于 internal heap budget |
+| `MEM_CUSTOM_ALLOCATOR` | `mem` 调用项目自定义 backend | 对齐、线程安全、失败语义由 Port/项目负责 |
+| `MEMP_MEM_MALLOC` | typed `memp` objects 改走 `mem_malloc/free` | “每个 typed pool 数量就是硬上限”不再成立；执行时间与中断可用性也改变 |
 
-打开后，`mem` 改用 C library 的 `malloc/free/calloc`，而不是 lwIP internal heap。
-
-这改变的是 `mem` backend，不意味着所有 `memp` pool 自动消失。
-
-### 12.2 `MEM_CUSTOM_ALLOCATOR`
-
-允许项目提供自定义 `MEM_CUSTOM_MALLOC/FREE/CALLOC`。`MEM_LIBC_MALLOC` 可以看作这个机制的一种特殊配置。
-
-### 12.3 `MEMP_MEM_MALLOC`
-
-这个选项影响更大：让 `memp` objects 改用 `mem_malloc/mem_free`，而不是 fixed pool allocator。upstream 注释特别提醒，这会改变执行速度以及 interrupt-context allocation 的工程约束。[S8](#source-s8)
-
-所以它不是“省一点静态池空间”的无代价开关。打开后，前面“typed fixed pool 数量就是硬上限”的默认心智模型也会改变。
+所以配置变化后，不能继续沿用默认构建下的“typed fixed pool + internal heap”结论，而应从实际 backend 重新做 sizing。[S8](#source-s8)[S10](#source-s10)
 
 ## 13. 到 Stage 12 为止形成的统一数据面模型
 
@@ -590,3 +545,19 @@ Stage 3 先解决 pbuf lifetime，Stage 12 再把 PCB、segment、message 与 pb
 - URL/文档：[`src/include/lwip/opt.h`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/include/lwip/opt.h)
 - 使用位置：`MEM_LIBC_MALLOC`、`MEM_CUSTOM_ALLOCATOR`、`MEMP_MEM_MALLOC`
 - 支撑内容：更换 `mem` backend 或把 typed pools 路由到 heap 时的配置语义与 upstream caveat
+
+<a id="source-s9"></a>
+### [S9] lwIP 官方 Packet buffers 文档
+- 类型：lwIP 官方 API 文档
+- 版本：lwIP 2.1.x 文档，访问日期 2026-10-03
+- URL/文档：[Packet buffers (PBUF)](https://www.nongnu.org/lwip/2_1_x/group__pbuf.html)
+- 使用位置：开篇阅读边界、`PBUF_RAM/PBUF_POOL/PBUF_REF/PBUF_ROM` allocator/ownership policy、pbuf chain
+- 支撑内容：官方定义各 pbuf type 的 allocation 语义、pbuf chain 行为以及外部引用型 payload 的边界
+
+<a id="source-s10"></a>
+### [S10] lwIP 官方 Heap and memory pools 配置文档
+- 类型：lwIP 官方配置文档
+- 版本：lwIP 2.1.x 文档，访问日期 2026-10-03
+- URL/文档：[Heap and memory pools](https://www.nongnu.org/lwip/2_1_x/group__lwip__opts__mem.html)
+- 使用位置：`MEM_SIZE`、`MEM_LIBC_MALLOC`、`MEMP_MEM_MALLOC`、allocator backend 变化
+- 支撑内容：官方说明 heap/memory-pool 配置项的默认模型、backend 切换以及性能和中断上下文注意事项

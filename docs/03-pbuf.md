@@ -2,17 +2,70 @@
 
 # 教程 03：从 `low_level_input()` 到 `pbuf_free()`——`pbuf` 的数据视图、Chain 与引用计数
 
-> 摘要：从 TAP 接收路径里的第一次 pbuf allocation 出发，理解 payload、长度、Chain、类型与引用计数如何共同描述一个 packet。
+> 摘要：从 TAP 接收路径的 low_level_input 出发，把 pbuf 作为数据视图、Chain 与生命周期来读，沿分配、复制、协议层推进和释放追清整个 packet 的释放责任。
 
 [TOC]
 
-本文源码块采用统一约定：除非代码块前明确标注为“上游连续源码片段”，其余 C 代码块一律视为按当前 revision 裁剪的“执行路径阅读版”。阅读版只删除与当前主线无关的注释、条件编译或旁支，不重排保留语句，也不使用省略号伪装缺失源码；示意代码会另行标注。
+Stage 2 已经把一帧 Ethernet 数据从 TAP 带进 lwIP。现在需要回答一个更底层的问题：**这些字节进入协议栈后到底放在哪里，为什么同一个 packet 可以跨多块内存，又是谁负责最后释放它？**
 
-Stage 2 已经看到：TAP 收到一帧后，Unix Port 会把字节复制进 `pbuf`，再交给 `netif->input()`。这一篇不先列 `PBUF_RAM/PBUF_POOL/PBUF_REF/PBUF_ROM` 名词，而是从真实 RX 调用点开始追。[S1](#source-s1)
+`pbuf` 是 lwIP 的 **packet buffer（数据包缓冲区）对象**。它不是单纯的一块 `malloc()` 内存，而是“当前数据起点 `payload` + 当前节点长度 `len` + 整包剩余长度 `tot_len` + 下一节点 `next` + 引用计数 `ref` + 分配/数据属性”的组合。[S2](#source-s2) 多个 pbuf 节点通过 `next` 连接起来时称为 **pbuf chain（pbuf 链）**；一条 chain 仍然可以只代表一个 packet，而不是多个 packet。
+
+这里沿用 Stage 2 的 TAP 实验：TAP 是 Linux 的虚拟 Ethernet 设备，frame 从它进入 lwIP。本文中的 **RX（receive，接收）**指 packet 从 TAP/网卡进入 lwIP 的方向；**Core（核心处理上下文）**指 lwIP 的主要协议处理执行环境；**ownership（所有权/释放责任）**指“当前哪一层有责任继续传递、保留引用或最终释放这份 pbuf”；**allocator（分配器）**指 pbuf 及其 payload 来自哪种内存分配来源，以及释放时应回到哪种回收路径。后文讨论 `ref`、`pbuf_cat()`、`pbuf_chain()` 和 `pbuf_free()` 时都围绕这些问题展开。
+
+## 阅读源码前：建议提前阅读
+
+1. [lwIP 2.1.x Doxygen — Packet buffers (PBUF)](https://www.nongnu.org/lwip/2_1_x/group__pbuf.html)：先浏览 `pbuf_alloc()`、`pbuf_free()` 以及 pbuf 类型相关的 API 说明，用来建立接口层概念。[S6](#source-s6)
+2. [`src/include/lwip/pbuf.h` — 目标源码快照](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/include/lwip/pbuf.h)：重点看 `struct pbuf`、`pbuf_layer` 和 `pbuf_type`；本文的字段语义以这份目标版本源码为准。[S2](#source-s2)
+3. [教程 02：从 `main()` 到第一次 Ping](02-netif-tap-first-ping.md)：如果还不清楚 `low_level_input()`、`netif->input()` 和 `tcpip_thread` 的位置，先恢复 TAP 接收到协议栈 Core 的主链。
+
+预读资料不是正文依赖。下面先建立本篇真正需要的 pbuf 心智模型，再进入 `low_level_input()`。
+
+## 进入源码前：先建立 pbuf 的生命周期模型
+
+先区分五个后文会反复出现的概念：
+
+- **node（节点）**：一个 `struct pbuf` 加它当前描述的 payload 区间；
+- **chain（链）**：多个节点通过 `next` 组成，同一个 packet 可以跨多个节点；
+- **data view（数据视图）**：`payload` 指向当前协议层看到的第一字节，`pbuf_remove_header()` / `pbuf_add_header()` 会移动这个视图；
+- **headroom（头部预留空间）**：payload 前为后续协议 Header 预留的空间，`pbuf_layer` 主要决定这一初始偏移；
+- **reference count（引用计数）**：`ref` 表示仍有多少引用持有当前 pbuf；`pbuf_free()` 先减少引用，只有减到 0 才真正释放。
+
+当前 TAP 接收路径调用 `pbuf_alloc(PBUF_RAW, len, PBUF_POOL)`：`PBUF_RAW` 表示不额外为上层协议头预留 headroom，收到的 Ethernet Header 就从当前 payload 起点开始；`PBUF_POOL` 表示从接收用的 pbuf pool 分配节点，frame 较大时可能形成 chain。[S1](#source-s1)[S2](#source-s2) 图中的 ARP 与 ICMP Echo 只是用来展示两种真实的“谁最终释放 pbuf”结局，具体协议语义由 Stage 2/4 负责。
+
+在当前 TAP Ping 主线中，一份 RX packet 的生命周期可以先压成这张导航图：
+
+```mermaid
+flowchart TD
+    A["TAP 文件描述符: read() 得到连续 Ethernet frame"] --> B["pbuf_alloc(PBUF_RAW, len, PBUF_POOL)"]
+    B --> C["可能得到单节点，也可能得到 pbuf chain"]
+    C --> D["pbuf_take(): 把连续 buf[] 写入一个或多个节点"]
+    D --> E["netif->input(): ownership 交给 lwIP Core"]
+    E --> F["协议层移动 payload 数据视图"]
+    F --> G{"当前协议如何结束?"}
+    G -- "ARP" --> H["etharp_input(): pbuf_free(p)"]
+    G -- "ICMP Echo" --> I["复用同一 pbuf 构造 Reply"]
+    I --> J["ip4_output_if() 发送后 icmp_input(): pbuf_free(p)"]
+```
+
+这张图回答“生命周期在哪里开始和结束”；后面的源码则要回答每一步为什么这样做。
+
+把常见 API 与当前 packet 语义先对应起来：
+
+| API / 字段 | 当前问题 | 关键语义 |
+| --- | --- | --- |
+| `pbuf_alloc(layer, length, type)` | 数据放在哪里、前面留多少 Header 空间 | `layer` 决定初始 headroom；`type` 决定 allocator/数据属性 |
+| `pbuf_take()` | Host 连续 buffer 怎样写进 chain | 顺着 `next` 跨节点复制 |
+| `payload` | 当前协议层从哪里开始读 | 会随 Header remove/add 移动 |
+| `len` / `tot_len` | 当前节点与整包还有多长 | `tot_len` 从当前节点一直统计到 packet 末尾 |
+| `pbuf_ref()` | 新 owner 怎样保留一份引用 | `ref + 1` |
+| `pbuf_cat()` / `pbuf_chain()` | 两条链如何拼接 | 区别在 tail ownership 是否额外保留 |
+| `pbuf_free()` | 什么时候真正释放 | `--ref` 后只释放 `ref==0` 的连续前缀 |
+
+下面从真实入口 `low_level_input()` 开始。
 
 ## 1. `pbuf` 第一次在哪里出现：`low_level_input()`
 
-Unix TAP Port 的 RX 路径不是先创建一个抽象“packet object”，而是先从 TAP fd 读取真实 Ethernet frame，再按读到的长度申请 `pbuf`。下面是当前 upstream `tapif.c` 的连续源码片段：[S1](#source-s1)
+Unix TAP Port 的 RX 路径不是先创建一个抽象“packet object”，而是先从 TAP 文件描述符读取真实 Ethernet frame，再按读到的长度申请 `pbuf`。下面是当前 upstream `tapif.c` 的连续源码片段：[S1](#source-s1)
 
 ```c
 static struct pbuf *
@@ -125,7 +178,7 @@ flowchart LR
 
 ## 3. 为什么一个 packet 可能需要多个 pbuf
 
-当前 example 配置的 `PBUF_POOL_BUFSIZE` 是 256 bytes，而 Ethernet MTU 可以是 1500 bytes；一个较大的 frame 很自然会横跨多个 pool element。[S3](#source-s3)
+当前 example 配置的 `PBUF_POOL_BUFSIZE` 是 256 bytes，而 Ethernet **MTU（Maximum Transmission Unit，最大传输单元）**可以是 1500 bytes；一个较大的 frame 很自然会横跨多个 pool element。[S3](#source-s3)
 
 关键不是记住“会形成 chain”，而是看 `pbuf_alloc()` 怎样真正做这件事。`PBUF_POOL` 分支从 `MEMP_PBUF_POOL` 循环取节点，每轮只把当前节点能承载的部分写入 `qlen`，直到 `rem_len` 归零：[S4](#source-s4)
 
@@ -378,7 +431,7 @@ pbuf_cat(struct pbuf *h, struct pbuf *t)
 }
 ```
 
-它没有调用 `pbuf_ref(t)`。API contract 是：调用者把自己原来持有的 `t` 引用转交给新的 chain，之后不能再把那份引用当成独立 ownership 使用。
+它没有调用 `pbuf_ref(t)`。API contract（接口约定）是：调用者把自己原来持有的 `t` 引用转交给新的 chain，之后不能再把那份引用当成独立 ownership 使用。
 
 `pbuf_chain()` 则是在相同拼接动作后明确再加一次引用：[S4](#source-s4)
 
@@ -491,7 +544,87 @@ p2 不会继续 decrement
 
 这一点是后续 UDP callback、TCP receive、zero-copy RX 等 ownership 分析的基础。
 
-## 10. Unit Test 在这一阶段应该怎么看
+## 10. 回到这次 Ping：成功路径上的 ownership 最终交给谁释放
+
+前面已经理解 `pbuf_free()` 的通用算法，现在把它重新挂回 Stage 2 的真实 RX 主线。关键问题不是“哪里出现过 `pbuf_free()`”，而是：**Port 把 `p` 交给 Core 后，哪一层成为最后一个 owner？**
+
+`tapif_input()` 从 `low_level_input()` 拿到 `p` 后调用 `netif->input(p, netif)`。只有 `netif->input()` 返回错误时，Port 才自己释放：[S1](#source-s1)
+
+```c
+static void
+tapif_input(struct netif *netif)
+{
+  struct pbuf *p = low_level_input(netif);
+
+  if (p == NULL) {
+    return;
+  }
+
+  if (netif->input(p, netif) != ERR_OK) {
+    pbuf_free(p);
+  }
+}
+```
+
+当前 `netif->input` 绑定的是 `tcpip_input()`。默认 mailbox 路径里，`tcpip_inpkt()` 把同一个 `p` 放进 `TCPIP_MSG_INPKT`，`tcpip_thread_handle_msg()` 再调用消息中保存的 `input_fn`；只有 `input_fn` 返回错误时，`tcpip_thread` 才执行兜底 `pbuf_free()`。[S7](#source-s7)
+
+```c
+case TCPIP_MSG_INPKT:
+  if (msg->msg.inp.input_fn(msg->msg.inp.p,
+                            msg->msg.inp.netif) != ERR_OK) {
+    pbuf_free(msg->msg.inp.p);
+  }
+  memp_free(MEMP_TCPIP_MSG_INPKT, msg);
+  break;
+```
+
+成功进入 `ethernet_input()` 后，具体协议 handler 负责把 packet 消费到结束。对 Stage 2 的两条主路径：
+
+**ARP Request/Reply RX** 在 `etharp_input()` 尾部直接释放这份 ARP pbuf：[S8](#source-s8)
+
+```c
+  /* free ARP packet */
+  pbuf_free(p);
+}
+```
+
+**ICMP Echo Request RX** 则更有代表性：`icmp_input()` 尽量复用收到的同一份 pbuf，把 Echo Request 改成 Echo Reply，调用 `ip4_output_if()` 同步走完 TX 提交，然后在函数尾部释放收到/复用的 pbuf：[S9](#source-s9)
+
+继续阅读 `icmp_input()` 的 Echo Request 分支。下面是发送 Echo Reply 的连续上游片段；`ip4_output_if()` 返回后，这个 case 结束：[S9](#source-s9)
+
+```c
+        /* send an ICMP packet */
+        ret = ip4_output_if(p, src, LWIP_IP_HDRINCL,
+                            ICMP_TTL, 0, IP_PROTO_ICMP, inp);
+        if (ret != ERR_OK) {
+          LWIP_DEBUGF(ICMP_DEBUG, ("icmp_input: ip_output_if returned an error: %s\n", lwip_strerr(ret)));
+        }
+      }
+      break;
+```
+
+`switch (type)` 还包含其他 ICMP 类型，因此上面的 `break` 与公共释放点在源码中并不相邻。Echo case 结束后控制流离开 `switch`，继续到 `icmp_input()` 的公共函数尾部；这里的连续源码明确释放当前输入 pbuf：[S9](#source-s9)
+
+```c
+  pbuf_free(p);
+  return;
+```
+
+这两个代码块分别来自同一个 `icmp_input()` 的 Echo case 与公共尾部，中间存在其他 `switch` 分支；正文显式保留这段控制流距离，而不是用省略符把非连续源码伪装成连续片段。
+
+因此当前 Ping RX 的 ownership 可以概括为：
+
+```text
+low_level_input() 创建 pbuf
+  -> tapif_input() 暂时持有
+  -> tcpip_input()/mailbox 把处理权交给 tcpip_thread
+  -> ethernet_input() 把 packet 交给具体协议 handler
+  -> etharp_input() / icmp_input() 在成功消费后负责最终 pbuf_free()
+```
+
+这条链说明一个重要规则：**成功把 pbuf 交给下一层后，上层不能再按“自己的 buffer”随意释放；是否保留引用必须由 API contract 和 `ref` 明确表达。** 这也是后续 zero-copy、TCP receive callback 和 DMA RX ownership 分析的基础。
+
+## 11. Unit Test 在这一阶段应该怎么看
 
 upstream `test_pbuf.c` 提供的是确定性输入：它会显式申请不同 layer/type/length 的 pbuf，检查 chain 长度、不变量、header 调整和 copy 行为。[S5](#source-s5)
 
@@ -547,3 +680,31 @@ Unit Test
 - URL/文档：[`test/unit/core/test_pbuf.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/test/unit/core/test_pbuf.c)
 - 使用位置：确定性边界输入与 API 不变量
 - 支撑内容：upstream 如何直接构造 pbuf case 检查 allocation、chain、header 与 copy 行为
+<a id="source-s6"></a>
+### [S6] lwIP Doxygen — Packet buffers (PBUF)
+- 类型：lwIP 官方 API 文档
+- URL/文档：[lwIP 2.1.x — Packet buffers (PBUF)](https://www.nongnu.org/lwip/2_1_x/group__pbuf.html)
+- 使用位置：“阅读源码前”
+- 支撑内容：提供 `pbuf_alloc()`、`pbuf_free()`、pbuf type/chain 的 API 层快速索引；目标实现细节仍以本项目源码快照为准
+
+<a id="source-s7"></a>
+### [S7] `tcpip.c` 的 RX mailbox ownership 桥
+- 版本：`d08f4773edd0182b7910fc8f046eed82ffcd67c9`
+- URL/文档：[`src/api/tcpip.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/api/tcpip.c)
+- 使用位置：“回到这次 Ping：成功路径上的 ownership 最终交给谁释放”
+- 支撑内容：`tcpip_input()`、`tcpip_inpkt()`、`TCPIP_MSG_INPKT` 和错误路径 `pbuf_free()` 的 ownership 交接
+
+<a id="source-s8"></a>
+### [S8] ARP RX 的最终释放点
+- 版本：`d08f4773edd0182b7910fc8f046eed82ffcd67c9`
+- URL/文档：[`src/core/ipv4/etharp.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/ipv4/etharp.c)
+- 使用位置：“回到这次 Ping：成功路径上的 ownership 最终交给谁释放”
+- 支撑内容：`etharp_input()` 消费 ARP packet 后在函数尾部执行 `pbuf_free(p)`
+
+<a id="source-s9"></a>
+### [S9] ICMP Echo RX/TX 与最终释放点
+- 版本：`d08f4773edd0182b7910fc8f046eed82ffcd67c9`
+- URL/文档：[`src/core/ipv4/icmp.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/ipv4/icmp.c)
+- 使用位置：“回到这次 Ping：成功路径上的 ownership 最终交给谁释放”
+- 支撑内容：`icmp_input()` 复用 pbuf 构造 Echo Reply、调用 `ip4_output_if()` 后回到公共 `pbuf_free(p)` 释放点
+

@@ -6,28 +6,49 @@
 
 [TOC]
 
-Stage 18 已经把一个 packet 从协议 PCB 追到 outgoing `netif`、source address、gateway/router 和 `netif->output()`。从这里继续向下，新的问题不再是“走哪张网卡”，而是：**包进入 Ethernet Driver 之前，IP/TCP/UDP/ICMP checksum 到底是谁计算的；进入 Driver 之后，硬件又能接管什么。**
+Checksum（校验和）用于让接收方发现报文头部或 payload 在传输过程中发生的比特错误。lwIP 的 IPv4、TCP、UDP、ICMP/ICMPv6 会在不同层生成或验证各自的 Internet checksum；**Checksum Offload（校验和卸载）**则表示把其中一部分工作从 CPU/lwIP Core 交给 NIC（Network Interface Controller，网卡控制器）、Ethernet MAC（Media Access Control，媒体访问控制）或 DMA（Direct Memory Access，直接内存访问）hardware 完成。
 
-当前源码基线仍为 lwIP commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1) 本篇继续使用 Unix TAP 作为可读的 Port 边界，但不会把 TAP 行为泛化为所有 MCU Ethernet Driver。当前 Unix `tapif` 没有 MAC/DMA checksum offload：`low_level_output()` 只是把 `pbuf` chain 拷贝到一个连续 buffer，然后 `write()` 到 TAP fd。[S2](#source-s2)
+标题中的 `ip_chksum_pseudo()` 对应 TCP/UDP 等 upper-layer checksum 使用的 **pseudo header（伪首部）**：它不是线上真实存在的一段 header，而是把 source/destination address、协议号/Next Header 和长度等网络层（L3）信息加入 checksum 运算，从而让传输层（L4）checksum 也覆盖关键网络层端点信息。[S1](#source-s1)[S4](#source-s4)[S5](#source-s5)
 
-本篇只回答一条主线：
+## 0. 进入源码前：先把软件 checksum 与 hardware offload 分开
+
+推荐资料只承担标准算法和平台对照，不替代正文：
+
+1. [RFC 1071 — Computing the Internet Checksum](https://www.rfc-editor.org/rfc/rfc1071.html)：用于 one's-complement（反码）加法、carry folding（进位回卷）等算法基础。[S3](#source-s3)
+2. [lwIP `opt.h` checksum options](https://www.nongnu.org/lwip/2_1_x/opt_8h.html)：确认 `CHECKSUM_GEN_*`、`CHECKSUM_CHECK_*`、`LWIP_CHECKSUM_CTRL_PER_NETIF` 等配置契约。[S8](#source-s8) [lwIP Optimization Hints](https://www.nongnu.org/lwip/2_1_x/optimization.html) 还说明 `LWIP_CHKSUM` 可以由 Port 覆盖成更快的软件实现；这仍然是 software checksum optimization，不等于 MAC/DMA hardware offload。[S9](#source-s9)
+3. [Linux Kernel — Checksum Offloads](https://docs.kernel.org/networking/checksum-offloads.html)：只作为“成熟 OS 如何定义 stack↔NIC offload contract”的对照，不把 Linux metadata 模型套到 lwIP。[S7](#source-s7)
+4. [Wireshark CaptureSetup — Offloading](https://wiki.wireshark.org/CaptureSetup/Offloading)：解释为什么 Host 本机 TX 抓包可能在硬件补齐 checksum 之前被捕获。[S6](#source-s6)
+
+Internet checksum 的核心运算可以先建立一个最小模型：把数据按 16-bit word 做 one's-complement 加法，进位回卷到低位，最后按位取反。lwIP 的 `LWIP_CHKSUM()`/`inet_chksum_*()` 会把这套运算应用到连续 buffer 或 `pbuf chain`（多个 `pbuf` 串成的报文缓冲链）；协议层再决定哪些 header/payload 以及 pseudo header 要参与。[S1](#source-s1)[S3](#source-s3)
+
+同时必须区分三个层次：
+
+| 层次 | 谁负责 | 关闭/启用意味着什么 |
+| --- | --- | --- |
+| lwIP software checksum | Core 中的 `CHECKSUM_GEN_*` / `CHECKSUM_CHECK_*` 路径 | CPU 生成或验证 checksum |
+| optimized software routine | Port 覆盖 `LWIP_CHKSUM` | 仍然由 CPU/软件计算，只是换成更快实现 |
+| MAC/DMA/NIC hardware offload | 具体 Driver + hardware descriptor/config | Core 可以不生成，但 Driver 必须明确把工作交给硬件 |
+
+因此最重要的工程边界是：**把 `CHECKSUM_GEN_TCP` 或 `CHECKSUM_GEN_UDP` 设为 0，并不会自动打开任何硬件功能。** 如果 Driver 没有同时设置对应 MAC/DMA offload，线上报文就可能带着无效 checksum 离开设备。[S1](#source-s1)[S2](#source-s2)
+
+当前发送路径先看成：
 
 ```mermaid
 flowchart LR
-    A["UDP/TCP 构造 L4 header"] --> B["lwIP software checksum?"]
-    B --> C["ip_chksum_pseudo()"]
-    C --> D["IP output"]
-    D --> E["Ethernet header"]
+    A["UDP/TCP builds L4 packet"] --> B["software checksum enabled?"]
+    B -->|yes| C["ip_chksum_pseudo() / inet_chksum"]
+    B -->|no| D["Driver must provide offload contract"]
+    C --> E["IP/Ethernet output"]
+    D --> E
     E --> F["netif->linkoutput()"]
-    F --> G["Port / Driver"]
-    G --> H["DMA / MAC offload 可选"]
+    F --> G["Port / Driver / MAC / DMA"]
 ```
 
-其中最重要的边界是：**`CHECKSUM_GEN_*` 关闭只代表 lwIP Core 不再生成对应软件 checksum，它不会自动配置任何 MAC、DMA descriptor 或 NIC。** 如果目标 Driver 没有真正接管，线上 packet 就会带着未完成的 checksum 离开设备。[S1](#source-s1)[S2](#source-s2)
+下面先用当前 Unix TAP 配置回答“默认到底是谁算 checksum”，再沿 UDP/TCP 的真实 TX/RX 代码下钻。
 
 ## 1. 当前 Unix TAP 路径默认是谁算 checksum
 
-先从配置事实开始。`src/include/lwip/opt.h` 中 `LWIP_CHECKSUM_CTRL_PER_NETIF` 默认是 `0`；`CHECKSUM_GEN_IP/UDP/TCP/ICMP/ICMP6` 与对应的 `CHECKSUM_CHECK_*` 默认都是 `1`。[S1](#source-s1)
+先从配置事实开始。`src/include/lwip/opt.h` 与官方 Doxygen 都显示 `LWIP_CHECKSUM_CTRL_PER_NETIF` 默认是 `0`；`CHECKSUM_GEN_IP/UDP/TCP/ICMP/ICMP6` 与对应的 `CHECKSUM_CHECK_*` 默认都是 `1`。[S1](#source-s1)[S8](#source-s8)
 
 ```c
 #if !defined LWIP_CHECKSUM_CTRL_PER_NETIF || defined __DOXYGEN__
@@ -606,21 +627,9 @@ checksum_flags &= (u16_t)~NETIF_CHECKSUM_CHECK_TCP;
 NETIF_SET_CHECKSUM_CTRL(netif, checksum_flags);
 ```
 
-此时只建立了一个 **Core contract**：
+此时只建立了一个 **Core contract**：这张 `netif` 的 TCP/UDP checksum 不再由 lwIP Core 生成/验证。
 
-```text
-lwIP:
-我不再替这张 netif 生成/验证 TCP、UDP checksum
-```
-
-还差另一半：
-
-```text
-Driver:
-我必须让 MAC/DMA 真正完成这些工作
-```
-
-前者不能替代后者。
+还必须同时存在 **Driver/hardware contract**：Driver 要把相应生成/验证任务明确配置给 MAC/DMA，并正确解释 TX descriptor 或 RX status。前者不能替代后者。
 
 ## 13. TX hardware offload 真正发生在 lwIP Core 之后
 
@@ -773,13 +782,13 @@ Core 不再重算
 
 Linux 的 `sk_buff` 有自己的一套 `ip_summed`/`CHECKSUM_PARTIAL` 等 offload contract，但那是 Linux network stack 与 Linux driver 之间的接口，不能直接套成 lwIP `pbuf` 语义。[S7](#source-s7)
 
-## 18. 为什么“打开硬件 offload”通常同时涉及 TX 与 RX 两套配置
+## 18. TX generation 与 RX verification 必须分别建立 contract
 
-硬件的 TX generation 与 RX verification 是两套能力。芯片只声明“支持 checksum offload”并不等于所有 `GEN_*` 与 `CHECK_*` 都可关闭；每一个 bit 都应由实际 MAC/DMA capability 和 Driver descriptor/status 处理支撑。
+硬件 TX generation 与 RX verification 是两套独立能力；是否关闭某个 `GEN_*` 或 `CHECK_*`，必须分别有对应 MAC/DMA capability 与 Driver descriptor/status 处理作为证据。`LWIP_CHECKSUM_CTRL_PER_NETIF` 只提供 Core 侧开关，不替硬件声明能力。[S1](#source-s1)[S8](#source-s8)
 
 ## 19. Ethernet FCS 不是这里的 Internet checksum
 
-Stage 0 已经从 Ethernet physical/frame 边界介绍过 FCS。到 Stage 19 必须重新做一次最小消歧，因为“网卡硬件校验”很容易把两类机制混在一起。
+FCS（Frame Check Sequence，帧校验序列）是 Ethernet 二层（L2）frame trailer，通常使用 CRC-32 由 MAC 生成/校验；它与 IPv4/TCP/UDP 使用的 Internet checksum 不是同一种机制。即使 Stage 0 已经介绍过 FCS，这里仍需要重新做最小消歧，因为“网卡硬件校验”很容易把两类机制混在一起。
 
 | 对象 | 所在层 | 典型算法 | lwIP `pbuf` 是否通常携带 |
 | --- | --- | --- | --- |
@@ -886,11 +895,9 @@ flowchart LR
 
 任何一层都不能靠另一层的宏自动替代。
 
-## 23. 两种典型错误可以从边界直接推导
+## 23. 错配的本质是 checksum ownership 没有闭环
 
-最危险的组合是“Core 已关闭软件 checksum，但 Driver 没有真正配置硬件”，这会直接把未完成 checksum 的 packet 送出。另一类错误是硬件只验证 TCP/UDP，却把 IP/ICMP/ICMPv6 的 Core verify 也一并关闭。
-
-因此排查顺序应先问 ownership：这个 checksum 本来应由谁生成/验证，Core 是否执行，per-netif bit 是否允许，Driver 是否真正设置硬件，以及抓包点位于 offload 前还是线上之后。
+最危险的错配只有两类：Core 已停止软件工作但 Driver 没有真正接管；或硬件只覆盖部分协议，却把未覆盖协议的 Core generation/verification 一并关闭。排查时按 Core option → per-netif bit → Driver descriptor/status → 抓包位置检查 ownership 即可。
 
 ## 24. 从 Stage 18 到 Stage 19，packet 的完整路径已经延伸到 Driver 边界
 
@@ -957,3 +964,20 @@ Stage 19 把 Stage 18 的 `route → netif → next hop` 继续延伸到 `softwa
 - URL/文档：[Linux Kernel - Checksum Offloads](https://docs.kernel.org/networking/checksum-offloads.html)
 - 使用位置：“Host/NIC offload 对照”“TX/RX Driver contract”
 - 支撑内容：说明 Linux stack 与 NIC/Driver 之间的 checksum offload metadata 与职责，用于和 lwIP 的 `pbuf`/`linkoutput` 边界做对照
+
+<a id="source-s8"></a>
+### [S8] lwIP 官方 checksum 配置文档
+- 类型：upstream 官方配置文档
+- 版本：lwIP 2.1.x Doxygen，访问日期 2026-10-03
+- URL/文档：[lwIP opt.h checksum options](https://www.nongnu.org/lwip/2_1_x/opt_8h.html)
+- 使用位置：默认 checksum 配置、per-netif 控制与 Core contract
+- 支撑内容：列出 `LWIP_CHECKSUM_CTRL_PER_NETIF`、`CHECKSUM_GEN_*`、`CHECKSUM_CHECK_*` 与 `LWIP_CHECKSUM_ON_COPY` 的默认配置值
+
+<a id="source-s9"></a>
+### [S9] lwIP 官方 Optimization Hints
+- 类型：upstream 官方优化文档
+- 版本：lwIP 2.1.x，访问日期 2026-10-03
+- URL/文档：[lwIP Optimization hints](https://www.nongnu.org/lwip/2_1_x/optimization.html)
+- 使用位置：软件 checksum 与硬件 offload 的边界说明
+- 支撑内容：说明 Port 可以通过 `LWIP_CHKSUM` 替换/优化软件 checksum 实现；该优化入口与 MAC/DMA checksum offload 是不同层次
+

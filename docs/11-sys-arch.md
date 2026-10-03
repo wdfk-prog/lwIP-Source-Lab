@@ -6,9 +6,37 @@
 
 [TOC]
 
-Stage 2～10 一直在使用 `tcpip_thread`，Stage 6 又出现了 application thread、mailbox 和 Core Locking。到这里才把它们单独展开，因为这些对象已经在真实调用链中反复出现。
 
-当前 `example_app` 配置 `NO_SYS=0` 且 `LWIP_TCPIP_CORE_LOCKING=1`；`LWIP_TCPIP_CORE_LOCKING_INPUT` 沿用 Core 默认值 `0`。这三个配置共同决定本篇观察到的线程与 packet handoff 行为。[S1](#source-s1)[S2](#source-s2)
+`sys_arch` 是 lwIP 面向操作系统或 RTOS 的移植抽象层，不属于 TCP/IP 协议本身。它解决的问题是：lwIP Core 需要线程、消息队列、信号量、互斥锁、时间与短临界区保护，但 Core 不应该绑定 pthread、RT-Thread 或某一种内核 API。Port 只要实现统一的 `sys_*` contract，Core 就能在不同 OS 上保持同一套调用方式。[S4](#source-s4)[S6](#source-s6)
+
+## 阅读源码前：建议提前阅读
+
+1. [lwIP 2.1.x — OS abstraction layer](https://www.nongnu.org/lwip/2_1_x/group__sys__os.html)：用于确认 `sys_arch` 要向 Core 提供哪些 thread/mailbox/semaphore/mutex/time primitive，以及 OS-specific 实现位于什么边界。[S10](#source-s10)
+2. [lwIP 2.1.x — Multithreading](https://www.nongnu.org/lwip/2_1_x/multithreading.html)：用于理解 TCP/IP Core 的线程约束，以及“非 Core thread 持有全局 Core mutex 后直接执行受保护操作”这种 Core Locking 模式。[S11](#source-s11)
+3. [`src/include/lwip/sys.h`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/include/lwip/sys.h)：直接对照 Core 看到的 `sys_*` API，而不是先陷入某个 RTOS 的具体实现。[S4](#source-s4)
+
+## 进入源码前先分清五个并发对象
+
+当前 `example_app` 配置 `NO_SYS=0`，表示 lwIP 运行在 OS 模式，并存在专门处理 Core work 的 **`tcpip_thread`（TCP/IP Core thread）**。外部 RX context、application thread 或 timer 不能都假设自己天然处在 Core thread 中；它们必须通过规定的 handoff/locking 方式进入 Core。[S1](#source-s1)[S3](#source-s3)
+
+**Mailbox（消息邮箱/消息队列）**用于把 work item 或 packet 指针排队交给另一个执行上下文；**Semaphore（信号量）**用于等待/通知某个条件或计数资源；**Mutex（互斥锁）**用于保证一段临界区同一时刻只有一个持有者。三者都属于同步原语，但语义不同，不能互换。[S4](#source-s4)
+
+**Core Locking** 是 lwIP 的一种线程进入模式：允许非 Core thread 在持有全局 TCP/IP Core mutex 的前提下执行受保护的 Core 操作。它与 **`SYS_ARCH_PROTECT`** 不是同一个层次；后者用于更短、更底层的 lightweight protection，典型目标是保护极小范围的共享状态，而不是把整段 TCP/IP Core 调用都包起来。[S2](#source-s2)[S4](#source-s4)
+
+这里的 **sequential API（顺序 API）**指 Netconn/Socket 这类允许 application thread 以阻塞式、顺序式调用使用协议栈的接口；它们内部仍必须把实际 Core work 安排到正确执行边界。当前文章后面会看到两条主要路径：packet RX 默认经 `tcpip_mbox` 投递给 Core thread，而某些 sequential API 在当前配置下可以通过 Core Locking 进入 Core。把它们放在同一张图里：
+
+```mermaid
+flowchart LR
+    RX["RX context"] -->|"tcpip_inpkt() posts message"| M["tcpip_mbox"]
+    M --> CT["tcpip_thread"]
+    APP["Application thread"] -->|"sequential API"] CO{"当前 API bridge"}
+    CO -->|"mailbox path"| M
+    CO -->|"Core Locking enabled path"| LOCK["lock_tcpip_core"]
+    LOCK --> CORE["lwIP Core operation"]
+    CT --> CORE
+```
+
+这张图只建立并发边界。下面仍然从真实创建入口 `tcpip_init()` 开始，逐步确认 mailbox、mutex 与 thread 是在哪里创建、由谁消费的。
 
 ## 1. `tcpip_init()` 第一次把 lwIP Core 变成一个线程化系统
 
@@ -56,47 +84,21 @@ flowchart TD
     E --> F["tcpip_thread 开始运行"]
 ```
 
-## 2. `sys_*` API 是 lwIP 对 Port 的 OS contract，不是 Linux API
+## 2. Core 实际依赖哪些 `sys_arch` contract
 
-`src/include/lwip/sys.h` 声明了 lwIP Core 期望 Port 提供的抽象，例如：[S4](#source-s4)
+`sys_arch` contract 可以理解为 Core 与 OS Port 之间的“最小并发服务接口”：Core 只调用统一的 `sys_*` API，不直接调用 pthread 或 RTOS 原语；Port 负责把这些 API 映射到具体内核。[S4](#source-s4)[S10](#source-s10) `NO_SYS=1` 时没有这套 OS thread 模型；当前 example 是 `NO_SYS=0`，因此下面这些 API 会真实参与运行路径。
+
+`src/include/lwip/sys.h` 声明的典型入口包括：[S4](#source-s4)
 
 ```text
 sys_thread_new()
-sys_sem_new()
-sys_arch_sem_wait()
-sys_mbox_new()
-sys_mbox_post()
-sys_arch_mbox_fetch()
-sys_mutex_new()
-sys_mutex_lock()
+sys_sem_new() / sys_arch_sem_wait()
+sys_mbox_new() / sys_mbox_post() / sys_arch_mbox_fetch()
+sys_mutex_new() / sys_mutex_lock()
 sys_now()
 ```
 
-这些名字不是 Linux pthread wrapper 的协议要求。lwIP Core 只依赖这套抽象 contract；不同 OS/Port 可以用不同底层对象实现。
-
-当前 Unix Port 的：
-
-```text
-contrib/ports/unix/port/include/arch/sys_arch.h
-contrib/ports/unix/port/sys_arch.c
-```
-
-只是这套 contract 的一种具体实现。[S5](#source-s5)[S6](#source-s6)
-
-因此要区分：
-
-```text
-lwIP Core requirement
-    sys.h 定义需要哪些抽象能力
-
-Unix Port implementation
-    用 pthread/condition/queue 等实现这些能力
-
-example_app behavior
-    当前配置怎样组合 tcpip_thread、TAP RX、Netconn
-```
-
-真实产品 Port 不必复制 Unix `sys_arch.c` 的内部结构，只需要满足 lwIP 要求的同步/时间/thread contract。
+当前 Unix Port 的 `contrib/ports/unix/port/include/arch/sys_arch.h` 与 `contrib/ports/unix/port/sys_arch.c` 只是这套 contract 的一种 Host 实现。[S5](#source-s5)[S6](#source-s6) 后文因此只回答三个实现问题：`tcpip_thread` 为什么需要 mailbox，timer 怎样与 mailbox wait 汇合，以及 Core Locking/短临界区分别在哪个边界生效。
 
 ## 3. 为什么 `sys_sem_t` / `sys_mbox_t` 看起来只是 pointer
 
@@ -551,55 +553,17 @@ RX packet input
 
 所以不能随意拿其他 mutex 代替，也不能只看到某个 API 内部没有 mailbox 就认为它天然 thread-safe。
 
-## 8. Mailbox、Semaphore、Mutex 为什么要同时存在
+## 8. Mailbox、Semaphore、Mutex 不再单独教学，只映射当前调用点
 
-### 8.1 Mailbox：传 work/data
+三类 primitive 的一般定义直接以 lwIP OS abstraction 文档为准。[S10](#source-s10) 在当前源码里，它们的差异由“谁调用、等待什么、保护什么”体现得更清楚：
 
-典型用途：
+| primitive | 当前真实调用点 | 在本篇承担的语义 |
+| --- | --- | --- |
+| mailbox | `tcpip_mbox_fetch()`、`tcpip_inpkt()` | 把 packet/API work 排队交给 Core thread |
+| semaphore | `main_loop()` 等待 `test_init()` 完成 | 一个调用方等待另一个上下文发出完成事件 |
+| mutex | `lock_tcpip_core` | 允许 non-Core thread 在持锁期间同步进入受保护的 lwIP Core state |
 
-```text
-producer thread/context
-  -> post message
-  -> consumer later fetch
-```
-
-它既有同步意义，也有消息内容。
-
-### 8.2 Semaphore：等待一个事件完成
-
-Stage 2 `main_loop()` 在调用 `tcpip_init(test_init, &init_sem)` 后执行：
-
-```text
-sys_sem_wait(&init_sem)
-```
-
-而 `test_init()` 在 `tcpip_thread` context 完成 netif/app 初始化后 signal 这个 semaphore。[S7](#source-s7)
-
-因此 semaphore 这里表达的是：
-
-```text
-main thread 等待“初始化完成”事件
-```
-
-不需要传一个 packet queue。
-
-### 8.3 Mutex：临界区互斥
-
-mutex 解决：
-
-```text
-多个线程都可能直接触碰同一份共享状态
-```
-
-同一时刻只允许一个进入关键区。
-
-三者最小对比：
-
-| primitive | 是否携带消息 | 是否通常有 owner | 典型用途 |
-| --- | --- | --- | --- |
-| mailbox | 是 | 否 | 异步 work/data handoff |
-| semaphore | 否，主要是计数/事件 | 通常不强调 mutex 式 owner | wait/signal 同步 |
-| mutex | 否 | 是 | 共享状态临界区 |
+Stage 2 的 init semaphore 由 `main_loop()` 等待、由 `test_init()` signal；这是一个具体的 wait/signal 关系，不需要再用抽象“信号量是什么”重复解释。[S7](#source-s7) 同样，mailbox 是否携带 work item、mutex 是否保护 Core invariant，都应从真实调用点判断，而不是从名字类比。
 
 ## 9. `SYS_ARCH_PROTECT` 又是另一层保护
 
@@ -617,27 +581,18 @@ SYS_ARCH_PROTECT
 
 一个 Port 可以用不同底层 primitive 实现它们。不能因为两者最终都可能碰 mutex/critical-section API，就把语义混在一起。
 
-## 10. Unix Port 如何实现这些抽象
+## 10. Unix Port 只作为 contract 的一份可观察实现
 
-当前 Unix `sys_arch.c` 使用 pthread 体系实现 thread、mailbox、semaphore、mutex 等对象。[S6](#source-s6)
-
-重要的是 API 语义，不是背结构体字段：
+当前 Unix `sys_arch.c` 使用 pthread/condition/queue 等 Host primitives 实现 lwIP 所需的 thread、mailbox、semaphore、mutex 与时间接口。[S6](#source-s6) 这里需要保留的结论不是具体 pthread 字段，而是映射关系：
 
 ```text
-sys_thread_new()
-    -> 创建 Host thread
-
-sys_mbox_new/post/fetch()
-    -> 建立 bounded message queue + 等待/唤醒
-
-sys_sem_new / sys_arch_sem_wait / sys_sem_signal
-    -> event/count synchronization
-
-sys_mutex_new / lock / unlock
-    -> mutual exclusion
+lwIP Core call
+    -> sys_* contract
+    -> Unix sys_arch implementation
+    -> pthread / condition / queue / clock
 ```
 
-Unix Port 适合 Host 学习，因为这些对象在普通进程里可观察；它并不意味着 embedded Port 也必须使用 pthread。
+真实 MCU/RTOS Port 可以采用完全不同的底层 primitive，只要保持 lwIP 官方 contract 的等待、超时、唤醒和互斥语义。[S10](#source-s10) Stage 39 会把同一 contract 映射到 RT-Thread；因此本篇不再展开一套通用 pthread 教程。
 
 ## 11. 把 Stage 2 与 Stage 6 的线程路径放到同一张图
 
@@ -739,3 +694,20 @@ Stage 12 会继续利用这条分层思路，把“内存不足”也拆成 `mem
 - URL/文档：[`src/core/timeouts.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/timeouts.c)
 - 使用位置：`sys_timeout_abs()`、`sys_timeouts_sleeptime()`、`sys_check_timeouts()`、`lwip_cyclic_timer()` 与 `sys_timeouts_init()`
 - 支撑内容：证明 timeout 节点按绝对到期时间排序、`tcpip_mbox_fetch()` 如何计算等待时长、到期 handler 如何执行，以及 cyclic timer 如何重新注册下一次 one-shot timeout
+
+<a id="source-s10"></a>
+### [S10] lwIP 官方 OS abstraction 文档
+- 类型：lwIP 官方 API/Porting 文档
+- 版本：lwIP 2.1.x 文档，访问日期 2026-10-03
+- URL/文档：[OS abstraction layer](https://www.nongnu.org/lwip/2_1_x/group__sys__os.html)
+- 使用位置：开篇阅读边界、`sys_*` contract、mailbox/semaphore/mutex 语义、Unix Port 与 RTOS Port 的边界
+- 支撑内容：官方定义 OS-specific `sys_arch` 的职责，说明 semaphore、mailbox、mutex、thread、timer/`NO_SYS` 的 Porting 关系，并明确具体实现位于 `arch/sys_arch.h` 与 `sys_arch.c`
+
+
+<a id="source-s11"></a>
+### [S11] lwIP 官方 Multithreading 文档
+- 类型：lwIP 官方 Porting 文档
+- 版本：lwIP 2.1.x 文档，访问日期 2026-10-03
+- URL/文档：[Multithreading](https://www.nongnu.org/lwip/2_1_x/multithreading.html)
+- 使用位置：开篇并发模型、Core thread/Core Locking 与外部线程进入 Core 的边界
+- 支撑内容：官方说明 lwIP 多线程环境下的 Core thread 约束、thread-safe API 范围与 Core Locking 模式

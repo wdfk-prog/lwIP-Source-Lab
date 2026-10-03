@@ -2,15 +2,56 @@
 
 # 教程 10：从 `tcp_receive()` 到 `ooseq` / SACK——TCP 乱序、重组与选择确认
 
-> 摘要：从 seqno 大于 rcv_nxt 的真实接收条件出发，理解 lwIP 如何保存乱序 segment、裁剪重叠、在 gap 补齐后重组连续数据，以及 SACK 如何反馈已收到的离散 range。
+> 摘要：沿 lwIP 的乱序接收与 SACK 实现路径，映射 TCP sequence space、累计 ACK 与选择确认到 ooseq、rcv_nxt、pbuf 重组和 ACK option。
 
 [TOC]
 
-本文源码块采用统一约定：除非代码块前明确标注为“上游连续源码片段”，其余 C 代码块一律视为按当前 revision 裁剪的“执行路径阅读版”。阅读版只删除与当前主线无关的注释、条件编译或旁支，不重排保留语句，也不使用省略号伪装缺失源码；示意代码会另行标注。
 
-Stage 9 看到 duplicate ACK 可以触发 Fast Retransmit，但还没有回答一个更靠近接收端的问题：**为什么 receiver 会不断 ACK 同一个 `rcv_nxt`？**
+Stage 9 从 sender 侧解释了 duplicate ACK 为什么可能触发 Fast Retransmit。Stage 10 转到 receiver 侧：当 TCP segment 没有按 sequence 顺序到达时，lwIP 怎样保存已经收到但暂时不能交付的数据，怎样在 gap 被补齐后恢复连续 byte stream，以及启用 SACK（Selective Acknowledgment，选择确认）时怎样把“gap 后哪些范围已经收到”反馈给 sender。
 
-一个常见原因是：更靠后的 TCP data 已经到达，但中间有一段 sequence gap。TCP 不能把 gap 后的数据直接当作连续 byte stream 交给 application，所以当前 lwIP 在 `TCP_QUEUE_OOSEQ=1` 时把它先放进 `pcb->ooseq`。[S1](#source-s1)[S2](#source-s2)
+## 阅读源码前：建议提前阅读
+
+1. [RFC 9293 — Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293.html)：用于理解 TCP 怎样给字节编号、为什么确认号表示“下一段连续期望的数据位置”，以及为什么 receiver 不能把缺口后的数据直接越过 gap 交给 application。[S3](#source-s3)
+2. [RFC 2018 — TCP Selective Acknowledgment Options](https://www.rfc-editor.org/rfc/rfc2018.html)：用于理解 receiver 怎样在累计确认之外，再告诉 sender“更高序号的某些离散范围其实已经收到”。本文会在进入源码前解释这种选择确认及其握手能力协商，不要求先记住完整 option 格式。[S6](#source-s6)
+3. [Wireshark User's Guide — TCP Analysis](https://www.wireshark.org/docs/wsug_html_chunked/ChAdvTCPAnalysis.html)：用于区分 `Out-Of-Order`、`Dup ACK`、`Fast Retransmission` 等抓包标签；标签是抓包视角，不代表 lwIP 内部一定已经建立某种 `ooseq`/SACK 状态。[S9](#source-s9)
+
+## 先建立乱序模型：数据已经到达，不代表可以交给 application
+
+TCP 向 application 提供的是**有序 byte stream**。`rcv_nxt` 表示 receiver 当前“下一个必须连续出现的 sequence number”。如果 `rcv_nxt=1500`，但收到 `SEQ=2000` 的 segment，就说明 `[1500,2000)` 仍有 gap。即使 `[2000,... )` 已经到达网卡并通过校验，它也不能越过缺口先交给 application。[S3](#source-s3)
+
+lwIP 在 `TCP_QUEUE_OOSEQ` 开启时使用 **`ooseq`（out-of-sequence queue，乱序队列）**保存这些已经收到、但尚未形成从 `rcv_nxt` 开始连续区间的 `tcp_seg`。`ooseq` 是 receiver 的本地重组数据结构，不是协议报文。队列元素 `struct tcp_seg` 是 lwIP 用来描述一段 TCP segment 的内部对象，关联该段的 TCP header/sequence 信息与对应 pbuf 数据。[S1](#source-s1)[S4](#source-s4)
+
+**SACK（Selective Acknowledgment，选择确认）**则是反馈机制。累计 ACK 仍然只能指向“最前面的缺口”，SACK option 可以额外告诉 sender：“虽然累计 ACK 还不能前进，但更高 sequence 的某些离散区间已经收到”。一个 **SACK block** 就是这样的已收 sequence range。连接必须在握手期间通过 **SACK-Permitted** 表明双方允许使用 SACK，之后 receiver 才能在 ACK 中携带 SACK blocks。[S6](#source-s6)
+
+下面用一个最小例子把 `rcv_nxt`、`ooseq` 与 SACK 放在同一条协议流程里：
+
+```mermaid
+sequenceDiagram
+    participant S as TCP Sender
+    participant R as TCP Receiver
+
+    S->>R: Segment A, SEQ=1000, LEN=500
+    R-->>S: ACK=1500
+    Note over S,R: Segment B with SEQ=1500 is not received
+    S->>R: Segment C, SEQ=2000, LEN=500
+    Note over R: rcv_nxt remains 1500, cache Segment C in ooseq
+    R-->>S: ACK=1500, optional SACK block 2000-2500
+    S->>R: Retransmitted Segment B, SEQ=1500, LEN=500
+    Note over R: gap closes, contiguous ooseq data can now be consumed
+    R-->>S: cumulative ACK=2500
+```
+
+这条流程对应的 lwIP 实现位置是：
+
+| 协议动作/状态 | lwIP 实现位置 | 关键对象 | 结果 |
+| --- | --- | --- | --- |
+| 判断 segment 是否正好连续 | `tcp_receive()` | `seqno`、`pcb->rcv_nxt` | 选择 in-sequence 或 out-of-sequence 分支 |
+| 保存 gap 后的数据 | `tcp_receive()` / `tcp_oos_insert_segment()` | `pcb->ooseq` | 保持按 sequence 排序并处理 overlap |
+| gap 被补齐后继续交付 | `tcp_receive()` | `rcv_nxt`、`ooseq`、pbuf chain | 把重新连续的数据交给 application callback |
+| 记录可反馈的 SACK range | `tcp_add_sack()` 等 | `pcb->rcv_sacks[]` | 为 ACK option 准备离散已收范围 |
+| 生成 SACK option | TCP output option path | SACK option fields | sender 获得累计 ACK 之外的额外信息 |
+
+下面从这条链的真实判断入口 `tcp_receive()` 开始。
 
 ## 1. 从 `tcp_receive()` 的真实分支开始：先判断是不是 `rcv_nxt`
 
@@ -224,6 +265,8 @@ in   = [1600,2100)
 
 插入前先把 `prev` 裁成 `[1200,1600)`，然后新节点负责从 1600 往后覆盖。于是 `ooseq` 的关键 invariant 可以落到真实代码上：**按 sequence 排序，并通过左右两边的裁剪尽量消除重复 sequence space。**
 
+前六节完成的是协议总流程中的“gap 后数据到达并进入 `ooseq`”阶段。下面进入关键转折：缺失 segment 到来后，`rcv_nxt` 重新变得连续，receiver 才能把此前缓存的乱序数据一起向 application 推进。
+
 ## 7. Gap 补齐后，为什么可以一次把多段数据交给 application
 
 当缺口前沿终于收到 in-sequence segment，`tcp_receive()` 先推进 `rcv_nxt`；随后不是等下一次 packet arrival，而是立即检查 `ooseq` 队头是否正好接在新的 `rcv_nxt` 上。[S1](#source-s1)
@@ -349,25 +392,22 @@ sender dupacks 增加
 Fast Retransmit 缺失 segment
 ```
 
-## 11. 这时才引入 SACK：累计 ACK 只能说“缺口在哪里”
+到这里，**本地重组数据面**已经闭环：`ooseq` 保存真实数据，gap 补齐后重新形成连续 byte stream。下面切到**反馈控制面**：SACK 不保存 payload，它只是把 receiver 已收到的离散 sequence range 编进 ACK option 告诉 sender。
 
-只有累计 ACK 时，receiver 可以告诉 sender：
+## 11. 从 SACK 反馈语义进入 lwIP：先看能力开关，再看 range 与 option
 
-```text
-ACK = 1000
-```
+SACK 并不会替换 TCP Header 里的累计 ACK。累计 ACK 仍然表示“最前面的连续缺口”；SACK 只是附加在 TCP option 中，补充描述更高 sequence space 中已经收到的离散区间。[S6](#source-s6)
 
-它表达“1000 是下一个需要的 byte”，但不能同时准确告诉 sender：
+RFC 2018 定义了两类相关 option：**SACK-Permitted** 用于 SYN 阶段声明“这个连接允许使用 SACK”，它的 Kind 为 4、Length 为 2；真正携带已收区间的 **SACK option** Kind 为 5，Length 为 `2 + 8*N`，每个 block 用两个 32-bit sequence number 表示 `Left Edge` 与 `Right Edge`，也就是一个半开区间 `[left, right)`。[S6](#source-s6) 因而一个 ACK 可以同时表达：
 
 ```text
-其实 [1500,2000) 和 [2200,2500) 已经到了
+ACK field = 最前面仍缺失的 sequence number
+SACK block = gap 后已经收到的一个或多个离散 range
 ```
 
-**SACK** 是 Selective Acknowledgment，选择确认。它允许 receiver 在 TCP option 中携带若干已收到的离散 sequence ranges，让 sender 更准确地知道哪些数据无需重传。[S6](#source-s6)
+这也是 `ooseq` 与 SACK 必须分开的原因：`ooseq` 是 receiver 内部保存实际乱序 segment/pbuf 的数据结构；SACK 是对 peer 暴露的 TCP option。内部存在 `ooseq` 并不自动意味着线上一定会出现 SACK，还要同时满足 build capability、连接协商和当前存在可报告 range。下面沿这三层条件进入 lwIP。
 
-SACK 不替代 cumulative ACK；它是在累计 ACK 之外提供额外信息。
-
-## 12. 当前 upstream 配置为什么默认看不到 SACK option
+## 12. 第一层：build 是否启用 SACK output
 
 当前 lwIP Core 默认：[S2](#source-s2)
 
@@ -393,7 +433,7 @@ LWIP_TCP_SACK_OUT = 1
     是否支持对 peer 发送 SACK feedback
 ```
 
-## 13. SACK 还需要握手协商，而不是单边强行发送
+## 13. 第二层：连接是否通过 SACK-Permitted 完成协商
 
 即使编译启用了 `LWIP_TCP_SACK_OUT`，连接也要在 SYN 阶段通过 SACK-Permitted option 协商支持。[S1](#source-s1)[S6](#source-s6)
 
@@ -409,7 +449,7 @@ LWIP_TCP_SACK_OUT = 1
 
 少其中任何一层，都不能仅凭“代码里有 SACK 函数”推断当前 ACK 一定携带 SACK。
 
-## 14. `rcv_sacks[]` 保存的是已收到的离散 range
+## 14. 第三层：`rcv_sacks[]` 怎样记录可反馈的离散 range
 
 SACK 支持开启后，PCB 有：[S4](#source-s4)
 
@@ -428,7 +468,7 @@ right
 
 乱序 segment 进入/合并时，`tcp_add_sack()` 更新这些 ranges；gap 被补齐、累计 ACK 前进以后，`tcp_remove_sacks_lt()` 等 helper 会删除已经不再需要单独报告的 range。[S1](#source-s1)
 
-## 15. SACK option 怎样进入 ACK
+## 15. 最终映射：SACK range 怎样被编码进 ACK
 
 输出端根据 PCB 当前有效 SACK ranges 和 TCP option 空间计算能携带多少 blocks，然后 `tcp_build_sack_option()` 把这些 sequence range 编码到 TCP options。[S8](#source-s8)
 
@@ -521,3 +561,9 @@ flowchart TD
 - URL/文档：[`src/core/tcp_out.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/tcp_out.c)、[`src/include/lwip/priv/tcp_priv.h`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/include/lwip/priv/tcp_priv.h)
 - 使用位置：SACK-Permitted 与 SACK option 构造
 - 支撑内容：`tcp_build_sack_option()`、option flags 与 empty ACK SACK output
+<a id="source-s9"></a>
+### [S9] Wireshark TCP Analysis
+- URL/文档：[Wireshark User's Guide — TCP Analysis](https://www.wireshark.org/docs/wsug_html_chunked/ChAdvTCPAnalysis.html)
+- 使用位置：源码前抓包前置阅读、Out-Of-Order/Dup ACK/Fast Retransmission 等分析标签的边界说明
+- 支撑内容：Wireshark 对 TCP analysis flags 的识别条件；用于解释抓包视角与 lwIP receiver 内部 `ooseq`/SACK 状态不能直接画等号
+

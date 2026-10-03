@@ -1,72 +1,137 @@
 <meta name="referrer" content="no-referrer" />
 
-# 教程 31：从 `slipif_init()` 到 `pppos_create()`——SLIP 与 PPPoS 的串口封装、错误检测、协商与工程边界
+# 教程 31：SLIP vs PPPoS——串口 IP Framing、错误检测、协商与工程边界
 
-> 摘要：从 lwIP 的 SLIP 与 PPPoS 两条真实串口路径对比 framing、Protocol 分发、FCS、地址配置、认证、线程桥接与错误语义，明确最小 IP framing 与完整 PPP 控制面的边界。
+> 摘要：用统一的数据流、控制面与实现边界比较 lwIP SLIP 和 PPPoS，解释 framing、错误检测、协议分发、地址配置、执行上下文与生命周期差异。
 
 [TOC]
 
-Stage 28～30 已经从 `pppos_create()` 追到 PPPoS framing、LCP/PAP/CHAP、IPCP/IPv6CP，再追到地址、DNS、default route 与 reconnect。Stage 31 不重复整套 PPP 状态机，而是换到 lwIP 另一条串口网络接口 `slipif`，从它真实的初始化和收发函数进入，再与已经建立好的 PPPoS 路径逐项对照。[S1](#source-s1)[S2](#source-s2)
+SLIP（Serial Line Internet Protocol，串行线路 IP）和 PPPoS（PPP over Serial）都能让 IP 数据穿过 serial byte stream，但二者解决的问题并不相同。SLIP 是一个极简的 **IP datagram framing**：它告诉接收端一段 IP 数据在哪里开始/结束，并对少数字节做 escaping；PPPoS 则把完整 PPP 放到串行链路上，因此除了 framing，还具有 FCS（Frame Check Sequence，帧校验序列）错误检测、Protocol multiplexing（按 PPP Protocol 字段复用多种上层协议）、LCP（Link Control Protocol，链路控制协议）、可选认证、IPCP（Internet Protocol Control Protocol，IPv4 网络控制协议）/IPv6CP（IPv6 Control Protocol，IPv6 网络控制协议）等 control plane（用于建立、协商和维护链路的控制面）。[S3](#source-s3)[S4](#source-s4)[S5](#source-s5)
 
-这里最重要的边界是：SLIP 在 RFC 1055 中只是“把 IP datagram 分帧到串口字节流”的 framing protocol；它不提供地址协商、packet type identification、error detection/correction 或 link configuration。PPP 则定义独立的数据链路封装、Protocol field、LCP/NCP，并在 HDLC-like framing 中使用 FCS 做 frame-level error detection。[S3](#source-s3)[S4](#source-s4)[S5](#source-s5)
+Stage 28～30 已经完整展开 PPPoS 的 framing、协商和网络配置源码。本篇不再复制那些调用链，而是回答一个独立工程问题：**同样是“串口传 IP”，SLIP 与 PPPoS 在系统职责、错误语义、配置能力和生命周期上到底差在哪里？** lwIP 源码只作为机制映射，不再作为文章骨架。[S1](#source-s1)[S6](#source-s6)
 
-因此，二者虽然都可以运行在 UART/serial byte stream 上，但承担的协议职责明显不同。
+## 阅读前建议：先看协议原文，再用本文建立工程映射
 
-## 1. upstream example 从 `netif_add(..., slipif_init, ip_input)` 创建 SLIP 接口
+1. [RFC 1055 — A Nonstandard for Transmission of IP Datagrams over Serial Lines: SLIP](https://www.rfc-editor.org/rfc/rfc1055.html)
+   - 用途：理解 SLIP 的 END（帧结束字节）/ESC（转义前缀）framing，以及它明确**不提供**地址协商、type field、错误检测等能力。[S3](#source-s3)
+2. [RFC 1661 — The Point-to-Point Protocol (PPP)](https://www.rfc-editor.org/rfc/rfc1661.html)
+   - 用途：理解 PPP 为什么有 Protocol field（协议类型字段）、LCP（链路控制协议）/NCP（网络控制协议）和 session phase（会话阶段），而不是只有一个串口封装器。[S4](#source-s4)
+3. [RFC 1662 — PPP in HDLC-like Framing](https://www.rfc-editor.org/rfc/rfc1662.html)
+   - 用途：理解异步 PPP 的 Flag（帧边界标记）、Control Escape（转义前缀）、ACCM（异步控制字符映射）与 FCS（帧校验序列）。[S5](#source-s5)
+4. [lwIP `slipif.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/netif/slipif.c) 与 [lwIP PPP source](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/netif/ppp)
+   - 用途：把协议职责映射到当前 pinned lwIP 实现，区分 Core 机制与 example/Port 行为。[S1](#source-s1)[S6](#source-s6)
 
-进入 `test_netif_init()`：lwIP `contrib/examples/example_app/test.c` 的 SLIP 创建代码直接把 `slipif_init` 注册为 netif init callback，并把 `ip_input` 作为输入函数。[S2](#source-s2)
+## 1. 先看系统位置：两者共享 serial transport，但不是同一层次的“串口协议”
 
-```c
-netif_add(&slipif1, SLIP1_ADDRS &num_slip1, slipif_init, ip_input);
-#if !USE_ETHERNET
-netif_set_default(&slipif1);
-#endif
-#if LWIP_IPV6
-netif_create_ip6_linklocal_address(&slipif1, 1);
-#endif
-netif_set_up(&slipif1);
-```
-
-这几行已经暴露 SLIP 与 Ethernet、PPPoS 的第一个结构差异：
+serial transport 只提供字节收发。SLIP 直接位于 serial 与 IP 之间；PPPoS 位于 serial 与 PPP Core 之间，而 PPP Core 再承载 IPv4、IPv6 和多个 control protocol。[S1](#source-s1)[S4](#source-s4)[S6](#source-s6)
 
 ```mermaid
 flowchart LR
-    A["serial byte stream"] --> B["slipif"]
-    B --> C["raw IP datagram"]
-    C --> D["ip_input()"]
-    D --> E["IPv4 / IPv6"]
+    subgraph S["SLIP path"]
+        S1["IPv4 / IPv6 datagram"] --> S2["SLIP END/ESC framing"] --> S3["serial byte stream"]
+    end
+
+    subgraph P["PPPoS path"]
+        P1["IPv4 / IPv6 / LCP / IPCP / ..."] --> P2["PPP Protocol multiplexing"] --> P3["HDLC-like framing + FCS"] --> P4["serial byte stream"]
+    end
 ```
 
-没有 `ethernet_input()`，因为 SLIP frame 里没有 Ethernet header、MAC 地址或 EtherType。也没有 PPP Protocol field；完整 SLIP packet 解码出来后，payload 本身就是 IP datagram。[S1](#source-s1)[S3](#source-s3)
+这里的关键不是哪条链更长，而是**职责层次**：SLIP framing 完成后，payload 直接就是 IP datagram；PPPoS framing 完成后，payload 仍然先进入 PPP Core，由 `Protocol` field 决定这是 IP data 还是 control packet。[S1](#source-s1)[S3](#source-s3)[S6](#source-s6)
 
-IPv4 地址在这个 example 中由 `LWIP_PORT_INIT_SLIP1_IPADDR()`、`LWIP_PORT_INIT_SLIP1_GW()`、`LWIP_PORT_INIT_SLIP1_NETMASK()` 在 `netif_add()` 前准备。也就是说，示例的 SLIP IPv4 configuration 来自 Port/example 配置，而不是 SLIP 协议在链路上协商得到。[S2](#source-s2)
+## 2. 同一个 IPv4 datagram，在两条路径上发生了什么
 
-Stage 30 中的 PPP 则不同：IPCP OPENED 后才通过 `sifaddr()` 把 negotiated IPv4 local/peer address 写进 PPP netif；这属于 PPP network-control protocol 的结果，而不是串口 Driver 自己预先填好的静态参数。
+从上层交给 `netif` 的 IPv4 packet 出发，可以把 TX 数据流统一成下面两条路径：
 
-## 2. 进入 `slipif_init()`：SLIP 把普通 IP output 直接绑定到串口 framing
+```mermaid
+flowchart TD
+    A["IPv4 datagram"] --> B{"selected netif"}
+    B -->|SLIP| C["slipif_output_v4()"]
+    C --> D["slipif_output(): END/ESC encode"]
+    D --> E["sio_send()"]
 
-`netif_add()` 调用 `slipif_init()`。该函数分配私有状态、打开 serial device，并建立 IPv4/IPv6 output callback。[S1](#source-s1)
+    B -->|PPPoS| F["ppp_netif_output(protocol=PPP_IP)"]
+    F --> G["pppos_netif_output()"]
+    G --> H["Protocol + FCS + escaping"]
+    H --> I["ppp_output_cb()"]
+```
 
-下面是 `slipif_init()` 的关键连续片段：
+RX 则反过来：
+
+- SLIP parser 看到 END，得到的完整 `pbuf` 直接交给 `netif->input()`；upstream example 把该 callback 设成 `ip_input()`。[S1](#source-s1)[S2](#source-s2)
+- PPPoS parser 完成 frame/FCS 校验后先交给 `ppp_input()`；`ppp_input()` 读取 `Protocol` field，再决定进入 IPv4、IPv6、LCP、PAP、CHAP、IPCP 等哪一个 handler。[S6](#source-s6)
+
+因此，“串口上都能发 IP”并不能推出两者具有相同的数据链路语义。
+
+## 3. Framing：SLIP 只解决边界与转义，PPPoS 还承担 PPP 链路格式
+
+SLIP 的 wire rule 极少：`END` 标记 packet boundary，payload 中如果出现 END 或 ESC，就用 ESC sequence 转义。RFC 1055 没有为 SLIP 定义 type field、sequence number 或 checksum/FCS。[S3](#source-s3)
+
+PPPoS 使用 RFC 1662 的 asynchronous HDLC-like framing。除了 Flag/Control Escape，还涉及 Address/Control field、PPP `Protocol` field、FCS，以及 LCP 协商可能改变的 ACCM/PFC/ACFC。[S4](#source-s4)[S5](#source-s5)
+
+| 维度 | SLIP | PPPoS |
+| --- | --- | --- |
+| 帧边界 | END | Flag Sequence `0x7E` |
+| escaping | END/ESC 两类特殊字节 | Control Escape + ACCM 规则 |
+| payload 类型标识 | 无；解码后默认就是 IP datagram | 有 PPP `Protocol` field，可区分 IP 与 control protocol |
+| link-level error detection | RFC 1055 未定义 | 16-bit FCS（当前 lwIP PPPoS 路径）[S5](#source-s5)[S6](#source-s6) |
+| framing 是否受协商影响 | 否 | 会；PFC/ACFC/ACCM 可由 LCP 结果改变 |
+
+## 4. 错误检测差异不是“小功能”，它改变 frame 是否有资格进入 IP 层
+
+SLIP parser 能判断的是 framing 是否完整，例如 END 到达、ESC sequence 如何恢复。协议本身没有 frame-level FCS，因此接收端无法依靠 SLIP framing 判断某个完整 datagram 是否在串行链路中发生 bit error。[S3](#source-s3)
+
+PPPoS 则在 `pppos_input()` 中持续累计 FCS；只有完整 frame 的 FCS 满足条件，packet 才继续进入 `ppp_input()`。因此 FCS 在这里属于**进入 PPP Core 前的 link-level gate**，和后续 IPv4 header checksum、TCP/UDP checksum 不是同一层检查。[S5](#source-s5)[S6](#source-s6)
+
+```mermaid
+flowchart LR
+    A["serial bytes"] --> B["framing parser"]
+    B --> C{"link-level integrity check"}
+    C -->|SLIP: no protocol FCS| D["IP datagram"]
+    C -->|PPPoS: FCS valid| E["PPP Protocol demux"]
+    C -->|PPPoS: FCS invalid| F["drop frame"]
+```
+
+## 5. Protocol multiplexing：SLIP 隐含“就是 IP”，PPP 明确写出“这是什么协议”
+
+SLIP 没有协议类型字段。lwIP 的 `slipif_output_v4()` 与 `slipif_output_v6()` 最终都调用同一个 `slipif_output()`，而 RX 完成后直接走 `netif->input()`；example 选择 `ip_input()`，由 IP 入口继续辨认 IPv4/IPv6。[S1](#source-s1)[S2](#source-s2)
+
+PPP frame 则显式携带 `Protocol` field。例如 IPv4 使用 PPP_IP，IPv6 使用 PPP_IPV6，LCP/PAP/CHAP/IPCP/IPv6CP 也各自有 protocol number。`ppp_input()` 读取这个字段后再做 protocol demultiplex。[S4](#source-s4)[S6](#source-s6)
+
+这也是为什么 PPP 可以在同一条 serial link 上同时承载**数据面**和**控制面**，而 SLIP 本身只负责把 IP datagram 运过去。
+
+## 6. 地址、DNS、认证：差异根源是“有没有 control plane”
+
+SLIP 没有 LCP/NCP。upstream example 在 `netif_add()` 之前准备 IPv4 address、gateway 和 netmask，然后直接 `netif_set_up()`；这些值来自 example/Port 配置，不是 SLIP 线上协商的结果。[S2](#source-s2)
+
+PPPoS 承载完整 PPP control plane：
+
+```mermaid
+flowchart LR
+    A["LCP"] --> B["optional PAP / CHAP"]
+    B --> C["IPCP / IPv6CP"]
+    C --> D["address / peer DNS / IPv6 link-local state"]
+    D --> E["Network Protocol usable"]
+```
+
+Stage 29 已经解释 LCP/Auth/NCP，Stage 30 已经解释 negotiated address、peer DNS、default-netif policy、link down 与 reconnect。本篇只保留这个职责映射，不重复逐函数展开。[S6](#source-s6)
+
+## 7. “接口 up”在两者中不是同一个生命周期语义
+
+SLIP example 创建 `netif` 后可以直接 `netif_set_up()`；只要 serial I/O 和静态网络参数已经准备好，就不存在“必须等待 LCP/NCP OPENED 才允许 IP”的协议门槛。[S2](#source-s2)
+
+PPPoS 不同。`pppos_create()` 创建的是 link adapter + PPP control block，`ppp_connect()` 之后还要经历 LCP、可选认证和 NCP。lwIP 的 PPP Core 还会在 `ppp_input()` 根据当前 phase/LCP state 丢弃不应出现的数据协议 packet。[S6](#source-s6)
+
+因此不能把 `netif_set_up()` 与 `PPP_PHASE_RUNNING` 直接类比成同一个状态：前者是 lwIP interface administrative state，后者属于 PPP session/control-plane progression。
+
+## 8. lwIP 实现映射：只看最能解释边界的几个符号
+
+Theory-of-Operation 不需要再复制 Stage 28～30 的完整 PPP 调用链，只需把机制定位到实现。
+
+### 8.1 SLIP：`slipif_init()` 直接把 IP output 接到 serial framing
+
+`slipif_init()` 把 IPv4/IPv6 output callback 绑定到 SLIP encoder，并打开 serial device：[S1](#source-s1)
 
 ```c
-err_t
-slipif_init(struct netif *netif)
-{
-  struct slipif_priv *priv;
-  u8_t sio_num;
-
-  LWIP_ASSERT("slipif needs an input callback", netif->input != NULL);
-
-  sio_num = LWIP_PTR_NUMERIC_CAST(u8_t, netif->state);
-
-  priv = (struct slipif_priv *)mem_malloc(sizeof(struct slipif_priv));
-  if (!priv) {
-    return ERR_MEM;
-  }
-
-  netif->name[0] = 's';
-  netif->name[1] = 'l';
 #if LWIP_IPV4
   netif->output = slipif_output_v4;
 #endif
@@ -76,615 +141,93 @@ slipif_init(struct netif *netif)
   netif->mtu = SLIP_MAX_SIZE;
 
   priv->sd = sio_open(sio_num);
-  if (!priv->sd) {
-    mem_free(priv);
-    return ERR_IF;
-  }
 ```
 
-当前 `SLIP_MAX_SIZE` 默认是 1500。`netif->state` 在进入 init 前被解释成 serial port number；成功打开后，`netif->state` 改成 `struct slipif_priv *`，其中保存 serial descriptor、当前 RX pbuf chain、解析状态和接收长度。[S1](#source-s1)
+这段实现没有创建额外 control protocol object。RX parser 完整组出 packet 后，`slipif_rxbyte_input()` 直接调用 `netif->input(p, netif)`。[S1](#source-s1)
 
-继续阅读同一个 `slipif_init()`，它初始化 RX parser；若 `SLIP_USE_RX_THREAD` 为 1，还会创建一个阻塞读串口的线程：
+### 8.2 PPPoS：`pppos_create()` 创建 link adapter，但 PPP Core 仍拥有 session
 
-```c
-  priv->p = NULL;
-  priv->q = NULL;
-  priv->state = SLIP_RECV_NORMAL;
-  priv->i = 0;
-  priv->recved = 0;
-#if SLIP_RX_FROM_ISR
-  priv->rxpackets = NULL;
-#endif
+Stage 28 的 `pppos_create()` 通过 `ppp_new()` 创建真正的 PPP control block/netif，并注册 serial output callback；`ppp_connect()` 才启动 session。PPPoS 自身不是 LCP/IPCP 状态机的 owner。[S6](#source-s6)
 
-  netif->state = priv;
-
-  MIB2_INIT_NETIF(netif, snmp_ifType_slip, SLIP_SIO_SPEED(priv->sd));
-
-#if SLIP_USE_RX_THREAD
-  sys_thread_new(SLIPIF_THREAD_NAME, slipif_loop_thread, netif,
-                 SLIPIF_THREAD_STACKSIZE, SLIPIF_THREAD_PRIO);
-#endif
-  return ERR_OK;
-}
-```
-
-函数返回后，回到 `netif_add()`；example 随后调用 `netif_set_up(&slipif1)`。此时 netif 已具备：
-
-- TX：`netif->output` / `output_ip6` → SLIP encoder；
-- RX：串口线程、poll 或 ISR 输入 → SLIP decoder → `netif->input`；
-- input callback：example 指定为 `ip_input()`。
-
-这和 PPPoS 的初始化层次不同。PPPoS 先由 `pppos_create()` 建立 PPP control block 和 PPP netif，随后 `ppp_connect()` 启动 LCP session；“netif 存在”和“PPP session 已经可承载 IP”是两个不同阶段。[S6](#source-s6)
-
-## 3. SLIP TX：`slipif_output_v4()`/`v6()` 不使用 next-hop 地址
-
-IPv4 或 IPv6 output 到达 SLIP netif 后分别进入 `slipif_output_v4()` 或 `slipif_output_v6()`。两个 wrapper 都忽略目标地址，只把完整 IP packet 交给 `slipif_output()`：[S1](#source-s1)
-
-```c
-static err_t
-slipif_output_v4(struct netif *netif, struct pbuf *p, const ip4_addr_t *ipaddr)
-{
-  LWIP_UNUSED_ARG(ipaddr);
-  return slipif_output(netif, p);
-}
-```
-
-IPv6 wrapper 的结构相同。这符合 point-to-point serial link 的数据路径：`slipif` 不做 ARP/ND next-hop MAC resolution，也不构造 L2 address header；它只需要把调用方已经形成的 IP datagram 变成可在串口字节流中识别边界的 SLIP frame。
-
-`slipif_output_v4()` 直接调用 `slipif_output()`，下面进入 encoder。
-
-## 4. `slipif_output()`：SLIP framing 只有 END 与 ESC escaping
-
-RFC 1055 定义的核心字符是 END `0xC0` 和 ESC `0xDB`。lwIP 还定义 `ESC_END=0xDC`、`ESC_ESC=0xDD`，完全对应 RFC 的字节透明机制。[S1](#source-s1)[S3](#source-s3)
-
-`slipif_output()` 从 END delimiter 开始，然后逐个遍历 pbuf chain 的 payload byte：[S1](#source-s1)
-
-```c
-static err_t
-slipif_output(struct netif *netif, struct pbuf *p)
-{
-  struct slipif_priv *priv;
-  struct pbuf *q;
-  u16_t i;
-  u8_t c;
-
-  priv = (struct slipif_priv *)netif->state;
-
-  sio_send(SLIP_END, priv->sd);
-
-  for (q = p; q != NULL; q = q->next) {
-    for (i = 0; i < q->len; i++) {
-      c = ((u8_t *)q->payload)[i];
-      switch (c) {
-        case SLIP_END:
-          sio_send(SLIP_ESC, priv->sd);
-          sio_send(SLIP_ESC_END, priv->sd);
-          break;
-        case SLIP_ESC:
-          sio_send(SLIP_ESC, priv->sd);
-          sio_send(SLIP_ESC_ESC, priv->sd);
-          break;
-        default:
-          sio_send(c, priv->sd);
-          break;
-      }
-    }
-  }
-  sio_send(SLIP_END, priv->sd);
-  return ERR_OK;
-}
-```
-
-完整 wire-level 关系是：
-
-```mermaid
-flowchart LR
-    A["IP pbuf chain"] --> B["send 0xC0 END"]
-    B --> C{"payload byte"}
-    C -->|"0xC0"| D["0xDB 0xDC"]
-    C -->|"0xDB"| E["0xDB 0xDD"]
-    C -->|"other"| F["send byte"]
-    D --> G["next byte"]
-    E --> G
-    F --> G
-    G --> C
-    C -->|"packet end"| H["send 0xC0 END"]
-```
-
-这里没有 PPP 的 Address `0xff`、Control `0x03`、Protocol field，也没有 FCS。RFC 1055 对 SLIP 的描述就是 packet framing only；error detection/correction 不属于 SLIP framing。[S3](#source-s3)
-
-### 4.1 `sio_send()` 的 API 设计让 `slipif_output()` 无法报告串口发送失败
-
-`slipif_output()` 的源码注释明确说明：serial layer 的 `sio_send()` 没有返回值，因此这个函数总是返回 `ERR_OK`。[S1](#source-s1)
-
-这不是“所有串口驱动都不会失败”的协议结论，而是当前 lwIP `sio` abstraction 与 `slipif` implementation 的错误传播边界。
-
-Stage 28 的 PPPoS 则由应用提供 `pppos_output_cb()`；`pppos_write()` 会比较 output callback 返回的实际长度与请求长度，发生 short write 时可以向 PPP link path 返回 `ERR_IF`。[S6](#source-s6)
-
-因此仅从 lwIP 当前接口契约看，两者的 TX error feedback 能力并不相同。
-
-## 5. SLIP RX：`slipif_loop_thread()` 每次读一个字节交给 parser
-
-当 `SLIP_USE_RX_THREAD` 为 1，`slipif_init()` 创建 `slipif_loop_thread()`。线程阻塞在 `sio_read()`：[S1](#source-s1)
-
-```c
-static void
-slipif_loop_thread(void *nf)
-{
-  u8_t c;
-  struct netif *netif = (struct netif *)nf;
-  struct slipif_priv *priv = (struct slipif_priv *)netif->state;
-
-  while (1) {
-    if (sio_read(priv->sd, &c, 1) > 0) {
-      slipif_rxbyte_input(netif, c);
-    }
-  }
-}
-```
-
-收到一个 byte 后直接进入 `slipif_rxbyte_input()`。该 helper 调 `slipif_rxbyte()`；只有 parser 确认一整个 packet 完成时才把 pbuf 送给 `netif->input()`：[S1](#source-s1)
-
-```c
-static void
-slipif_rxbyte_input(struct netif *netif, u8_t c)
-{
-  struct pbuf *p;
-  p = slipif_rxbyte(netif, c);
-  if (p != NULL) {
-    if (netif->input(p, netif) != ERR_OK) {
-      pbuf_free(p);
-    }
-  }
-}
-```
-
-回到 example 的创建参数，`netif->input` 就是 `ip_input()`。所以完整默认线程路径是：[S1](#source-s1)[S2](#source-s2)
-
-```mermaid
-flowchart LR
-    A["sio_read()"] --> B["slipif_loop_thread()"]
-    B --> C["slipif_rxbyte_input()"]
-    C --> D["slipif_rxbyte()"]
-    D -->|"END + complete"| E["pbuf"]
-    E --> F["netif->input()"]
-    F --> G["ip_input()"]
-```
-
-这条路径没有 `tcpip_input()` mailbox bridge。是否需要进一步切到 TCP/IP Core thread，取决于 Port 给 `netif->input` 绑定什么 callback 以及所采用的 lwIP execution model。upstream example 这里明确使用 `ip_input()`，因此这只是该 example 的执行方式，不能泛化成所有 RTOS SLIP Port 的线程安全模板。
-
-## 6. `slipif_rxbyte()`：两态 parser 恢复 END/ESC 并累积 pbuf chain
-
-SLIP parser 的状态只有：
-
-```c
-enum slipif_recv_state {
-  SLIP_RECV_NORMAL,
-  SLIP_RECV_ESCAPE
-};
-```
-
-`SLIP_RECV_NORMAL` 收到 END 时，如果已经累计了 payload，就裁剪 pbuf chain 并返回完整 packet；收到 ESC 时切到 `SLIP_RECV_ESCAPE`。[S1](#source-s1)
-
-下面继续阅读 `slipif_rxbyte()` 的 delimiter/escape 分支：
-
-```c
-switch (priv->state) {
-  case SLIP_RECV_NORMAL:
-    switch (c) {
-      case SLIP_END:
-        if (priv->recved > 0) {
-          pbuf_realloc(priv->q, priv->recved);
-          LINK_STATS_INC(link.recv);
-          t = priv->q;
-          priv->p = priv->q = NULL;
-          priv->i = priv->recved = 0;
-          return t;
-        }
-        return NULL;
-      case SLIP_ESC:
-        priv->state = SLIP_RECV_ESCAPE;
-        return NULL;
-      default:
-        break;
-    }
-    break;
-  case SLIP_RECV_ESCAPE:
-    switch (c) {
-      case SLIP_ESC_END:
-        c = SLIP_END;
-        break;
-      case SLIP_ESC_ESC:
-        c = SLIP_ESC;
-        break;
-      default:
-        break;
-    }
-    priv->state = SLIP_RECV_NORMAL;
-    break;
-  default:
-    break;
-}
-```
-
-这不是类似 LCP/IPCP 那种 protocol FSM；它只是 byte unescaping parser。把 `SLIP_RECV_NORMAL/ESCAPE` 与 PPP `PPP_PHASE_*` 或 generic PPP FSM 的 CLOSED/REQSENT/OPENED 混为一谈，会把“串口 framing parser 状态”和“链路协议协商状态”混在不同层次。
-
-### 6.1 packet body 直接进入 `PBUF_POOL`
-
-同一个 `slipif_rxbyte()` 在需要空间时通过 `pbuf_alloc(PBUF_LINK, ..., PBUF_POOL)` 分配新的 pbuf，并用 `pbuf_cat()` 接到当前 packet chain。[S1](#source-s1)
-
-```c
-if (priv->p == NULL) {
-  priv->p = pbuf_alloc(PBUF_LINK,
-                       (PBUF_POOL_BUFSIZE - PBUF_LINK_HLEN - PBUF_LINK_ENCAPSULATION_HLEN),
-                       PBUF_POOL);
-
-  if (priv->p == NULL) {
-    LINK_STATS_INC(link.drop);
-    return NULL;
-  }
-
-  if (priv->q != NULL) {
-    pbuf_cat(priv->q, priv->p);
-  } else {
-    priv->q = priv->p;
-  }
-}
-```
-
-因此 SLIP RX 也会受到 Stage 12 已经讲过的 PBUF_POOL 资源约束。它没有 Ethernet DMA ring，但仍可能因为 pbuf allocation failure 而 drop packet。
-
-当前实现还限制 `SLIP_MAX_SIZE`。超过限制的后续 bytes 不再写进 pbuf，直到 END 到来完成当前 parser cycle。[S1](#source-s1)
-
-## 7. SLIP 有三种 RX execution mode，不等价于 PPPoS 的 Core bridge
-
-`slipif.h` 明确给出三类接收方式：[S1](#source-s1)
-
-1. `SLIP_USE_RX_THREAD`：独立 thread 阻塞 `sio_read()`；
-2. `slipif_poll()`：主循环用 `sio_tryread()` polling；
-3. `SLIP_RX_FROM_ISR`：ISR 调 `slipif_received_byte[s]()`，完成 packet 后排队，main loop 再 `slipif_process_rxqueue()`。
-
-`SLIP_USE_RX_THREAD` 的默认值是 `!NO_SYS`；`SLIP_RX_FROM_ISR` 默认关闭。[S1](#source-s1)
-
-PPPoS example 的典型路径则是应用自己的 serial RX thread 批量读取，再调用 `pppos_input_tcpip()`，由该 API 把输入切换到 `tcpip_thread` 后执行 PPP framing parser。若配置 `PPP_INPROC_IRQ_SAFE`，则可以采用另一种 in-process 模式。[S6](#source-s6)
-
-因此两个模块都允许多种 Port 方式，但 API 边界不同：
+这两个入口已经足以解释架构差异：
 
 ```text
-SLIP:
-serial source
-→ slipif-specific RX thread/poll/ISR queue
-→ completed IP pbuf
-→ netif->input
-
-PPPoS:
-application serial source
-→ pppos_input_tcpip()/pppos_input
-→ PPP framing + protocol demux
-→ PPP netif / IP
+SLIP:  netif -> framing adapter -> serial
+PPPoS: netif -> PPP Core -> PPPoS framing adapter -> serial
 ```
 
-线程模型属于 Port/integration contract，不能只根据“底层都是 UART”假定相同。
+## 9. RX execution context：都可以有线程/ISR，但线程模型不是协议本身
 
-## 8. PPPoS 多出的不是几字节 header，而是一整层 PPP data-link protocol
+当前 lwIP `slipif` 支持几种 RX integration：独立 `SLIP_USE_RX_THREAD` 线程、主循环 `slipif_poll()`，以及配置允许时的 ISR enqueue + `slipif_process_rxqueue()`。[S1](#source-s1)
 
-Stage 28 已经完整展开 PPPoS，这里只保留本篇需要的对照桥接。`pppos_create()` 创建 PPP PCB；`ppp_connect()` 让 adapter connect 后进入 `ppp_start()`；LCP 先建立链路，再按配置进入认证与 NCP。[S6](#source-s6)
+PPPoS example 使用自己的 serial RX thread，再通过 `pppos_input_tcpip()` 把字节交回 `tcpip_thread`；如果配置改变，PPPoS 也有其他 execution model。[S6](#source-s6)
 
-PPP asynchronous HDLC-like frame 的逻辑结构包括：[S4](#source-s4)[S5](#source-s5)
+因此“SLIP 是线程方式、PPPoS 是 Core 线程方式”不是协议结论。能比较的是：**当前 lwIP integration 为了满足 Core locking/threading contract，分别提供了哪些桥接方式。**
 
-```text
-Flag
-Address
-Control
-Protocol
-Information
-FCS
-Flag
-```
+## 10. TX error feedback：协议能力与 I/O abstraction 要分开
 
-在 LCP 协商后，Address/Control 可以通过 ACFC 省略，Protocol field 也可以通过 PFC 压缩；ACCM 决定异步链路上还需转义哪些控制字符。[S4](#source-s4)[S5](#source-s5)
+当前 `slipif_output()` 最终调用 `sio_send()`；该 serial abstraction 没有提供可传播的发送失败返回值，因此 `slipif_output_v4()/v6()` 的 API 注释说明当前路径总是返回 `ERR_OK`。[S1](#source-s1)
 
-SLIP frame 则可以概括为：
+PPPoS 的 `ppp_output_cb` 类型允许应用 callback 返回写入长度，PPPoS encoder 可以依据回调结果形成自己的返回语义。[S6](#source-s6)
 
-```text
-END
-escaped IP datagram bytes
-END
-```
+这属于**当前 lwIP I/O abstraction 的实现差异**，不能泛化成“SLIP 协议永远无法报告错误、PPP 协议一定能报告 UART 错误”。协议 wire format 与本地 driver/API error semantics 是两个层次。
 
-RFC 1055 不定义 protocol field，因此原始 SLIP framing 本身没有“这个 payload 是 IPv4、IPv6、LCP 还是 IPCP”的 data-link type identifier。[S3](#source-s3)
+## 11. 大小限制与 overhead：不要只比较固定 header 字节
 
-lwIP 当前 `slipif` 同时设置 `output` 和 `output_ip6`，并直接把完成的 datagram 交给 generic `ip_input()`；这是 lwIP implementation 对 raw IP datagram 的处理能力。RFC 1055 本身是 1988 年的 IP-over-serial SLIP 文档，不应把 lwIP 当前 IPv6 integration 反向描述成 RFC 1055 当年定义的 IPv6 SLIP 标准。[S1](#source-s1)[S3](#source-s3)
+SLIP 的 `SLIP_MAX_SIZE` 是当前 lwIP parser 接收 packet 的实现上限；PPP 的 MRU（Maximum-Receive-Unit，最大接收单元）属于 PPP 链路参数，并可通过 LCP 参与协商。[S1](#source-s1)[S4](#source-s4)[S6](#source-s6)
 
-## 9. error detection：SLIP framing 没有 FCS，PPPoS 在 frame 层验证 FCS
+两者的 serial overhead 也不是“固定多几个 header byte”这么简单：
 
-这是二者最容易被低估的差别之一。
+- SLIP 遇到 END/ESC 时会扩展 escaping；
+- PPPoS 的 overhead 受 Address/Control、Protocol 压缩、FCS，以及 ACCM 需要 escape 的字节数量影响。[S3](#source-s3)[S5](#source-s5)
 
-RFC 1055 明确指出 SLIP 没有 error detection/correction；如果串口传输中某个 ordinary byte 被翻转成另一个 ordinary byte，而且没有破坏 END/ESC framing，SLIP decoder 自己没有 frame-level checksum 可以据此拒绝整个 packet。[S3](#source-s3)
+所以没有实际 payload 分布和链路配置时，不应给出一个无条件的“某方案一定更省带宽”的结论。
 
-上层协议可能仍有自己的校验：
+## 12. IPv6：区分 lwIP integration 能力与协议标准化历史
 
-- IPv4 header checksum 只覆盖 IPv4 header；
-- TCP/UDP checksum 覆盖其 transport pseudo-header/header/payload；
-- IPv6 header 本身没有 IPv4 那种 header checksum。
+当前 lwIP `slipif` 可以设置 `netif->output_ip6 = slipif_output_v6`，因此实现层面能够把 IPv6 datagram 直接通过 SLIP framing 送到串行链路。[S1](#source-s1)
 
-这些都不等价于链路层对整个 serial frame 做 FCS。
+但 RFC 1055 本身是历史上的 IP-over-serial SLIP 文档，不提供类似 PPP IPv6CP 的 IPv6 control plane。PPP 则由 RFC 5072 定义 IPv6 over PPP 和 IPv6CP。[S7](#source-s7)
 
-PPPoS 则按 RFC 1662 使用 HDLC FCS；lwIP `pppos_input()` parser 在完整 frame 结束前累计 FCS，不满足 good-FCS 条件的 frame 不进入 `ppp_input()`。TX 端 `pppos_netif_output()`/相关 writer 同样生成 FCS。[S4](#source-s4)[S6](#source-s6)
+因此应该表述为：**当前 lwIP 可以把 IPv6 packet 走 `slipif`，但它没有因此获得 PPP IPv6CP 那套协商语义。**
 
-```mermaid
-flowchart TD
-    A["serial corruption"] --> B{"SLIP"}
-    B --> C["no framing FCS"]
-    C --> D["may reach IP; upper layer checksum may detect"]
-    A --> E{"PPPoS"}
-    E --> F["HDLC-like FCS"]
-    F --> G["bad frame discarded before PPP protocol input"]
-```
+## 13. 用统一维度比较 SLIP 与 PPPoS
 
-图中“may”是边界限定：具体 bit error 是否最终被 IP/transport checksum 检出，取决于受损字段和承载协议，不能把上层 checksum 当成 SLIP frame FCS 的等价替代。
-
-## 10. Protocol multiplexing：SLIP 只交 raw IP，PPP 用 Protocol field 分发多种协议
-
-Stage 28 中 `ppp_input()` 根据 PPP Protocol field 分发：[S6](#source-s6)
-
-```text
-PPP_IP     → IPv4 input
-PPP_IPV6   → IPv6 input
-PPP_LCP    → lcp_input()
-PPP_PAP    → auth input
-PPP_CHAP   → auth input
-PPP_IPCP   → ipcp_input()
-PPP_IPV6CP → ipv6cp_input()
-```
-
-这就是 Stage 29 的 LCP/Auth/NCP 能与用户 IP traffic 共享同一串口的基础。
-
-SLIP 没有对应 protocol field。`slipif_rxbyte_input()` 一旦完成 packet 就调用 `netif->input()`；upstream example 把该 callback 绑定为 `ip_input()`。[S1](#source-s1)[S2](#source-s2)
-
-因此 SLIP 不能仅靠自己的 framing，在同一 link 内原生 multiplex 一套类似 LCP/PAP/IPCP 的 control protocols。若产品要在 SLIP serial link 旁边再实现 modem control/config channel，那是另外的 framing/multiplexing 设计，不属于 RFC 1055 SLIP 本身。
-
-## 11. 地址与 DNS：SLIP 依赖外部配置，PPP 可以在 NCP 中协商
-
-upstream SLIP example 在创建 netif 前直接初始化 IPv4 local/gateway/netmask，然后 `netif_add()`。[S2](#source-s2)
-
-也就是说，下面这些问题不由 SLIP framing 回答：
-
-```text
-local IPv4 是多少？
-peer IPv4 是多少？
-DNS server 是多少？
-什么时候认为链路 configuration 完成？
-```
-
-实际产品必须通过静态配置、串口外的 modem command、应用协议或其他机制得到这些信息。
-
-PPPoS 则有明确的 control plane：
-
-```mermaid
-flowchart LR
-    A["LCP"] --> B["optional PAP/CHAP"]
-    B --> C["IPCP / IPv6CP"]
-    C --> D["IPv4 / IPv6 link configuration"]
-    D --> E["optional peer DNS"]
-    E --> F["RUNNING"]
-```
-
-Stage 29/30 已经证明 lwIP 当前 IPCP/IPv6CP 与 `sifaddr()`、`sdns()`、`sifup()` 等函数如何更新 PPP netif。[S6](#source-s6)
-
-所以“串口拨号网络为什么常见 PPPoS 而不是只有 SLIP framing”不能只用 packet overhead 解释；是否需要 negotiation、authentication、address/DNS configuration、error detection 与 protocol multiplexing 才是更完整的协议能力差异。
-
-## 12. Authentication：SLIP 没有 PAP/CHAP 对应层
-
-Stage 29 已经追踪 PAP/CHAP 在 PPP phase 中的位置。这里仅做边界对照：RFC 1055 SLIP 没有 link authentication state machine；PPP 通过 LCP negotiation 确定 authentication protocol，并可进入 PAP/CHAP。[S3](#source-s3)[S4](#source-s4)[S6](#source-s6)
-
-因此：
-
-```text
-SLIP over UART
-```
-
-本身不能表达“peer 必须用某个 username/password 完成 PAP/CHAP 后才允许 Network phase”。如果产品在 SLIP 上需要认证，必须在 SLIP 之外自行建立认证机制。
-
-## 13. Link lifecycle：SLIP `netif_set_up()` 不等价于 PPP RUNNING
-
-SLIP example 在 `netif_add()` 后直接 `netif_set_up(&slipif1)`。SLIP framing 没有 LCP lower-up、AUTHENTICATE、NETWORK、RUNNING 这一组协商阶段。[S2](#source-s2)[S3](#source-s3)
-
-PPPoS 中：
-
-```text
-pppos_create()
-→ PPP PCB / netif exists
-→ ppp_connect()
-→ ESTABLISH
-→ AUTHENTICATE (optional)
-→ NETWORK
-→ RUNNING
-```
-
-Stage 30 又说明 error/close 会把 NCP、link 和 phase 逐层收回到 DEAD，再由 application 决定是否 reconnect。[S6](#source-s6)
-
-因此不能把：
-
-```text
-SLIP netif UP
-```
-
-直接类比为：
-
-```text
-PPP_PHASE_RUNNING
-```
-
-前者只是 lwIP netif administrative state 加上 Port 已经准备好的 serial path；后者表示 PPP link control/auth/network control 已经完成到允许 network protocol traffic 的阶段。
-
-## 14. 两种 framing 的 escaping 也不是同一套规则
-
-SLIP 只需要对两个特殊 byte 做透明处理：[S1](#source-s1)[S3](#source-s3)
-
-| 原 byte | wire sequence |
-| --- | --- |
-| `0xC0` END | `0xDB 0xDC` |
-| `0xDB` ESC | `0xDB 0xDD` |
-
-PPP asynchronous HDLC framing 使用 `0x7e` Flag、`0x7d` Control Escape，并按 ACCM 对控制字符执行 octet stuffing；被转义 byte 与 `0x20` 做变换。LCP 还可以协商 ACCM。[S5](#source-s5)[S6](#source-s6)
-
-所以把 SLIP `0xC0/0xDB` 机械替换成 PPP `0x7e/0x7d` 并不会得到 PPPoS；PPP frame 还包含 protocol multiplexing、FCS 和 negotiation-driven compression/options。
-
-## 15. overhead 不能只看 header byte 数量
-
-从 wire format 看，SLIP 确实很薄：通常只是 packet delimiter，再对 END/ESC 做 escape；PPP 还有 Address/Control、Protocol、FCS，并可能因为 ACCM 产生更多 escaping。[S3](#source-s3)[S5](#source-s5)
-
-但实际链路开销还受这些因素影响：
-
-- payload 中特殊 byte 出现频率；
-- PPP 是否协商 ACFC/PFC；
-- ACCM；
-- serial line rate；
-- LCP/Auth/NCP control traffic；
-- retransmission 是否发生在更高层；
-- implementation 的 per-byte/pbuf processing cost。
-
-因此不能在没有真实流量和串口速率测量的情况下，仅凭“SLIP header 更短”就给出吞吐量排名。Stage 27 的性能原则仍然适用：需要根据实际 byte count、CPU、pbuf pressure 与链路速率测量，而不是从协议名字推导性能结论。
-
-## 16. IPv6 支持要区分 lwIP implementation 与历史 SLIP RFC
-
-当前 `slipif_init()` 在 `LWIP_IPV6` 下设置：
-
-```c
-netif->output_ip6 = slipif_output_v6;
-```
-
-继续阅读 `test_netif_init()`，upstream example 还调用：
-
-```c
-netif_create_ip6_linklocal_address(&slipif1, 1);
-```
-
-并继续把完整 RX packet 交给 generic `ip_input()`。[S1](#source-s1)[S2](#source-s2)
-
-这些代码证明当前 lwIP `slipif` 可以把 IPv6 datagram 放到该 raw serial framing 路径中。但 RFC 1055 的规范背景是 1988 年的 SLIP/IP；其“packet framing only”定义不能被改写成一个后来正式标准化的 IPv6-over-SLIP negotiation protocol。[S3](#source-s3)
-
-PPP 的 IPv6 则有 Stage 29 已讲过的 IPv6CP，并由 RFC 5072 定义 IPv6 over PPP 的 protocol/control boundary。[S7](#source-s7)
-
-## 17. SLIP `SLIP_MAX_SIZE=1500` 与 PPP MRU 的语义不同
-
-当前 `slipif.c` 的 `SLIP_MAX_SIZE` 默认 1500，并直接赋给 `netif->mtu`。RX parser 也据此限制当前 packet 最大接收长度。[S1](#source-s1)
-
-这个值是 lwIP SLIP implementation 的 compile-time/default sizing policy。
-
-PPP 中 Stage 29 已经看到 MRU 是 LCP configuration option；peer 可以在 LCP Configure negotiation 中协商其能接收的最大 Information field。lwIP PPP 还维护本地/peer MRU 相关状态。[S4](#source-s4)[S6](#source-s6)
-
-因此：
-
-```text
-SLIP_MAX_SIZE
-```
-
-与：
-
-```text
-PPP MRU
-```
-
-不能只因为都限制 packet/frame 大小就当成同一种机制。前者是当前 SLIP netif implementation 的本地上限，后者属于 PPP 链路协商的一部分。
-
-## 18. 本系列中的两条完整串口数据路径
-
-经过 Stage 28～31，现在可以把同一块 MCU/RTOS 上“serial network interface”的两种路径压缩成两张图。
-
-### 18.1 SLIP
-
-```mermaid
-flowchart TD
-    A["IP output"] --> B["slipif_output_v4/v6()"]
-    B --> C["slipif_output()"]
-    C --> D["END + ESC byte stuffing"]
-    D --> E["sio_send()"]
-    E --> F["serial wire"]
-    F --> G["sio_read()/poll/ISR"]
-    G --> H["slipif_rxbyte()"]
-    H --> I["completed raw IP pbuf"]
-    I --> J["netif->input()"]
-    J --> K["ip_input() in upstream example"]
-```
-
-### 18.2 PPPoS
-
-```mermaid
-flowchart TD
-    A["IP output"] --> B["PPP netif"]
-    B --> C["ppp_netif_output()"]
-    C --> D["PPP Protocol field"]
-    D --> E["pppos_netif_output()"]
-    E --> F["ACCM escaping + FCS"]
-    F --> G["application output callback"]
-    G --> H["serial wire"]
-    H --> I["application serial RX"]
-    I --> J["pppos_input_tcpip()/pppos_input()"]
-    J --> K["frame/FCS parser"]
-    K --> L["ppp_input() protocol demux"]
-    L --> M["IP or LCP/Auth/NCP"]
-```
-
-第二条图中还隐含 Stage 29 的 LCP/Auth/NCP control plane；SLIP 图没有对应 control plane，因为它不属于 SLIP 协议。
-
-## 19. 用统一维度比较 SLIP 与 PPPoS
-
-| 维度 | lwIP SLIP | lwIP PPPoS |
+| 维度 | SLIP | PPPoS |
 | --- | --- | --- |
-| serial framing | END/ESC byte framing | PPP HDLC-like octet framing |
-| data-link Protocol field | 无 | 有 |
-| frame-level FCS | 无 | 有，PPP FCS |
-| link negotiation | 无 | LCP |
-| authentication | SLIP 本身无 | PAP/CHAP 等，视编译/配置 |
-| IPv4 参数协商 | SLIP 本身无 | IPCP |
-| IPv6 control | 当前 lwIP 可承载 raw IPv6，但 SLIP 本身无 IPv6CP | IPv6CP + IPv6 PPP protocol |
-| peer DNS | SLIP 本身无 | IPCP 可带 peer DNS，应用决定是否采用 |
-| compression option negotiation | 无 | ACFC/PFC 等由 LCP 协商 |
-| serial escaping policy | 固定 END/ESC | Flag/Escape + ACCM |
-| lwIP TX error feedback | `sio_send()` 无返回值，`slipif_output()` 总是 `ERR_OK` | output callback 长度可参与 short-write/error 判断 |
-| RX integration | thread / poll / ISR queue | application RX + `pppos_input_tcpip()`，或特定 in-process 模式 |
-| netif configuration | example 由外部/static 参数建立 | NCP OPENED 后写入 negotiated configuration |
-| reconnect protocol state | SLIP 本身无 session FSM | PPP 有 phase/FSM，应用决定重拨策略 |
-| implementation complexity | framing path 较少 | control plane 与 framing 状态更多 |
+| 核心职责 | 最小 IP datagram serial framing | 完整 PPP over serial link adapter + PPP control plane |
+| RX 完成后的下一层 | 通常直接进入 IP input | 先进入 `ppp_input()` 做 Protocol demux |
+| link-level FCS | 无协议定义 | 有 HDLC-like FCS |
+| 协议类型复用 | 无独立 type field | PPP `Protocol` field |
+| 链路参数协商 | 无 | LCP |
+| 认证 | 无 | 可选 PAP/CHAP/EAP 等，取决于配置/协商 |
+| IPv4 参数协商 | 无 | IPCP |
+| IPv6 control plane | 无 IPv6CP | IPv6CP |
+| peer DNS | 无协议机制 | 可通过 IPCP extension 获取，取决于实现/配置 |
+| framing 参数可协商 | 基本固定 | ACCM/PFC/ACFC 等受 LCP 影响 |
+| 当前 lwIP integration | thread / poll / ISR queue | PPPoS callback + Core/thread bridge 等 |
+| 生命周期复杂度 | 小 | 明显更高，因为存在 session phase 和 control protocol FSM |
 
-表格描述的是“协议和当前 lwIP implementation 的能力差异”，不是给不同产品做绝对优劣排序。真正的选择还取决于 peer 支持什么协议、是否需要动态配置/认证、串口错误环境、资源预算以及已有 modem/host 协议。
+表中“无”表示**该协议本身不提供对应机制**，不代表产品不能通过其他私有命令、静态配置或上层协议补充这些能力。
 
-## 20. 什么时候“只需要 framing”，什么时候需要完整 point-to-point control plane
+## 14. 工程边界：选择的不是“哪个封装更高级”，而是哪一层需要承担配置责任
 
-如果链路两端完全受同一系统控制，IP 参数预先已知，不需要 PAP/CHAP、动态地址、peer DNS，也接受由上层 checksum 或物理链路承担剩余错误检测，那么 SLIP 所提供的最小 framing 模型能够减少协议状态和 negotiation 逻辑。这是由其能力边界推导出的适用条件，不是“SLIP 一定更好”。[S1](#source-s1)[S3](#source-s3)
+如果链路两端已经通过产品约定预先知道 IP 参数，只需要极小的 datagram boundary/escaping 机制，那么 SLIP 的设计目标与这种场景更接近。代价是地址配置、peer 能力、认证、link-level integrity 等职责需要由其他层解决。[S3](#source-s3)
 
-如果链路对端要求 PPP、需要 LCP negotiation、authentication、IPCP/IPv6CP、PPP FCS、Protocol multiplexing，或者 modem/network 本身就是 PPP service endpoint，那么这些能力只能由 PPP control/data plane 提供，不能通过给 SLIP 多加几个配置项得到。[S4](#source-s4)[S5](#source-s5)[S6](#source-s6)
+如果链路需要建立 session、协商链路参数、可选认证、配置 IPv4/IPv6、获得 peer DNS，并希望多种 Network/Control Protocol 在同一 link 上明确复用，那么 PPP/PPPoS 提供的是一套完整 control plane；代价是实现状态、定时器、协商失败路径和生命周期都更复杂。[S4](#source-s4)[S5](#source-s5)[S6](#source-s6)
 
-换句话说，真正的分界不是：
+这个判断不是性能排名。实际项目仍要结合 peer 支持、modem 接口、RAM/ROM、认证要求、故障恢复和部署环境决定。
 
-```text
-哪一种转义字符更简单？
-```
+## 15. Stage 28～31 的知识边界
 
-而是：
+经过四篇后，串口网络路径已经形成清晰分层：
 
-```text
-这个 serial link 只需要 raw IP framing，
-还是需要一个完整的 point-to-point data-link control protocol？
-```
+- Stage 28：PPP Core 与 PPPoS framing，回答 serial bytes 如何变成 PPP packet；
+- Stage 29：LCP/Auth/NCP，回答 PPP session 为什么需要协商才能进入 Network/Running；
+- Stage 30：地址、DNS、route policy 与 teardown/reconnect，回答协商结果怎样成为可用 `netif`；
+- Stage 31：SLIP vs PPPoS，回答两种 serial IP 方案的职责边界与工程取舍。
 
-## 21. Stage 28～31 的完整机制回看
-
-串口网络这一组文章现在形成完整闭环：
-
-```mermaid
-flowchart LR
-    A["Stage 28 PPPoS framing"] --> B["Stage 29 LCP/Auth/NCP"]
-    B --> C["Stage 30 Address/DNS/Route/Reconnect"]
-    C --> D["Stage 31 compare SLIP"]
-    D --> E{"required link contract"}
-    E -->|"raw IP framing"| F["SLIP"]
-    E -->|"negotiated PPP link"| G["PPPoS"]
-```
-
-Stage 28 解释“byte stream 怎样恢复成 PPP frame”；Stage 29 解释“PPP 为什么必须先协商”；Stage 30 解释“协商结果怎样进入 lwIP netif 和应用生命周期”；Stage 31 再用 SLIP 证明，serial framing、link configuration、authentication、protocol multiplexing 和 reconnect policy 本来就是不同层次的问题。
+Stage 31 到这里停止，不再重新展开 PPP FSM 或 address lifecycle 的源码细节。
 
 ## 资料来源
 
@@ -694,7 +237,7 @@ Stage 28 解释“byte stream 怎样恢复成 PPP frame”；Stage 29 解释“P
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
 - 定位：`src/netif/slipif.c`：`slipif_init()`、`slipif_output()`、`slipif_output_v4()`、`slipif_output_v6()`、`slipif_rxbyte()`、`slipif_rxbyte_input()`、`slipif_loop_thread()`、`slipif_poll()`、ISR queue 路径；`src/include/netif/slipif.h`
 - URL/文档：[lwIP slipif.c](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/netif/slipif.c)
-- 使用位置：“SLIP init/TX/RX”“END/ESC framing”“PBUF_POOL”“thread/poll/ISR”“SLIP_MAX_SIZE”“IPv6 integration”
+- 使用位置：“SLIP 系统位置”“framing/escaping”“RX/TX 数据流”“执行上下文”“IPv6 integration”
 - 支撑内容：证明当前 pinned lwIP `slipif` 的真实 framing、pbuf 与 serial I/O 实现
 
 <a id="source-s2"></a>
@@ -703,7 +246,7 @@ Stage 28 解释“byte stream 怎样恢复成 PPP frame”；Stage 29 解释“P
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
 - 定位：`contrib/examples/example_app/test.c`：`USE_SLIPIF` 分支；`contrib/examples/example_app/lwipcfg.h`
 - URL/文档：[lwIP example_app/test.c](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/contrib/examples/example_app/test.c)
-- 使用位置：“真实创建入口”“static IPv4 参数”“`ip_input` callback”“IPv6 link-local”“netif up/default”
+- 使用位置：“SLIP 初始化模型”“静态 IPv4 参数”“`ip_input` callback”“IPv6 integration”
 - 支撑内容：证明 upstream example 如何把 SLIP netif 接入 lwIP，而不是把 Port 行为泛化成 Core 规则
 
 <a id="source-s3"></a>
@@ -711,7 +254,7 @@ Stage 28 解释“byte stream 怎样恢复成 PPP frame”；Stage 29 解释“P
 - 类型：IETF 历史协议文档
 - 版本：RFC 1055，1988
 - URL/文档：[RFC 1055](https://www.rfc-editor.org/rfc/rfc1055.html)
-- 使用位置：“SLIP framing 职责”“END/ESC”“没有 addressing/type/error detection/compression”“IPv6 规范边界”
+- 使用位置：“建议提前阅读”“SLIP framing 职责”“END/ESC”“能力边界”
 - 支撑内容：定义 SLIP 是最小 IP datagram serial framing，并明确其不承担的功能
 
 <a id="source-s4"></a>
@@ -719,7 +262,7 @@ Stage 28 解释“byte stream 怎样恢复成 PPP frame”；Stage 29 解释“P
 - 类型：IETF Internet Standard
 - 版本：RFC 1661 / STD 51，1994
 - URL/文档：[RFC 1661](https://www.rfc-editor.org/rfc/rfc1661.html)
-- 使用位置：“PPP Protocol field”“LCP/NCP”“MRU negotiation”“PPP phase/control plane”
+- 使用位置：“建议提前阅读”“PPP control plane”“Protocol multiplexing”“LCP/NCP”“MRU”
 - 支撑内容：提供 PPP 链路建立、configuration protocol 与 multi-protocol encapsulation 的规范边界
 
 <a id="source-s5"></a>
@@ -727,7 +270,7 @@ Stage 28 解释“byte stream 怎样恢复成 PPP frame”；Stage 29 解释“P
 - 类型：IETF Internet Standard
 - 版本：RFC 1662 / STD 51，1994
 - URL/文档：[RFC 1662](https://www.rfc-editor.org/rfc/rfc1662.html)
-- 使用位置：“Flag/Control Escape”“ACCM”“Address/Control/Protocol/FCS”“FCS error detection”
+- 使用位置：“建议提前阅读”“PPPoS framing”“Flag/Control Escape”“ACCM/FCS”
 - 支撑内容：定义 asynchronous PPP 的 HDLC-like octet framing 与 FCS
 
 <a id="source-s6"></a>
@@ -736,7 +279,7 @@ Stage 28 解释“byte stream 怎样恢复成 PPP frame”；Stage 29 解释“P
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
 - 定位：`src/netif/ppp/pppos.c`、`ppp.c`、`lcp.c`、`auth.c`、`ipcp.c`、`ipv6cp.c`、`fsm.c`；`contrib/examples/ppp/pppos_example.c`
 - URL/文档：[lwIP PPP source](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/netif/ppp)
-- 使用位置：“PPPoS framing/FCS”“Protocol demux”“LCP/Auth/NCP”“address/DNS/reconnect”“TX error feedback”“RX Core bridge”
+- 使用位置：“PPPoS 对照模型”“framing/FCS”“Protocol demux”“control plane”“lifecycle”“执行上下文”
 - 支撑内容：作为 Stage 28～30 已展开机制的直接源码依据，用统一维度与 SLIP 对照
 
 <a id="source-s7"></a>

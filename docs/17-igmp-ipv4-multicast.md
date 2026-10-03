@@ -6,57 +6,79 @@
 
 [TOC]
 
-Stage 16 已经把 IPv4 fragmentation/reassembly 的 MTU 边界闭环。接下来进入另一种完全不同的“一个 packet 对应谁”的问题：**multicast packet 不是发给一个明确的 unicast host，而是发给一个 group；Host 必须告诉本地链路上的 multicast router 自己正在监听哪些组，同时网卡/Driver 还要决定哪些 multicast Ethernet frame 能进入接收路径。**
+IPv4 multicast（IPv4 组播）让发送者把一个 IPv4 datagram 发送到 **multicast group address（组播组地址）**，所有已经加入该组、并且链路路径允许该组流量通过的接收者都可以获得同一份数据。IGMP（Internet Group Management Protocol，互联网组管理协议）不是业务数据协议，而是 IPv4 Host 与本地 multicast router 之间维护“哪些组当前有成员”的控制协议。[S3](#source-s3)[S4](#source-s4)
 
-本篇使用 upstream 自带的 RTP multicast example 作为真实应用入口，而不是从 `igmp_joingroup_netif()` 中间函数凭空开始。[S1](#source-s1)
+本文标题中的 MAC Filter 指 Ethernet MAC（Media Access Control，媒体访问控制）/Driver 的组播地址过滤能力：即使 IP 层已经加入组，如果网卡硬件在更早的二层过滤阶段把对应 multicast MAC frame 丢掉，lwIP 仍然收不到业务数据。组成员状态机则是 lwIP 为每个 `netif + group` 维护的 membership 状态、定时器和 `last_reporter_flag`；其中 `netif` 是 lwIP 的网络接口对象，`last_reporter_flag` 记录本机是否认为自己是该组最近一次发送 Report 的 Host。这些状态决定收到 Query、其他 Host 的 Report 或本机 leave 时下一步做什么。[S1](#source-s1)[S2](#source-s2)
 
-RTP（Real-time Transport Protocol）位于应用层，通常承载实时音视频等媒体数据；它常以 UDP 作为下层传输。当前 lwIP example 用一段 MPEG4 bitstream 构造 RTP packet，默认向 IPv4 multicast group `232.0.0.0:4000` 发送数据。[S1](#source-s1)[S5](#source-s5) **RTP 本身不是 IGMP 的一部分**：RTP/UDP 负责 multicast group 中实际传输的数据，IGMP 则负责 IPv4 Host 对 group 的加入、报告和离开。
+RTP（Real-time Transport Protocol，实时传输协议）在当前 example 中只是 multicast **数据面**样例：`rtp_send_thread()` 通过 UDP 向 `232.0.0.0:4000` 发送 RTP packet；`rtp_recv_thread()` 则通过 `IP_ADD_MEMBERSHIP` 触发本文真正要追踪的 IGMP **控制面**。[S1](#source-s1)[S5](#source-s5)
 
-当前 example 的运行关系是：[S1](#source-s1)
+## 0. 阅读源码前：建议提前阅读
+
+以下资料用于建立标准语义和继续深入，不是正文的强制前置条件；不打开这些链接，后面的 join、Query/Report、suppression、Leave 和源码调用链仍然可以独立理解。
+
+1. [RFC 2236 — Internet Group Management Protocol, Version 2](https://www.rfc-editor.org/rfc/rfc2236.html)：用于核对本文目标实现实际采用的 IGMPv2 Query、Membership Report、Leave、timer 与 host membership state machine。[S4](#source-s4)
+2. [RFC 1112 — Host Extensions for IP Multicasting](https://www.rfc-editor.org/rfc/rfc1112.html)：用于 IPv4 multicast host model，以及 IPv4 multicast address 到 Ethernet multicast MAC 的映射规则。[S3](#source-s3)
+3. [Cisco Multicast Configuration Guide — IGMP](https://www.cisco.com/c/en/us/td/docs/switches/lan/c9000/multicast/multicast-configuration-guide/igmp.html)：适合作为工程视角的补充阅读，重点看 host/router、Query、Report、Leave，以及 report suppression（本机在等待发送 Report 时听到同组其他 Host 的 Report，于是取消自己的待发 Report）。[S7](#source-s7)
+4. [RFC 9776 — Internet Group Management Protocol, Version 3](https://www.rfc-editor.org/rfc/rfc9776.html)：用于确认当前 IGMPv3 标准状态。本文仍以 RFC 2236 为主要协议对照，因为目标 `igmp.c` 的 host-side 行为是 IGMPv2 模型。[S8](#source-s8)
+
+### 0.1 先建立 IGMPv2 最小协议模型
+
+本文只需要先掌握四类对象：
+
+| 对象 | 在当前流程中的职责 |
+| --- | --- |
+| Application | 通过 `IP_ADD_MEMBERSHIP` / `IP_DROP_MEMBERSHIP` 表达本机是否需要接收某个组 |
+| IPv4 Host / lwIP | 为每个 `netif + group` 维护 membership，并发送/接收 IGMP control message |
+| Multicast Router | 周期或按需发送 Query，并根据 Host Report 维护本链路上的组成员信息 |
+| Multicast Data Sender | 向 group address 发送实际 UDP/RTP 等业务 datagram；它不通过 IGMP 发送 payload |
+
+IGMPv2 当前主线会遇到三类 Control Message：
+
+- **Membership Query**：由 multicast router 发出，询问 Host 对全部组或某个指定组是否仍有成员。
+- **Version 2 Membership Report**：Host 用它声明“本接口仍然属于这个 group”。新 join 时会主动发送，收到 Query 后也可能延迟发送。
+- **Leave Group**：Host 最终离组时可能发送给 router，帮助 router 更快确认该链路是否还有成员。
+
+`Max Response Time` 是 Query 中约束 Host 最迟何时响应的字段。Host 不会让所有成员同时立即 Report，而是为 group 启动一个随机 delay timer；如果等待期间先听到另一个 Host 对同组的 Report，本机可以取消自己的 Report，这就是 **Report Suppression（报告抑制）**。在 lwIP 中，这些协议行为最终落到 `group->timer`、`group_state` 与 `last_reporter_flag`。[S1](#source-s1)[S4](#source-s4)
+
+### 0.2 一次完整 membership 生命周期先看协议，再看源码
+
+IGMPv2 的 General Query 通常发送到 `224.0.0.1` all-systems group，Group-Specific Query 发送到被查询的 group；Membership Report 发送到对应 group address，Leave Group 则发送到 `224.0.0.2` all-routers group。[S3](#source-s3)[S4](#source-s4) 因此下面箭头表示“该类消息由 router/Host 接收”，不是 Host 对某台 router 做单播。
 
 ```mermaid
-flowchart TD
-    A["rtp_init()"] --> B["rtp_send_thread()"]
-    A --> C["rtp_recv_thread()"]
-    B --> D["RTP header + MPEG4 payload"]
-    D --> E["UDP -> 232.0.0.0:4000"]
-    C --> F["UDP bind :4000"]
-    F --> G["SO_RCVTIMEO"]
-    G --> H["IP_ADD_MEMBERSHIP 232.0.0.0"]
-    H --> I["IGMP Membership Report"]
+sequenceDiagram
+    participant APP as Application
+    participant H as lwIP IPv4 Host
+    participant R as Multicast Router
+
+    APP->>H: IP_ADD_MEMBERSHIP(group)
+    H-->>R: Membership Report to group address, router receives
+    R-->>H: Query to all-systems group or target group
+    Note over H: start response delay timer
+    alt 先听到同组其他 Host 的 Report
+        H->>H: cancel timer, suppress own Report
+    else timer 到期
+        H-->>R: Membership Report to group address, router receives
+    end
+    APP->>H: IP_DROP_MEMBERSHIP(group)
+    H-->>R: Leave Group to 224.0.0.2 when current host is last reporter
 ```
 
-因此本文真正要追的控制链从 `rtp_recv_thread()` 的 `IP_ADD_MEMBERSHIP` 开始：
+业务数据走另一条路径：Sender 把 IPv4 destination 设置成 multicast group；在 Ethernet 上，IPv4 multicast destination 会映射成 `01:00:5e:xx:xx:xx` 一类 multicast MAC。Host 的 IGMP membership 决定 IP 层是否接受该组，同时 Port（平台适配层）可以通过 `igmp_mac_filter()` 把对应 MAC 加入或移出硬件过滤器。[S1](#source-s1)[S3](#source-s3)
 
-```text
-rtp_recv_thread()
-    ↓
-lwip_setsockopt(IP_ADD_MEMBERSHIP)
-    ↓
-tcpip_callback / Core Lock
-    ↓
-lwip_setsockopt_impl()
-    ↓
-igmp_joingroup()
-    ↓
-igmp_joingroup_netif()
-    ↓
-Membership Report + report timer
-    ↓
-Router Query / other host Report
-    ↓
-igmp_input()
-    ↓
-state / timer / suppression
-    ↓
-IP_DROP_MEMBERSHIP
-    ↓
-Leave Group + resource cleanup
-```
+### 0.3 协议动作与 lwIP 源码先建立双轨映射
 
-本文使用的本地源码快照中，IGMP、RTP 与 Socket 相关文件和 upstream `master` commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 对应文件一致，因此源码结论继续绑定该 revision。[S1](#source-s1)
+下面表里会提前出现三个源码状态名：`NON_MEMBER` 表示尚未加入，`DELAYING_MEMBER` 表示已经是成员且有一个待发送 Report 的 delay timer，`IDLE_MEMBER` 表示已经是成员但当前没有待发送 Report。后文会沿 `igmp_input()` 与 timer 代码看这些状态怎样迁移。
 
-本文只解释当前 lwIP `igmp.c` 的 IPv4 host-side IGMP 行为。IPv6 MLD、IGMPv3 source filtering、multicast routing protocol 与交换机 IGMP Snooping 不展开成第二条主线。
+| 协议动作 | lwIP 入口/关键函数 | 关键对象/状态 | 下一步 |
+| --- | --- | --- | --- |
+| 应用加入组 | `lwip_setsockopt(IP_ADD_MEMBERSHIP)` → `igmp_joingroup()` | `struct igmp_group`、`group->use` 本机 join 引用计数 | 为目标 `netif` 建立/增加 membership |
+| 新加入后主动 Report | `igmp_joingroup_netif()` → `igmp_send()` | `DELAYING_MEMBER`、join timer | 等待 Query、peer Report 或 timer |
+| Router Query 到达 | `ip4_input()` → `igmp_input()` | `group->timer`、`group_state` | 延迟响应 |
+| peer Report 到达 | `igmp_input()` | 取消 timer、`IDLE_MEMBER` | suppression 完成 |
+| timer 到期 | `igmp_tmr()` → `igmp_timeout()` | 当前 group | 再发送 Membership Report |
+| 最终离组 | `igmp_leavegroup_netif()` | `group->use`、`last_reporter_flag` | 可选 Leave、MAC filter 删除、释放 group |
+
+下面开始沿真实应用入口追踪这张表，而不是按 RFC 章节顺序讲协议。
 
 ## 1. Multicast 的第一层边界：UDP Port 和 Multicast Group 是两个不同筛选条件
 
@@ -65,7 +87,7 @@ Leave Group + resource cleanup
 ```text
 Destination IPv4
 + Destination UDP Port
-→ 找到本机 UDP PCB / Socket
+→ 找到本机 UDP PCB（Protocol Control Block，协议控制块）/ Socket
 ```
 
 Multicast 又多了一层 group membership：
@@ -130,19 +152,7 @@ rtp_init(void)
 | `rtp_send_thread()` | 把 MPEG4 payload 加上 RTP header，经 UDP 发往 `232.0.0.0:4000` | multicast **数据面**示例 |
 | `rtp_recv_thread()` | bind UDP 4000，并通过 `IP_ADD_MEMBERSHIP` 加入 `232.0.0.0` | 本文 IGMP **控制面**入口 |
 
-RTP 的标准固定 Header 包含 sequence number、timestamp、payload type、SSRC 等字段，用来标识媒体 packet 顺序、采样/播放时间基准、payload 类型和同步源。[S5](#source-s5) 当前 lwIP example 保留了这条主干字段：[S1](#source-s1)
-
-```c
-struct rtp_hdr {
-  PACK_STRUCT_FLD_8(u8_t  version);
-  PACK_STRUCT_FLD_8(u8_t  payloadtype);
-  PACK_STRUCT_FIELD(u16_t seqNum);
-  PACK_STRUCT_FIELD(u32_t timestamp);
-  PACK_STRUCT_FIELD(u32_t ssrc);
-} PACK_STRUCT_STRUCT;
-```
-
-Stage 17 不继续展开 RTP codec、jitter buffer 或 RTCP；只需要知道：**RTP/UDP 是 group 里的业务数据，`IP_ADD_MEMBERSHIP` 才是进入 IGMP 的控制入口。**
+RTP 的协议格式、sequence/timestamp/SSRC 等字段直接参考 RFC 3550。[S5](#source-s5) 本篇不展开 RTP header、codec、jitter buffer 或 RTCP；当前 example 只提供两个必要上下文：`rtp_send_thread()` 产生 multicast UDP 数据，`rtp_recv_thread()` 通过 `IP_ADD_MEMBERSHIP` 触发 IGMP 控制链。
 
 ### 3.1 `rtp_recv_thread()` 的真实顺序里还有一次 `SO_RCVTIMEO`
 
@@ -531,9 +541,9 @@ netif->igmp_mac_filter == NULL
 
 这属于 **Port 实现差异**，不是 IGMP 协议规定“无需 MAC filter”。实际 MCU Ethernet MAC 若默认只接收自身 unicast/broadcast，Driver 可能必须实现这个 callback，否则 IGMP 协议状态正确，multicast data frame 仍可能在硬件层就被丢掉。
 
-## 13. 第二件事：join 立即发送一个 IGMPv2 Membership Report
+## 13. Join 的网络侧结果：`igmp_send()` 把 membership 变成 IGMPv2 Report
 
-继续阅读同一个 `igmp_joingroup_netif()`：[S1](#source-s1)
+继续阅读 `igmp_joingroup_netif()`：[S1](#source-s1)
 
 ```c
 IGMP_STATS_INC(igmp.tx_join);
@@ -544,75 +554,31 @@ igmp_start_timer(group, IGMP_JOIN_DELAYING_MEMBER_TMR);
 group->group_state = IGMP_GROUP_DELAYING_MEMBER;
 ```
 
-RFC 2236 要求 Host 加组时立即发送 unsolicited Membership Report，以尽快让 multicast router 知道本链路出现了 group member；随后还会延时再次 report，提高初始 report 丢失时的可靠性。[S4](#source-s4)
+这里不再重复解释 unsolicited Report 的协议理由；Cisco IGMP 资料与 RFC 2236 已完整说明。[S7](#source-s7)[S4](#source-s4) 对源码只需要确认三件事：立即发送一次 Report、启动延时 timer、把 group 置为 `DELAYING_MEMBER`。
 
-因此 join 的第一个网络可见证据不是 multicast data，而是 IGMP control packet。
-
-## 14. 进入 `igmp_send()`：Report 到 group，Leave 到 224.0.0.2
-
-`igmp_joingroup_netif()` 直接调用 `igmp_send()`。进入该函数：[S1](#source-s1)
+进入 `igmp_send()` 后，当前实现根据 message type 选择目的地址并维护 `last_reporter_flag`：[S1](#source-s1)
 
 ```c
-p = pbuf_alloc(PBUF_TRANSPORT, IGMP_MINLEN, PBUF_RAM);
-
-if (p) {
-  igmp = (struct igmp_msg *)p->payload;
-  ip4_addr_copy(src, *netif_ip4_addr(netif));
-
-  if (type == IGMP_V2_MEMB_REPORT) {
-    dest = &(group->group_address);
+if (type == IGMP_V2_MEMB_REPORT) {
+  dest = &(group->group_address);
+  ip4_addr_copy(igmp->igmp_group_address, group->group_address);
+  group->last_reporter_flag = 1;
+} else {
+  if (type == IGMP_LEAVE_GROUP) {
+    dest = &allrouters;
     ip4_addr_copy(igmp->igmp_group_address, group->group_address);
-    group->last_reporter_flag = 1;
-  } else {
-    if (type == IGMP_LEAVE_GROUP) {
-      dest = &allrouters;
-      ip4_addr_copy(igmp->igmp_group_address, group->group_address);
-    }
   }
-```
-
-当前行为和 RFC 2236 对应：[S4](#source-s4)
-
-| IGMP message | IPv4 destination |
-| --- | --- |
-| General Query | `224.0.0.1` all-systems |
-| Group-Specific Query | 被查询 group |
-| Membership Report | 被报告 group |
-| Leave Group | `224.0.0.2` all-routers |
-
-`last_reporter_flag=1` 也不是装饰字段：leave 时是否需要发送 Leave Group 就依赖它。
-
-## 15. `igmp_send()` 生成 8-byte IGMPv2 Header，并把 TTL 固定为 1
-
-继续阅读 `igmp_send()`：[S1](#source-s1)
-
-```c
-if ((type == IGMP_V2_MEMB_REPORT) || (type == IGMP_LEAVE_GROUP)) {
-  igmp->igmp_msgtype  = type;
-  igmp->igmp_maxresp  = 0;
-  igmp->igmp_checksum = 0;
-  igmp->igmp_checksum = inet_chksum(igmp, IGMP_MINLEN);
-
-  igmp_ip_output_if(p, &src, dest, netif);
 }
 ```
 
-然后 `igmp_ip_output_if()` 调用 IPv4 output：[S1](#source-s1)
+随后构造 8-byte IGMPv2 message、计算 checksum，并通过 `ip4_output_if_opt()` 以 `IP_PROTO_IGMP`、`IGMP_TTL=1` 和 Router Alert 发出。[S1](#source-s1)[S4](#source-s4) 这些 wire-level 规则由 RFC 承担，本文保留它们只是为了把源码字段与抓包对应起来。
 
-```c
-return ip4_output_if_opt(p, src, dest, IGMP_TTL, 0,
-                         IP_PROTO_IGMP, netif, ra, ROUTER_ALERTLEN);
-```
+## 14. Ethernet 输出：IPv4 multicast 地址直接映射 multicast MAC，不走 ARP
 
-当前实现还插入 IPv4 Router Alert option，并使用 `IGMP_TTL=1`，让 IGMP control traffic 保持在本地链路范围。[S1](#source-s1)[S4](#source-s4)
-
-## 16. IPv4 multicast 不查 ARP：`etharp_output()` 直接把 group 映射成 Ethernet multicast MAC
-
-IGMP Report 本身就是 IPv4 multicast packet。IPv4 output 最终进入 Ethernet 时，`etharp_output()` 专门处理 multicast destination。[S1](#source-s1)[S3](#source-s3)
+`igmp_send()` 产生的 IPv4 multicast packet 最终进入 `etharp_output()`。对 multicast destination，当前实现直接构造 Ethernet multicast MAC：[S1](#source-s1)[S3](#source-s3)
 
 ```c
 } else if (ip4_addr_ismulticast(ipaddr)) {
-  /* Hash IP multicast address to MAC address.*/
   mcastaddr.addr[0] = LL_IP4_MULTICAST_ADDR_0;
   mcastaddr.addr[1] = LL_IP4_MULTICAST_ADDR_1;
   mcastaddr.addr[2] = LL_IP4_MULTICAST_ADDR_2;
@@ -622,51 +588,11 @@ IGMP Report 本身就是 IPv4 multicast packet。IPv4 output 最终进入 Ethern
   dest = &mcastaddr;
 ```
 
-前三个 byte 固定：
+RFC 1112 已完整定义 `01:00:5e` 与低 23-bit 映射。[S3](#source-s3) 这里的实现结论只有两个：multicast output 不先发 ARP；硬件 MAC filter 命中也只是链路层粗过滤，IPv4 层仍需检查真正的 group membership。
 
-```text
-01:00:5e
-```
+## 15. 接收路径：`ip4_input()` 先核对 membership，再按 Protocol=2 进入 `igmp_input()`
 
-后 23 bit 来自 IPv4 multicast address 的低 23 bit。[S3](#source-s3)
-
-因此 multicast output 不需要：
-
-```text
-IPv4 group
-→ ARP Request
-→ 等待 ARP Reply
-```
-
-而是可以直接：
-
-```text
-IPv4 multicast group
-→ 01:00:5e:xx:xx:xx
-→ ethernet_output()
-```
-
-## 17. 为什么多个 IPv4 multicast group 可能映射到同一个 Ethernet MAC
-
-IPv4 multicast address 空间使用 28-bit group ID，而 Ethernet IPv4 multicast mapping 只携带其中低 23 bit。[S3](#source-s3)
-
-因此这个映射不是一一对应：多个 IPv4 groups 会共享同一个 multicast MAC。
-
-这也是为什么硬件 MAC filter 只能解决第一层粗过滤：
-
-```text
-Ethernet destination MAC
-    ↓ 可能对应多个 IPv4 groups
-ip4_input()
-    ↓ 再检查真正 IPv4 destination group
-IGMP membership
-```
-
-不能因为某帧 MAC 命中了 multicast filter，就直接认定它一定属于应用正在订阅的那个 IPv4 group。
-
-## 18. `ip4_input()` 对 multicast packet 的接收条件：这个 `netif` 必须真的有 group entry
-
-当 Ethernet frame 已经进入 lwIP，Stage 4 的 `ip4_input()` 会判断 destination 是否 multicast。[S1](#source-s1)
+Ethernet frame 已进入 lwIP 后，`ip4_input()` 对 multicast destination 不会无条件放行：[S1](#source-s1)
 
 ```c
 if (ip4_addr_ismulticast(ip4_current_dest_addr())) {
@@ -681,25 +607,7 @@ if (ip4_addr_ismulticast(ip4_current_dest_addr())) {
 }
 ```
 
-这一步把：
-
-```text
-“MAC 接收了这帧”
-```
-
-和：
-
-```text
-“lwIP 当前 interface 加入了这个 IPv4 multicast group”
-```
-
-明确分开。
-
-如果 group 不存在，packet 不会因为 destination 是 multicast 就无条件交给 UDP/TCP。
-
-## 19. IGMP control packet 怎样进入 `igmp_input()`
-
-IPv4 Header 的 Protocol field 对 IGMP 使用 protocol number 2。`ip4_input()` 完成 Header 验证和 membership 接收判断后，protocol dispatch 进入：[S1](#source-s1)
+这一步把“MAC 接收了 frame”和“当前 `netif` 真正加入了 IPv4 group”分开。对于 IGMP control packet，IPv4 Protocol field 为 2。继续阅读 `ip4_input()` 的 protocol dispatch 分支：[S1](#source-s1)
 
 ```c
 #if LWIP_IGMP
@@ -709,71 +617,11 @@ case IP_PROTO_IGMP:
 #endif /* LWIP_IGMP */
 ```
 
-进入 `igmp_input()` 时：
+`igmp_input()` 首先检查最小长度、checksum 和当前 interface/group context，然后才根据 IGMP message type 推进状态。[S1](#source-s1)
 
-```text
-p->payload = IGMP Header
-inp        = 收到 packet 的 netif
-dest       = IPv4 destination group
-```
+## 16. Query 在 lwIP 中落到“每个 group 一个 delay timer”
 
-这和 Stage 5 的 UDP input 一样，协议分发已经把上一层 Header 移开，当前函数只处理自己的 protocol header。
-
-## 20. `igmp_input()` 先检查长度、checksum，再确认 group 是本机正在维护的 membership
-
-进入 `igmp_input()`：[S1](#source-s1)
-
-```c
-if (p->len < IGMP_MINLEN) {
-  pbuf_free(p);
-  IGMP_STATS_INC(igmp.lenerr);
-  return;
-}
-
-igmp = (struct igmp_msg *)p->payload;
-if (inet_chksum(igmp, p->len)) {
-  pbuf_free(p);
-  IGMP_STATS_INC(igmp.chkerr);
-  return;
-}
-
-group = igmp_lookfor_group(inp, dest);
-
-if (!group) {
-  pbuf_free(p);
-  IGMP_STATS_INC(igmp.drop);
-  return;
-}
-```
-
-所以 IGMP packet 也不是看到 Type 就立刻改状态：必须先通过 packet validity 和 interface/group context 检查。
-
-## 21. General Query：不是立即一起回答，而是每个 group 设置随机 delay timer
-
-`igmp_input()` 遇到 `IGMP_MEMB_QUERY`，如果 destination 是 `224.0.0.1` 且 IGMP Group Address 字段为 0，就认作 General Query。[S1](#source-s1)[S4](#source-s4)
-
-继续阅读该分支：
-
-```c
-groupref = netif_igmp_data(inp);
-
-if (groupref != NULL) {
-  groupref = groupref->next;
-}
-
-while (groupref) {
-  igmp_delaying_member(groupref, igmp->igmp_maxresp);
-  groupref = groupref->next;
-}
-```
-
-第一项 all-systems group 被跳过，其余 memberships 分别进入 `igmp_delaying_member()`。
-
-这样做的目的不是“故意变慢”，而是避免同一 LAN 上所有 hosts 同时发 Report。RFC 2236 规定 Host 对 Query 选择不超过 Max Response Time 的随机 delay；如果先听到别人的 Report，可以取消自己的重复 Report。[S4](#source-s4)
-
-## 22. 进入 `igmp_delaying_member()`：只在需要时缩短 timer
-
-`igmp_input()` 调用 `igmp_delaying_member()`。当前函数：[S1](#source-s1)
+General Query / Group-Specific Query 的协议语义直接参考 Cisco 文档和 RFC 2236。[S7](#source-s7)[S4](#source-s4) 在实现层，`igmp_input()` 把需要响应的 membership 交给 `igmp_delaying_member()`：[S1](#source-s1)
 
 ```c
 static void
@@ -788,99 +636,23 @@ igmp_delaying_member(struct igmp_group *group, u8_t maxresp)
 }
 ```
 
-如果 group 已经在等待 Report，新 Query 给出的 Max Response Time 比当前剩余 timer 更短，才重新缩短倒计时；更长的 Query 不应该把一个本来更早的 response 推迟。
-
-## 23. `igmp_start_timer()`：随机 delay 以 100 ms tick 表示
-
-进入 `igmp_start_timer()`：[S1](#source-s1)
-
-```c
-static void
-igmp_start_timer(struct igmp_group *group, u8_t max_time)
-{
-#ifdef LWIP_RAND
-  group->timer = (u16_t)(max_time > 2 ? (LWIP_RAND() % max_time) : 1);
-#else
-  group->timer = max_time / 2;
-#endif
-
-  if (group->timer == 0) {
-    group->timer = 1;
-  }
-}
-```
-
-当前 IGMP tick：
-
-```c
-#define IGMP_TMR_INTERVAL 100
-```
-
-也就是 timer 字段单位不是毫秒，而是 **100 ms tick 数量**。[S2](#source-s2)
-
-如果 Port 提供 `LWIP_RAND`，当前实现会在允许范围内随机选择 report delay；没有随机源时退化成固定中间值，这属于实现 fallback，不应写成协议推荐行为。
-
-## 24. `igmp_tmr()` 在哪里被注册：它是 lwIP cyclic timer，不是独立线程
-
-Stage 11 已经解释 `sys_timeouts_init()`。IGMP timer 位于同一张 cyclic timer 表：[S2](#source-s2)
-
-```c
-#if LWIP_IGMP
-{IGMP_TMR_INTERVAL, HANDLER(igmp_tmr)},
-#endif /* LWIP_IGMP */
-```
-
-因此：
+`igmp_start_timer()` 把协议允许的 response window 转成当前 group 的 timer；`IGMP_TMR_INTERVAL` 为 100 ms。[S1](#source-s1)[S2](#source-s2) timer 并不是独立线程，而是注册在 lwIP cyclic timer 表中的 `igmp_tmr()`：
 
 ```text
 sys_timeouts framework
     ↓ every 100 ms
 igmp_tmr()
-    ↓
-扫描 netif group list
-    ↓
-group->timer--
-    ↓ timer==0
+    ↓ group->timer--
+    ↓ timer == 0
 igmp_timeout()
+    ↓ igmp_send(IGMP_V2_MEMB_REPORT)
 ```
 
-没有额外的“IGMP timer thread”。
+如果 Port 提供 `LWIP_RAND`，`igmp_start_timer()` 会在允许范围内随机取 delay；没有随机源时使用当前实现的 fallback。随机等待本身为什么存在由协议资料解释，本文只关注 timer 如何落到 lwIP 对象和 callback 路径。
 
-## 25. Timer 到期：`igmp_timeout()` 发送真正的 Membership Report
+## 17. Report Suppression 在源码中就是取消 timer，并推进三态 membership
 
-进入 `igmp_tmr()`：[S1](#source-s1)
-
-```c
-while (group != NULL) {
-  if (group->timer > 0) {
-    group->timer--;
-    if (group->timer == 0) {
-      igmp_timeout(netif, group);
-    }
-  }
-  group = group->next;
-}
-```
-
-进入 `igmp_timeout()`：[S1](#source-s1)
-
-```c
-if ((group->group_state == IGMP_GROUP_DELAYING_MEMBER) &&
-    (!(ip4_addr_eq(&(group->group_address), &allsystems)))) {
-  group->group_state = IGMP_GROUP_IDLE_MEMBER;
-
-  IGMP_STATS_INC(igmp.tx_report);
-  igmp_send(netif, group, IGMP_V2_MEMB_REPORT);
-}
-```
-
-状态变为 `IDLE_MEMBER`，再通过前面已经展开的 `igmp_send()` 发 Report。
-
-## 26. Report Suppression：听到别的 Host 已经报告，就取消自己的 timer
-
-这是 IGMP 最值得理解的协作机制之一。
-
-当本机仍处于 `DELAYING_MEMBER`，但先收到同 group 的 `IGMP_V2_MEMB_REPORT`，`igmp_input()` 执行：[S1](#source-s1)[S4](#source-s4)
+当同 group 的 `IGMP_V2_MEMB_REPORT` 到达，而本机仍处于 `DELAYING_MEMBER`，`igmp_input()` 执行：[S1](#source-s1)
 
 ```c
 case IGMP_V2_MEMB_REPORT:
@@ -893,71 +665,26 @@ case IGMP_V2_MEMB_REPORT:
   break;
 ```
 
-于是多个 Hosts 同时属于一个 group 时，Query 后通常不需要每台机器都发 Report。
-
-```mermaid
-sequenceDiagram
-    participant R as Multicast Router
-    participant A as Host A
-    participant B as Host B
-
-    R->>A: General Query
-    R->>B: General Query
-    A->>A: random timer = short
-    B->>B: random timer = long
-    A->>R: Membership Report
-    A->>B: multicast Report visible on LAN
-    B->>B: stop timer / suppress duplicate report
-```
-
-这也是 `last_reporter_flag` 会被清零的原因：Host B 已经知道自己不是最后一个 report 的成员。
-
-## 27. 三态状态机：Non-Member、Delaying Member、Idle Member
-
-当前 lwIP 定义：[S1](#source-s1)[S4](#source-s4)
-
-```c
-#define IGMP_GROUP_NON_MEMBER          0
-#define IGMP_GROUP_DELAYING_MEMBER     1
-#define IGMP_GROUP_IDLE_MEMBER         2
-```
-
-主路径：
+协议层的 suppression 原理不在这里重复。[S4](#source-s4)[S7](#source-s7) 对 lwIP 来说，它就是“收到他人的 Report → 取消本机 delay → 进入 Idle → 清 last-reporter”。当前三态与触发点可以压缩成：[S1](#source-s1)
 
 ```mermaid
 stateDiagram-v2
     [*] --> NON_MEMBER
-    NON_MEMBER --> DELAYING_MEMBER: join / send immediate Report / start timer
+    NON_MEMBER --> DELAYING_MEMBER: join
     DELAYING_MEMBER --> IDLE_MEMBER: timer expires / send Report
-    DELAYING_MEMBER --> IDLE_MEMBER: other Report received / suppress own Report
-    IDLE_MEMBER --> DELAYING_MEMBER: Query received / start timer
+    DELAYING_MEMBER --> IDLE_MEMBER: peer Report / suppress
+    IDLE_MEMBER --> DELAYING_MEMBER: Query / start timer
     DELAYING_MEMBER --> [*]: final leave
     IDLE_MEMBER --> [*]: final leave
 ```
 
-`NON_MEMBER` 主要是新创建 group object 的初始状态；最终 leave 时当前实现会把 group 从 list 删除并 `memp_free()`，而不是保留一个永久 Non-Member object。
+`NON_MEMBER` 是新 group object 的初始状态；最终 leave 时当前实现会删除 object，而不是永久保留一条 Non-Member membership。
 
-## 28. `use` 不是网络上的成员数量，而是本机对同一 group 的引用计数
+## 18. Leave 同时受本机引用计数和 `last_reporter_flag` 控制
 
-同一个 `netif` 上多个 Socket/模块可能都请求加入同一 group。`igmp_lookup_group()` 会找到同一个 `struct igmp_group`，`igmp_joingroup_netif()` 最后执行：
+`group->use` 是**本机**对同一个 membership 的引用计数，不是 LAN 上 Host 数量。多个 Socket/模块 join 同一 group 时共享同一个 `struct igmp_group`；只有最后一个 local user 离开才进入真正 cleanup。[S1](#source-s1)
 
-```c
-group->use++;
-```
-
-所以：
-
-```text
-use = 3
-```
-
-表示本机三个逻辑使用者共享这条 membership，并不表示 LAN 上有三个 Hosts。
-
-这也是为什么一次 `IP_DROP_MEMBERSHIP` 不一定立刻发送 Leave。
-
-## 29. Leave：只有本机最后一个使用者离开时才真正拆 membership
-
-从 Socket `IP_DROP_MEMBERSHIP` 返回到 IGMP Core 后，最终进入 `igmp_leavegroup_netif()`。[S1](#source-s1)
+`igmp_leavegroup_netif()` 的关键路径是：[S1](#source-s1)
 
 ```c
 if (group->use <= 1) {
@@ -978,95 +705,37 @@ if (group->use <= 1) {
 }
 ```
 
-这里形成完整 cleanup：
+RFC 2236 已定义 last-reporter/Leave 语义。[S4](#source-s4) 当前实现只是在本地记录这个事实：自己发 Report 时置 `last_reporter_flag=1`，收到别人的同组 Report 时清零。最终 leave 因而形成“从 group list 删除 → 条件发送 Leave → 可选 MAC filter DEL → 释放 `MEMP_IGMP_GROUP`”的完整生命周期。
+
+## 19. 当前 `igmp.c` 的边界：目标实现仍是 IGMPv2 group membership
+
+当前 `igmp_input()` 的主线处理 Membership Query 与 IGMPv2 Membership Report，并发送 IGMPv2 Report/Leave；源码没有 IGMPv3 INCLUDE/EXCLUDE source-list state machine。[S1](#source-s1) 因此 `igmp_joingroup*()` 表达的是 group membership，而不是完整 IGMPv3 source filtering。
+
+RFC 9776 已是当前 IGMPv3 标准。[S8](#source-s8) 这不改变本篇源码事实：解析当前 lwIP `igmp.c` 时，RFC 2236 仍是理解其 v2 message/state 语义最直接的对照资料。
+
+upstream RTP example 默认使用 `232.0.0.0`，本篇只把它视为现成的 `IP_ADD_MEMBERSHIP` call site；不能由这个地址反推当前 lwIP 已实现完整 SSM/IGMPv3 语义。
+
+## 20. Unix TAP 与 MCU Ethernet MAC：同一 IGMP Core，MAC filter 边界不同
+
+Unix TAP Port 没有安装 `igmp_mac_filter` callback；真实 MCU Ethernet MAC 则可能需要 Driver 在 join/leave 时编程 multicast filter。[S1](#source-s1) 因此同一条 IGMP Core 调用链在两类 Port 上的主要差异是：
 
 ```text
-最后一个 local user 离开
-    ↓
-从 netif group list 删除
-    ↓
-如果 last reporter → 发送 Leave Group
-    ↓
-可选 MAC filter DEL
-    ↓
-释放 MEMP_IGMP_GROUP
+Linux TAP
+IP_ADD_MEMBERSHIP
+→ IGMP Core membership
+→ TAP/host side 接收 multicast frame
+
+MCU Ethernet
+IP_ADD_MEMBERSHIP
+→ IGMP Core membership
+→ igmp_mac_filter(ADD)
+→ MAC hardware filter
+→ frame 才有机会进入 RX DMA / lwIP
 ```
 
-如果 `use > 1`，只减少本机引用，网络 membership 仍保持。
+这个 callback 是 Core → Driver 的实现边界，不是 IGMP wire protocol 的一部分。
 
-## 30. 为什么只有 `last_reporter_flag=1` 才需要发 Leave
-
-RFC 2236 的优化语义是：如果本机不是最后一个发送 Report 的 Host，那么已经观察到链路上还有其他 group member；离开时可以不发送 Leave，减少不必要 control traffic。[S4](#source-s4)
-
-当前 lwIP 通过：
-
-```text
-自己发送 Report       -> last_reporter_flag = 1
-听到别人的同组 Report -> last_reporter_flag = 0
-```
-
-保存这个事实。
-
-所以 `last_reporter_flag` 不是“是不是最后一个真实成员”的绝对真相，而是 Host 根据最近 Report 观察得到的协议状态。
-
-## 31. Current lwIP `igmp.c` 的实现边界：主线是 IGMPv2，不是 IGMPv3 source filtering
-
-当前 `igmp_input()` 处理：
-
-- Membership Query；
-- IGMPv2 Membership Report；
-- Leave 由本机发送；
-- `igmp_maxresp==0` 的 v1-style Query 被按兼容路径处理。[S1](#source-s1)
-
-源码没有 IGMPv3 INCLUDE/EXCLUDE source list state machine。因此当前 `igmp_joingroup*()` 表达的是传统 group membership：
-
-```text
-(*, G)
-```
-
-而不是：
-
-```text
-(S, G) source-specific membership
-```
-
-upstream RTP example 虽然默认 group 位于 `232.0.0.0`，但本篇只用它作为现成的 `IP_ADD_MEMBERSHIP` call site；不把这个 example 的地址选择泛化成当前 lwIP 已实现完整 IGMPv3/SSM semantics。
-
-## 32. Unix TAP 与 MCU Ethernet MAC：同一 IGMP Core，MAC filter 边界不同
-
-当前 Unix TAP Port：
-
-```text
-NETIF_FLAG_IGMP = yes
-igmp_mac_filter callback = not installed
-```
-
-因此 Core 仍然会：
-
-```text
-维护 group list
-发送 Membership Report
-处理 Query
-执行 timer / suppression / leave
-```
-
-但不会通过 callback 编程真实 Ethernet multicast filter。
-
-典型 MCU Port 则可能：
-
-```text
-igmp_joingroup_netif()
-    ↓
-netif->igmp_mac_filter(ADD)
-    ↓
-Driver
-    ↓
-MAC hash/perfect filter
-```
-
-这正好连接 Stage 0 的 MAC receive filter：**协议栈 membership 和硬件 receive filter 属于不同层，但 Port 必须把两层协调起来。**
-
-## 33. Host 实验：真实运行已经证明 timeout warning 不阻断 IGMP join
+## 21. Host 实验：真实运行已经证明 timeout warning 不阻断 IGMP join
 
 当前 `example_app/lwipcfg.h` 默认：
 
@@ -1126,7 +795,7 @@ sudo tcpdump -i lwip0 -nn -vv \
 数据面：RTP → UDP → 232.0.0.0:4000
 ```
 
-## 34. 真实 PCAP：两帧 Membership Report 与源码逐字段互证
+## 22. 真实 PCAP：两帧 Membership Report 与源码逐字段互证
 
 本次抓包文件已保存在 [`assets/stage17-igmp.pcap`](assets/stage17-igmp.pcap)。它包含两帧、每帧 46 bytes 的 Ethernet frame。[S6](#source-s6)
 
@@ -1180,7 +849,7 @@ sequenceDiagram
 原来只靠“预期应该看到 Report”的实验，现在已经有真实 packet 证据。尤其可以确认：`SO_RCVTIMEO` warning 与 IGMP join 是两条不同的语义路径，前者失败没有阻断后者。[S6](#source-s6)
 
 
-## 35. 最终回看：从一个 Socket join 到链路上的 multicast membership
+## 23. 最终回看：从一个 Socket join 到链路上的 multicast membership
 
 ```mermaid
 flowchart TD
@@ -1279,4 +948,18 @@ local use count
 - 资源：[`assets/stage17-igmp.pcap`](assets/stage17-igmp.pcap)
 - 使用位置：`SO_RCVTIMEO errno=22` 现象、两帧 IGMPv2 Membership Report、约 398.88 ms 的二次 Report 间隔
 - 支撑内容：证明 timeout warning 未阻断 `IP_ADD_MEMBERSHIP`；确认 Ethernet multicast MAC、Router Alert、TTL=1、Protocol=2、Type=0x16、Group=`232.0.0.0` 与 join delay 实际报文
+
+<a id="source-s7"></a>
+### [S7] Cisco Multicast Configuration Guide — IGMP
+- 类型：厂商官方协议说明；版本：Cisco IOS XE 17 文档，访问日期 2026-10-03
+- URL/文档：[Multicast Configuration Guide - IGMP](https://www.cisco.com/c/en/us/td/docs/switches/lan/c9000/multicast/multicast-configuration-guide/igmp.html)
+- 使用位置：“建议提前阅读”“Query/Report/Leave”“report suppression”
+- 支撑内容：作为工程视角的补充材料，用于交叉核对 host/router、Query/Report/Leave 与 report suppression；正文仍独立建立当前主线所需的协议模型
+
+<a id="source-s8"></a>
+### [S8] RFC 9776 — Internet Group Management Protocol, Version 3
+- 类型：IETF / RFC Editor；版本：RFC 9776，2025-03，STD 100
+- URL/文档：[RFC 9776](https://www.rfc-editor.org/rfc/rfc9776.html)
+- 使用位置：“阅读源码前”
+- 支撑内容：确认当前 IGMPv3 标准状态；RFC 9776 更新 RFC 2236 并取代 RFC 3376，用于解释为什么本文仍把 RFC 2236 仅作为目标 lwIP IGMPv2 实现的对照规范
 

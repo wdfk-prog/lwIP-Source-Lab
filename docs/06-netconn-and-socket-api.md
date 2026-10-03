@@ -2,13 +2,64 @@
 
 # 教程 06：从 `udpecho_thread()` 到 Socket——Netconn、Mailbox 与顺序式 API
 
-> 摘要：沿 upstream Netconn UDP Echo 的 application thread 路径，理解 Netconn、netbuf、mailbox、Core Locking，以及 Socket API 如何继续封装 Netconn。
+> 摘要：从应用线程与 lwIP Core 的执行边界出发，沿 Netconn UDP Echo 追踪 netconn、netbuf、mailbox、Core Locking，并映射到 Socket API。
 
 [TOC]
 
-本文源码块采用统一约定：除非代码块前明确标注为“上游连续源码片段”，其余 C 代码块一律视为按当前 revision 裁剪的“执行路径阅读版”。阅读版只删除与当前主线无关的注释、条件编译或旁支，不重排保留语句，也不使用省略号伪装缺失源码；示意代码会另行标注。
+Netconn 是 lwIP 的 **sequential API（顺序式 API）**：应用线程可以用 `netconn_recv()` 这类阻塞调用写普通“open/read/write/close”式逻辑，而协议 Core 仍保持事件驱动。**Raw API** 则是 lwIP 的 callback-style Core API，应用 callback 直接由协议栈事件驱动，不能把 callback 当成可长期阻塞的业务线程。[S8](#source-s8)
 
-Stage 5 的 Raw API 回调直接运行在 lwIP Core 上下文中。现在换一个目标：应用希望写成普通顺序代码——“创建 endpoint → bind → 阻塞等待数据 → 发送回复”，而不是把业务逻辑塞进 protocol callback。Netconn API 就是在这个问题上建立的。[S1](#source-s1)
+**Mailbox（消息邮箱）**是线程间传递指针/消息的队列抽象；**Core Locking** 是让非 `tcpip_thread` 线程先取得 Core mutex（保护协议 Core 的互斥锁）再执行受保护操作的同步方案。[S2](#source-s2)[S3](#source-s3)[S5](#source-s5) Socket API 再在 Netconn 之上增加 **fd（file descriptor，整数文件描述符）**、`sockaddr`（保存 socket 地址的结构）和 errno 风格错误码契约，从而接近 BSD/POSIX 类 Unix socket 编程模型。[S7](#source-s7)
+
+Stage 5 的 Raw UDP Echo 已经说明：Raw callback 直接运行在 lwIP Core 执行上下文中。Stage 6 不再学习另一套 UDP，而是回答一个软件架构问题：**怎样把事件驱动的 UDP Core 变成应用线程可阻塞等待的顺序式接口？**
+
+## 阅读源码前：建议提前阅读
+
+这三份 lwIP 官方文档适合先建立 API 层次，但当前文章的执行细节仍以固定源码快照为准：
+
+1. [lwIP 2.1.x — APIs](https://www.nongnu.org/lwip/2_1_x/group__api.html)：先看 Raw、Sequential、Socket 三类 API 的总体关系，以及 Raw callback 为什么不能阻塞。[S8](#source-s8)
+2. [lwIP 2.1.x — Sequential-style APIs](https://www.nongnu.org/lwip/2_1_x/group__sequential__api.html)：重点理解 sequential API 是 blocking API，应用程序和 TCP/IP Core 处于不同执行上下文。[S8](#source-s8)
+3. [lwIP 2.1.x — Socket API](https://www.nongnu.org/lwip/2_1_x/group__socket.html)：用于确认 Socket API 是 BSD-style 兼容层，并建立在 sequential API 之上。[S8](#source-s8)
+
+## 先把三层 API 和线程边界放在同一张图里
+
+三层 API 不是三套 TCP/IP 协议栈，而是同一套 lwIP Core 的三种应用访问方式：[S8](#source-s8)
+
+| API 层 | 应用看到的主要对象 | 应用执行模型 | 与 Core 的关系 |
+| --- | --- | --- | --- |
+| Raw API | `udp_pcb` / `tcp_pcb`、`pbuf`、callback | 事件驱动，callback 不能阻塞 | 应用 callback 与协议 Core 位于同一受控执行上下文 |
+| Netconn API | `struct netconn`、`netbuf` | 普通 application thread，可阻塞等待 | 通过 API bridge、Core Locking/`tcpip_thread` 与 `recvmbox` 连接 Core |
+| Socket API | integer fd、`sockaddr`、application buffer | BSD/POSIX-style | 先映射到 `netconn`，再进入同一 Core |
+
+这里几个对象必须先区分：
+
+- **`pbuf`**：lwIP Core 的 packet buffer，保存 packet bytes 与引用/链信息；Stage 3 已系统讲过。
+- **`netbuf`**：Netconn 面向 datagram 应用的 network-buffer descriptor，内部持有 `pbuf`，并附带源/目标地址和端口信息。[S3](#source-s3)
+- **`struct netconn`**：顺序式 API 的连接/端点对象，保存 PCB 指针、接收 mailbox、状态、超时和 callback 等线程桥接状态。[S2](#source-s2)
+- **`tcpip_thread`**：`NO_SYS=0` 时负责串行执行 lwIP Core 输入和定时器工作的 Core thread；它不是 `udpecho_thread` 这个应用线程。[S5](#source-s5)
+
+当前 Unix `example_app` 明确配置 `LWIP_TCPIP_CORE_LOCKING=1`。因此部分 Netconn API 请求会通过 Core mutex 同步进入 Core；RX packet 输入仍使用 `LWIP_TCPIP_CORE_LOCKING_INPUT=0` 的 mailbox/thread 路径。两者不能混成一句“Netconn 都靠 mailbox 调 Core”。[S4](#source-s4)[S5](#source-s5)
+
+对本篇 UDP Echo，最重要的双向桥接是：
+
+```mermaid
+sequenceDiagram
+    participant A as Application thread (udpecho_thread)
+    participant N as Netconn API
+    participant M as conn->recvmbox
+    participant C as lwIP UDP Core
+
+    A->>N: netconn_recv(conn, &buf)
+    N->>M: 阻塞等待 RX object
+    C->>M: recv_udp() 投递 netbuf
+    M-->>N: mailbox 唤醒
+    N-->>A: 返回 netbuf
+    A->>N: netconn_send(conn, buf)
+    N->>C: API bridge, current build uses Core Locking
+    C-->>N: UDP send result
+    N-->>A: 返回 err_t
+```
+
+这张图先建立运行时心智模型；下面再从 upstream `udpecho_init()` 的真实入口验证每一条边具体由哪个函数和对象实现。
 
 ## 1. 真正入口不是 `netconn_new()`，而是 `udpecho_init()` 创建 application thread
 
@@ -29,53 +80,6 @@ flowchart LR
 ```
 
 因此 Netconn 解决的核心问题不是“UDP 另一套实现”，而是**如何让 application thread 安全地使用 Core 对象并等待 RX 数据**。
-
-## Raw API、Netconn API 与 Socket API 的本质区别
-
-三层 API 不是三套协议栈，而是同一套 lwIP Core 上不同的应用访问模型。
-
-```text
-Socket API
-    ↓
-Netconn API
-    ↓
-Raw API
-    ↓
-TCP/UDP Core
-```
-
-核心区别是：应用代码运行在哪里，以及数据如何从 Core 交给应用。
-
-|API|执行模型|优势|代价|
-|-|-|-|-|
-|Raw API|lwIP callback|最低开销、最高控制力|callback 状态机复杂，不能阻塞|
-|Netconn|application thread + mailbox|顺序代码，适合 RTOS|增加 mailbox、同步和对象开销|
-|Socket|BSD/POSIX fd|移植 Linux 网络程序方便|封装层最多|
-
-如果不考虑兼容性，Raw API 完全可以直接使用。很多资源受限 MCU 产品会选择 Raw API。
-
-但是 Raw callback 运行在 lwIP Core 执行上下文中，不能执行长时间阻塞操作：
-
-```text
-Raw UDP callback（反例示意）
-  -> flash_write()
-  -> delay_ms()
-  -> wait_event()
-```
-
-更常见的结构是：
-
-```text
-Raw callback
-    ↓
-快速解析
-    ↓
-消息队列
-    ↓
-业务线程
-```
-
-选择标准不是简单看性能，而是看应用模型：事件驱动应用适合 Raw；顺序任务模型适合 Netconn；需要 POSIX 兼容时选择 Socket。
 
 ## 2. `udpecho_thread()` 的代码形状为什么像 BSD socket
 
@@ -527,3 +531,12 @@ Stage 7 进入 TCP 后，Socket/Netconn 层仍然存在，但 TCP Core 本身增
 - URL/文档：[`src/api/sockets.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/api/sockets.c)
 - 使用位置：`lwip_socket()`、`lwip_bind()`、`lwip_sendto()`、`lwip_recvfrom()`
 - 支撑内容：Socket descriptor 层如何建立在 Netconn 之上并进行 sockaddr/data copy 转换
+
+
+<a id="source-s8"></a>
+### [S8] lwIP 官方 API 分层文档
+- 类型：lwIP 官方 Doxygen 文档
+- 版本：2.1.x 文档；正文执行链以固定 commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 为准
+- URL/文档：[APIs](https://www.nongnu.org/lwip/2_1_x/group__api.html)、[Sequential-style APIs](https://www.nongnu.org/lwip/2_1_x/group__sequential__api.html)、[Socket API](https://www.nongnu.org/lwip/2_1_x/group__socket.html)
+- 使用位置：“阅读源码前”、Raw/Netconn/Socket 分层模型
+- 支撑内容：说明三类 API 的定位、sequential API 的 blocking/thread 模型，以及 Socket API 构建在 sequential API 之上的总体关系；当前配置与函数细节由 [S1]～[S7] 证明

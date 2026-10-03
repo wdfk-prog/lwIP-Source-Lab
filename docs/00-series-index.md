@@ -2,14 +2,14 @@
 
 本系列持续跟踪官方 `lwip-tcpip/lwip` 的 `master`。绝大多数源码篇采用 **Source-driven** 主线：从当前行为的真实入口函数、注册入口或外部 API 开始，沿实际调用、数据与状态变化向下追踪。
 
-Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
+Stage 00、15、31、38 与 45 属于 **Theory of Operation / Application Note** 型总览：先建立系统位置和完整数据流，再解释关键机制；它们不会覆盖后续源码篇“从真实入口开始”的硬约束。
 
 ## Stage 00～45
 
 0. [Stage 00：从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](00-ethernet-physical-layer-and-network-stack.md)
-   沿物理介质、PHY、MAC、DMA/Driver 到 lwIP netif 建立 Ethernet 收发心智模型，并解释速率协商、抗干扰、冲突与 MAC 过滤。
+   从 Ethernet Frame、PHY/MAC 分层出发，沿 DMA/Driver、pbuf、netif 建立完整软硬件边界，并区分链路、接口、IP 与上层就绪状态。
 1. [Stage 01：从 upstream `master` 到第一条可读源码链——Linux Host、构建树与源码地图](01-linux-lwip-lab.md)
-   建立固定追踪 upstream master 的 Linux Host 学习仓库，理解源码、构建树、compile database 与后续源码阅读之间的关系。
+   沿 submodule、Host 依赖、Debug build tree、compile database 与 VS Code 索引走完第一次可构建、可跳转的源码阅读环境。
 2. [Stage 02：从 `main()` 到第一次 Ping——`netif`、TAP、ARP 与 ICMP 的完整源码链](02-netif-tap-first-ping.md)
    从 Unix example_app 的真实入口出发，沿 netif、TAP、ARP、IPv4、ICMP 与收发路径追踪一次真实 Ping，并用实际 PCAP 与源码逐字段互证。
 3. [Stage 03：从 `low_level_input()` 到 `pbuf_free()`——`pbuf` 的数据视图、Chain 与引用计数](03-pbuf.md)
@@ -62,20 +62,20 @@ Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览
    从 SNMP 示例入口追踪 UDP 161、ASN.1/PDU 解析、GET/GETNEXT/GETBULK、OID Tree、MIB2 interface/counter 映射与 RAW/NETCONN 线程边界。
 27. [Stage 27：从 `lwiperf_start_tcp_server_default()` 到 TCP ACK——lwIP 吞吐量、窗口、pbuf、线程与 Driver 瓶颈定位](27-lwiperf-performance-bottleneck.md)
    从 lwiperf Raw TCP 入口追踪收发、ACK 驱动的续传、窗口与发送队列，再把 pbuf/memp、tcpip_thread、DMA ring、checksum offload 与 PHY 速率接成一条性能瓶颈证据链。
-28. [Stage 28：从 `pppos_create()` 到 `ppp_input()`——PPP Core、PPPoS 串口字节流、异步 HDLC Framing 与 FCS](28-ppp-core-pppos-framing.md)
-   从 upstream PPPoS example 追踪 PPP netif 创建、LCP 启动、串口 RX 跨线程输入、异步 HDLC 解帧、Protocol 分发，以及 TX 的 ACCM escaping、PFC/ACFC 与 FCS。
+28. [Stage 28：从 `pppos_create()` 到 `ppp_input()`——PPP Core、PPPoS 串口字节流与 HDLC-like Framing](28-ppp-core-pppos-framing.md)
+   从 upstream PPPoS example 追踪 PPP netif 创建、串口 RX 跨线程输入、HDLC-like 解帧、FCS、Protocol 分发，以及 TX 的 ACCM、PFC/ACFC 与 serial output。
 29. [Stage 29：从 `lcp_open()` 到 `np_up()`——LCP、PAP/CHAP、IPCP、IPv6CP 与 PPP 协商状态机](29-ppp-lcp-auth-ipcp-ipv6cp.md)
    沿 PPP phase 与 generic FSM 追踪 LCP 配置协商、PAP/CHAP 认证、Network phase、IPCP/IPv6CP 配置与网络协议启用，明确各层职责与 RUNNING 条件。
 30. [Stage 30：从 `ipcp_up()` 到 `ppp_link_status_cb()`——PPP 地址、DNS、Default Route、Link Down 与 Reconnect](30-ppp-address-dns-route-reconnect.md)
    从 IPCP/IPv6CP OPENED 追踪 netif 地址、peer DNS、default netif、link up/down、PPPERR 回调、关闭与应用侧重连责任，建立 PPP 网络配置生命周期。
-31. [Stage 31：从 `slipif_init()` 到 `pppos_create()`——SLIP 与 PPPoS 的串口封装、错误检测、协商与工程边界](31-slip-vs-pppos.md)
-   从 lwIP 的 SLIP 与 PPPoS 两条真实串口路径对比 framing、Protocol 分发、FCS、地址配置、认证、线程桥接与错误语义，明确最小 IP framing 与完整 PPP 控制面的边界。
+31. [Stage 31：SLIP vs PPPoS——串口 IP Framing、错误检测、协商与工程边界](31-slip-vs-pppos.md)
+   用统一的数据流、控制面与实现边界比较 SLIP 和 PPPoS 的 framing、错误检测、Protocol 分发、地址/认证能力、执行上下文与生命周期。
 32. [Stage 32：从 `httpd_init()` 到 `http_sent()`——HTTPD、altcp、fsdata 与 HTTP 连接生命周期](32-httpd-altcp.md)
    从 HTTPD 真实入口追踪监听、连接状态、request parsing、fsdata 文件映射、TCP 背压与 ACK 驱动续传，理解 altcp 怎样解耦 HTTP 与传输层。
 33. [Stage 33：从 `https_ex_init()` 到 `http_recv()`——altcp、mbedTLS、TLS Handshake 与 HTTPS 数据通路](33-altcp-tls-https.md)
    从 upstream HTTPS example 追踪 TLS config、TLS outer/TCP inner、mbedTLS handshake、BIO I/O 与解密后的 HTTP callback，理解 HTTPS 如何复用 Stage 32。
-34. [Stage 34：从 `mqtt_example_init()` 到 `mqtt_message_received()`——MQTT CONNECT、SUBSCRIBE、PUBLISH 与回调数据通路](34-mqtt.md)
-   从 upstream MQTT example 追踪 CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、request queue、ring buffer 与 incoming publish callback。
+34. [Stage 34：MQTT 从协议流程到 lwIP 源码——连接、订阅、发布与回调链](34-mqtt.md)
+   从 Client/Broker、Control Packet、QoS、Keep Alive、Will、Clean Session 等协议基线进入真实 MQTT example，再把 CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH 与回调逐步映射到 lwIP 源码。
 35. [Stage 35：从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](35-mqtt-tls-reconnect-keepalive.md)
    沿 MQTT TLS 分支追踪 TLS handshake、Keep Alive、request timeout、断线清理和 connection callback，明确应用侧 reconnect/resubscribe 责任。
 36. [Stage 36：从 `sntp_example_init()` 到 `sntp_process()`——SNTP、DHCP/DNS、Timer 与系统时间同步](36-sntp-system-time.md)
@@ -97,7 +97,7 @@ Stage 00、15 与 38 属于 **Theory of Operation / Application Note** 型总览
 44. [Stage 44：从 `phy_monitor_thread_entry()` 到 `dhcp_network_changed()`——STM32H750 PHY Link、Auto-negotiation 与 DHCP 恢复](44-stm32-phy-link-dhcp-recovery.md)
    沿 PHY monitor、BMSR latch-low、Auto-negotiation、MAC speed/duplex 重配置、`eth_device_linkchange()`、lwIP Link flag 与 DHCP reboot/discover 追踪网线插拔后的恢复链。
 45. [Stage 45：从 Link Up 到 MQTT Reconnect——STM32 + RT-Thread + lwIP MCU Cloud Lifecycle](45-mcu-cloud-lifecycle.md)
-   把 Link Ready、IP/DNS/Time Ready、TLS、MQTT CONNECT、Keep Alive、backoff 与 resubscribe 串成产品状态机，明确协议栈自动行为和应用层长期运行责任。
+   以 readiness、事件所有权、failure domain 与 Cloud Orchestrator 串起 Link/IP/Time/DNS/TLS/MQTT，解释不同失败应从哪一层恢复，以及协议栈与产品层的责任边界。
 
 ## 系列主线完成后的边界
 

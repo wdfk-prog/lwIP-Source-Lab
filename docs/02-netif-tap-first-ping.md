@@ -2,17 +2,74 @@
 
 # 教程 02：从 `main()` 到第一次 Ping——`netif`、TAP、ARP 与 ICMP 的完整源码链
 
-> 摘要：从 Unix example_app 的真实入口出发，沿 netif、TAP、ARP、IPv4、ICMP 与收发路径追踪一次真实 Ping，并用实际 PCAP 与源码逐字段互证。
+> 摘要：先建立 IPv4 Ping 的 Ethernet、ARP、IPv4 与 ICMP 交互模型，再从 Unix example_app 入口追到 TAP 接收、协议栈线程、Echo Reply 与二层发送。
 
 [TOC]
 
-本文继续使用 upstream `master`。写作时核对的 `master` commit 为 `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
+这一阶段要回答的不是“Ping 命令怎么用”，而是一个完整的数据路径问题：
 
-这一阶段的目标不是记住几条 Linux 命令，而是回答一条具体问题：
+> Linux Host 执行 `ping 198.18.0.200` 后，为什么会先出现 ARP，再出现 ICMP；这些 Ethernet frame 又怎样从 Linux TAP 进入 lwIP，经过 `netif`、`tcpip_thread`、ARP、IPv4、ICMP 后返回 Host？
 
-> 当 Linux Host 执行 `ping 198.18.0.200` 时，这个请求究竟怎样从 Linux 虚拟网卡进入 lwIP，又怎样经过 ARP、IPv4、ICMP 后返回 Host？
+先把标题里的四个对象说清楚。`netif` 是 lwIP 的 **network interface（网络接口）抽象对象**，把协议栈 **Core（核心协议处理代码与执行上下文）**和具体 **Port（面向操作系统/设备的适配层）**连接起来；TAP 是 Linux 提供给 **userspace（用户态）**的**虚拟 Ethernet 设备**，程序通过 TAP 的 **fd（file descriptor，文件描述符）**读写完整 Ethernet frame。[S3](#source-s3)[S7](#source-s7) **MAC（Media Access Control）地址**是 Ethernet 链路层用于标识接口的地址；ARP（Address Resolution Protocol，地址解析协议）负责在同一 IPv4 链路上把目标 IPv4 地址解析成目标 MAC 地址；ICMP（Internet Control Message Protocol，Internet 控制报文协议）由 IP 承载，`ping` 使用其中的 Echo Request 与 Echo Reply。[S9](#source-s9)[S11](#source-s11)
 
-正文按实际执行顺序展开。协议名、网络层次和工具只在主线第一次需要时解释。
+Linux 的 **neighbor table（邻居表）**保存网络层地址与链路层地址的邻居映射；在当前 IPv4/Ethernet 实验里，最关键的就是 ARP 学到的 `IPv4 -> MAC` 关系。[S13](#source-s13) 后文的 **RX（receive，接收）**和 **TX（transmit，发送）**分别表示 packet 进入协议栈和离开协议栈的方向。
+
+本文面向第一次系统阅读这条链路的读者，因此不会把协议理解外包给外部链接。下面先给出推荐资料，再在正文内建立足够的协议模型；即使不打开任何链接，后续源码也应能够独立读懂。
+
+## 阅读源码前：建议提前阅读
+
+1. [Linux Kernel — Universal TUN/TAP device driver](https://docs.kernel.org/networking/tuntap.html)：先理解 TUN（虚拟三层 IP 接口）与 TAP（虚拟二层 Ethernet 接口）的区别，重点关注 userspace 对 `/dev/net/tun` 的 `read()/write()` 语义，以及 TAP 读写 Ethernet frame。[S7](#source-s7)
+2. [Cisco — Address Resolution Protocol](https://www.cisco.com/c/en/us/td/docs/routers/ios-xe/ip-addressing/ip-addressing/m_arp-config-arp-0.html)：用于建立“已知 IPv4、未知 MAC 时为什么需要 ARP Request/Reply”这一地址解析模型。[S16](#source-s16)
+3. [Cloudflare — 什么是 Internet 协议？](https://www.cloudflare.com/zh-cn/learning/network-layer/internet-protocol/)：第一次接触 IP 时，用它建立 IPv4 packet、源/目的地址以及上层协议标识的基础概念。[S8](#source-s8)
+4. [Cisco — Understand Ping and Traceroute Commands](https://www.cisco.com/c/en/us/support/docs/ios-nx-os-software/ios-software-releases-121-mainline/12778-ping-traceroute.html)：重点关注 Ping 使用 ICMP Echo Request/Reply，以及同网段通信为什么可能先发生 ARP resolution。[S17](#source-s17)
+5. [RFC 826 — ARP](https://www.rfc-editor.org/rfc/rfc826.html)、[RFC 791 — IPv4](https://www.rfc-editor.org/rfc/rfc791.html)、[RFC 792 — ICMP](https://www.rfc-editor.org/rfc/rfc792.html)：用于核对字段与规范语义，不要求先通读全文。[S9](#source-s9)[S10](#source-s10)[S11](#source-s11)
+
+这些资料用于加速建立背景和提供规范证据，不是继续阅读本文的强制前置条件。
+
+## 进入源码前：先建立这次 Ping 的协议模型
+
+当前实验只有两个真正通信的端点：
+
+| 角色 | IPv4 地址 | MAC 地址 | 当前职责 |
+| --- | --- | --- | --- |
+| Linux Host / `lwip0` | `198.18.0.1` | `0e:df:2b:29:78:22` | 发起 Ping，并在邻居表中学习 lwIP 的 MAC |
+| lwIP Unix `example_app` | `198.18.0.200` | `02:12:34:56:78:ab` | 从 TAP 接收 Ethernet frame，处理 ARP 与 ICMP，再把回复写回 TAP |
+
+这里的 **Ethernet frame（以太网帧）**是 TAP 读写的基本二层数据单元。它至少包含目标 MAC、源 MAC 和 EtherType；**EtherType（以太类型）**告诉接收方 Ethernet **payload（载荷，即 Header 之后承载的数据）**应按哪种协议解释：本次 `0x0806` 表示 ARP，`0x0800` 表示 IPv4。[S5](#source-s5)[S12](#source-s12)
+
+ARP frame 内部还有自己的 **opcode（操作码）**：`1` 表示 ARP Request，`2` 表示 ARP Reply。ARP Request 的问题可以直译成：“谁拥有 `198.18.0.200`？请把 MAC 地址告诉 `198.18.0.1`。” Reply 则返回 `198.18.0.200 -> 02:12:34:56:78:ab`。[S9](#source-s9)[S12](#source-s12)
+
+得到目标 MAC 后，Linux 才能发送真正的 IPv4 packet。IPv4 Header 中的 **Protocol（上层协议号）**决定 payload 继续交给谁；本次 `Protocol=1` 表示 ICMP。ICMP Echo Header 中的 **Type（消息类型）**再决定当前是 Echo Request 还是 Echo Reply：`Type=8` 为 Request，`Type=0` 为 Reply。[S10](#source-s10)[S11](#source-s11)[S12](#source-s12)
+
+因此，本实验在主动清空 Linux neighbor table 后得到的最小成功流程是：
+
+```mermaid
+sequenceDiagram
+    participant H as Linux Host 198.18.0.1
+    participant T as TAP lwip0
+    participant L as lwIP 198.18.0.200
+    H->>T: Frame 1 ARP Request（广播，询问 198.18.0.200 的 MAC）
+    T->>L: read(fd) 后交给 lwIP
+    L->>T: Frame 2 ARP Reply（返回 02:12:34:56:78:ab）
+    T->>H: Linux 邻居表学习 IP→MAC
+    H->>T: Frame 3 IPv4 / ICMP Echo Request（Type 8）
+    T->>L: Ethernet → IPv4 → ICMP
+    L->>T: Frame 4 IPv4 / ICMP Echo Reply（Type 0）
+    T->>H: ping 收到 Echo Reply
+```
+
+源码映射表会出现 `p->payload`。`pbuf` 是 lwIP 的 packet buffer（数据包缓冲区），`payload` 表示“当前协议层看到的数据起点”；Stage 3 会专门拆解它的 chain、长度和引用计数，本篇只跟踪这一数据视图怎样随协议层推进而移动。
+
+四帧与 lwIP 源码的第一层映射如下；后文会沿真实执行顺序逐项展开，而不是只停留在这张表：
+
+| 协议阶段 | 抓包/关键字段 | lwIP 入口 | 进入时 `p->payload` 指向 | 下一步 |
+| --- | --- | --- | --- | --- |
+| ARP Request RX | EtherType `0x0806`、opcode `1` | `ethernet_input()` → `etharp_input()` | Ethernet Header → ARP Header | 学习 Host IP/MAC，并构造 ARP Reply |
+| ARP Reply TX | opcode `2` | `etharp_raw()` → `ethernet_output()` | ARP frame | `netif->linkoutput()` 写回 TAP |
+| Echo Request RX | EtherType `0x0800`、IPv4 Protocol `1`、ICMP Type `8` | `ethernet_input()` → `ip4_input()` → `icmp_input()` | Ethernet → IPv4 → ICMP Header | 把 Request 改成 Reply |
+| Echo Reply TX | ICMP Type `0` | `ip4_output_if()` → `etharp_output()` → `ethernet_output()` | IPv4 Header → Ethernet Header | `low_level_output()` → `write(fd)` |
+
+现在才进入真实源码入口：`main()`。
 
 ---
 
@@ -24,7 +81,7 @@ Unix `example_app` 的入口位于：
 upstream/lwip/contrib/examples/example_app/test.c
 ```
 
-当前 `master` 的 `main()` 很薄。[S1](#source-s1)
+目标源码快照中的 `main()` 很薄。[S1](#source-s1)
 
 ```c
 #if USE_PPP && PPPOS_SUPPORT
@@ -80,7 +137,18 @@ sys_sem_free(&init_sem);
 - `tcpip_init()` 创建 `tcpip_thread`；
 - `test_init()` 不是由 `main()` 直接调用，而是在 `tcpip_thread` 启动后作为初始化完成回调执行。[S2](#source-s2)
 
-![从 main 到 netif/TAP 初始化的线程与调用关系](images/02-init-netif-tap.png)
+```mermaid
+sequenceDiagram
+    participant M as main thread
+    participant C as tcpip_thread
+    M->>M: main() -> main_loop()
+    M->>M: tcpip_init() -> lwip_init()
+    M->>C: sys_thread_new(tcpip_thread)
+    C->>C: test_init()
+    C->>C: init_default_netif() -> netif_add()
+    C->>C: tapif_init() / low_level_init()
+    C-->>M: init_sem signal
+```
 
 这张图只回答一个问题：**`netif` 与 TAP 是在什么线程、经过哪些函数建立起来的。**
 
@@ -118,9 +186,9 @@ tcpip_init(tcpip_init_done_fn initfunc, void *arg)
 
 ### 2.1 `lwip_init()` 到底初始化了什么
 
-`tcpip_init()` 的第一条实质调用就是 `lwip_init()`。这一步发生在调用 `tcpip_init()` 的 main thread 中；此时 `tcpip_thread` 还没有创建。也就是说，**lwIP 的协议模块和 timeout 基础设施先初始化，随后才建立 Core thread。**[S16](#source-s16)
+`tcpip_init()` 的第一条实质调用就是 `lwip_init()`。这一步发生在调用 `tcpip_init()` 的 main thread 中；此时 `tcpip_thread` 还没有创建。也就是说，**lwIP 的协议模块和 timeout 基础设施先初始化，随后才建立 Core thread。**[S15](#source-s15)
 
-下面是 `src/core/init.c` 中 `lwip_init()` 的执行路径阅读版，只保留当前学习主线需要观察的模块初始化顺序：[S16](#source-s16)
+下面是 `src/core/init.c` 中 `lwip_init()` 的执行路径阅读版，只保留当前学习主线需要观察的模块初始化顺序：[S15](#source-s15)
 
 ```c
 void
@@ -171,7 +239,7 @@ lwip_init(void)
 | `raw_init()` / `udp_init()` / `tcp_init()` | 各 transport/control PCB 模块 | 后续 Stage 5～10 会使用这些 PCB |
 | `sys_timeouts_init()` | lwIP timeout 调度表 | ARP、IP reassembly、DHCP、DNS、IPv6 等周期任务从这里进入 timeout 系统 |
 
-这里有一个后续 Stage 9 必须用到的特殊点：`sys_timeouts_init()` **不会在启动时直接让 TCP timer 永久运行**。TCP timer 位于 cyclic timer 表的第 0 项，但初始化函数故意跳过它；当真正出现 active/TIME-WAIT TCP PCB 时，`TCP_REG()` 才通过 `tcp_timer_needed()` 按需启动 TCP timer。[S16](#source-s16)
+这里有一个后续 Stage 9 必须用到的特殊点：`sys_timeouts_init()` **不会在启动时直接让 TCP timer 永久运行**。TCP timer 位于 cyclic timer 表的第 0 项，但初始化函数故意跳过它；当真正出现 active/TIME-WAIT TCP PCB 时，`TCP_REG()` 才通过 `tcp_timer_needed()` 按需启动 TCP timer。[S15](#source-s15)
 
 因此完整启动顺序不是“创建 tcpip_thread，然后线程自己初始化一切”，而是：
 
@@ -245,7 +313,7 @@ tcpip_thread
     -> test_init(...)
 ```
 
-初始化完成后，`main_loop()` 还会进入自己的循环；当前 `master` 在 `USE_ETHERNET` 分支中调用 `default_netif_poll()`。[S1](#source-s1)[S3](#source-s3) 后面会看到，它和 `tapif_thread` 都能走到 `tapif_input()`。因此第一次 Ping 的 RX 上游并不是只有一个生产者；真正稳定、必须理解的线程边界，是收到的 `pbuf` 经 `tcpip_input()` 投递到 `tcpip_mbox` 后，由 `tcpip_thread` 继续协议处理。
+初始化完成后，`main_loop()` 还会进入自己的循环；目标源码快照在 `USE_ETHERNET` 分支中调用 `default_netif_poll()`。[S1](#source-s1)[S3](#source-s3) 后面会看到，它和 `tapif_thread` 都能走到 `tapif_input()`。因此第一次 Ping 的 RX 上游并不是只有一个生产者；真正稳定、必须理解的线程边界，是收到的 `pbuf` 经 `tcpip_input()` 投递到 `tcpip_mbox` 后，由 `tcpip_thread` 继续协议处理。
 
 ---
 
@@ -555,30 +623,18 @@ Ethernet frame
 - **IP packet/datagram** 是 L3 数据单位，包含 IP 地址、TTL、Protocol 等字段，本身没有 Ethernet MAC Header；
 - IPv4 packet 可以作为 Ethernet frame 的 payload；ARP 则是另一种 Ethernet payload，并不是 IPv4 packet。[S5](#source-s5)
 
-### 5.4 L2、L3 是什么？一共有几层
+### 5.4 为什么本实验必须使用 TAP，而不是把 OSI 七层再讲一遍
 
-`L2`、`L3` 中的 `L` 是 Layer。这里借用 OSI Reference Model 的层号描述协议位置。OSI 模型定义 7 层：[S8](#source-s8)
-
-| 层 | 名称 | 当前系列最直观的例子 |
-| --- | --- | --- |
-| Layer 7 | Application，应用层 | HTTP、DNS 应用逻辑 |
-| Layer 6 | Presentation，表示层 | 数据表示/编码抽象 |
-| Layer 5 | Session，会话层 | 会话控制抽象 |
-| Layer 4 | Transport，传输层 | TCP、UDP |
-| Layer 3 | Network，网络层 | IPv4/IPv6，IP 地址与路由 |
-| Layer 2 | Data Link，数据链路层 | Ethernet，MAC 地址，Ethernet frame |
-| Layer 1 | Physical，物理层 | PHY、网线/无线物理传输 |
-
-TCP/IP 实现不会机械地按 7 层拆成 7 个源码目录。这里真正要记住的是：
+这里只需要区分当前实验实际跨越的两个数据边界：
 
 ```text
-TUN: 从 IPv4 Header 开始      -> L3
-TAP: 从 Ethernet Header 开始  -> L2
+TUN：userspace 从 IPv4/IPv6 Header 开始读取 -> L3 packet
+TAP：userspace 从 Ethernet Header 开始读取   -> L2 frame
 ```
 
-本系列需要观察 MAC、EtherType、ARP 和 Ethernet Header，因此使用 TAP。[S7](#source-s7)
+Linux Kernel 的 TUN/TAP 文档已经明确给出这一区别。[S7](#source-s7) Ethernet 在协议栈中的层次与 encapsulation 可直接回看教程 00 引用的 Microchip AN1120，本篇不再额外展开 OSI 七层定义。
 
-`IFF_NO_PI` 表示 Linux 不在 frame 前再附加额外的 TUN/TAP packet-information header，所以 `read(tapif->fd, ...)` 得到的第一字节就是实际 Ethernet frame。[S4](#source-s4)[S7](#source-s7)
+本系列需要直接观察 Destination/Source MAC、EtherType 和 ARP frame，因此选择 TAP。`IFF_NO_PI` 又保证 Linux 不会在 Ethernet frame 前附加额外的 TUN/TAP packet-information header，所以 `read(tapif->fd, ...)` 得到的第一字节就是实际 Ethernet frame。[S4](#source-s4)[S7](#source-s7)
 
 ### 5.5 `PRECONFIGURED_TAPIF` 怎样让 lwIP 绑定 `lwip0`
 
@@ -943,9 +999,7 @@ Destination: 198.18.0.200
 Protocol:    1
 ```
 
-这里第一次需要解释 ICMP。
-
-ICMP 是 **Internet Control Message Protocol，Internet 控制报文协议**。它由 IP 承载，`ping` 使用其中的 Echo Request/Echo Reply。[S11](#source-s11)
+这里把开头协议模型里的 ICMP 映射到真实抓包字段。ICMP 已在前文定义为由 IPv4 承载的控制报文协议；本次只跟踪 Ping 使用的 Echo Request/Echo Reply。[S11](#source-s11)
 
 ```text
 Type 8 -> Echo Request
@@ -1443,71 +1497,24 @@ lwIP 在 `prot/ieee.h` 中定义 `ETHTYPE_ARP=0x0806`、`ETHTYPE_IP=0x0800`。[S
 [ Ethernet ][ IPv4 Header ][ ICMP Header ][ Data ]
 ```
 
-### 15.1 `IHL`、`TTL` 和 `Protocol` 分别告诉 `ip4_input()` 什么
+### 15.1 这里只读取决定源码分发的 IPv4 字段
 
-真实 PCAP 的 IPv4 Header：[S12](#source-s12)
+IPv4 Header 的完整定义可由 RFC 791 核对；当前主线只展开会改变这次 Ping 源码执行的字段，TTL、traceroute、ICMP Time Exceeded 等旁支留到真正需要它们的位置。[S10](#source-s10) 当前真实 PCAP 只需要关注这些值：[S12](#source-s12)
 
 ```text
 Source IP      = 198.18.0.1
 Destination IP = 198.18.0.200
 IHL            = 20 bytes
-Total Length   = 84 bytes
 TTL            = 64
 Protocol       = 1
 ```
 
-**IHL** 是 Internet Header Length，即 IPv4 Header 长度。字段单位是 32-bit word；本次值相当于 5 个 32-bit word：
+与当前 lwIP 调用链直接相关的只有两点：
 
-```text
-5 * 4 bytes = 20 bytes
-```
+- `IHL=20 bytes` 决定 IPv4 Header 的长度，因此 `ip4_input()` 后续通过 `pbuf_remove_header(p, iphdr_hlen)` 把 `p->payload` 从 IPv4 Header 移到上层 payload；
+- `Protocol=1` 表示当前 IPv4 payload 是 ICMP，因此分发表会进入 `icmp_input()`。[S6](#source-s6)[S10](#source-s10)
 
-20 字节是没有 IPv4 options 时的最小 Header。`ip4_input()` 用 IHL 判断 Header 边界，并在向上层协议分发前执行：
-
-```c
-pbuf_remove_header(p, iphdr_hlen);
-```
-
-所以 IHL 也直接决定 `p->payload` 要向后移动多少字节。[S6](#source-s6)[S10](#source-s10)
-
-**TTL** 是 Time To Live。名字保留了“生存时间”的历史语义，但 IPv4 转发时实际表现为 hop limit：每经过一个负责转发 IPv4 packet 的路由器，TTL 都会递减。这样可以防止路由配置错误时 packet 永远在网络里循环。[S10](#source-s10)
-
-如果路由器处理 packet 时发现 TTL 已经耗尽，就会丢弃这个原始 IPv4 packet，并通常向原发送端返回一条 **ICMP Time Exceeded** 控制报文。[S11](#source-s11) 它不是 Ping 的 Echo Reply，而是在告诉发送端：**“这个 packet 没能继续到达目的地，因为它允许经过的跳数已经用完了。”**
-
-RFC 792 定义的 Time Exceeded 是 **ICMP Type 11**，其中当前最相关的 Code 是：[S11](#source-s11)
-
-| Type | Code | 含义 |
-| ---: | ---: | --- |
-| 11 | 0 | TTL exceeded in transit：转发途中 TTL 耗尽 |
-| 11 | 1 | Fragment reassembly time exceeded：分片重组等待超时 |
-
-Time Exceeded 还会携带原始 datagram 的 IPv4 Header 和开头一部分数据，使原发送端能够判断“是哪一个 packet 触发了这个错误”。这也是 `traceroute` 能逐跳发现路由器的基础：它从较小 TTL 开始发送 probe，并逐步增大 TTL，利用沿途网关返回的 ICMP Time Exceeded 识别每一跳。[S15](#source-s15)
-
-lwIP 自己也实现了这条机制。`src/include/lwip/prot/icmp.h` 定义 `ICMP_TE = 11`；当 `ip4_forward()` 转发 packet 时，会先把 TTL 减 1，如果结果变成 0，并且原 packet 不是 ICMP，就调用：`icmp_time_exceeded(p, ICMP_TE_TTL)`。后者再通过 `icmp_send_response()` 生成 Type 11 的 ICMP 错误报文。[S6](#source-s6)
-
-```text
-ip4_forward()
-    ↓ TTL - 1
-TTL == 0 ?
-    ↓ yes
-icmp_time_exceeded(..., ICMP_TE_TTL)
-    ↓
-icmp_send_response(..., ICMP_TE, ...)
-    ↓
-ICMP Time Exceeded
-```
-
-本实验的 `198.18.0.1 -> 198.18.0.200` 是同一个 TAP 二层链路上的直连通信，不经过中间路由器，因此这次真实 PCAP 中不会出现 Time Exceeded。Request 的 TTL 是 Linux 发出的 `64`；Reply 的 TTL 是 `255`，因为当前 `example_app/lwipopts.h` 配置 `ICMP_TTL=255`，而 `icmp_input()` 构造 Reply 时执行 `IPH_TTL_SET(iphdr, ICMP_TTL)`。[S1](#source-s1)[S6](#source-s6)[S12](#source-s12)
-
-**Protocol** 告诉 IPv4：Payload 要交给哪个上层协议。lwIP 当前定义：[S6](#source-s6)
-
-| 常量 | 数值 | IPv4 payload |
-| --- | ---: | --- |
-| `IP_PROTO_ICMP` | 1 | ICMP |
-| `IP_PROTO_IGMP` | 2 | IGMP，IPv4 multicast group management |
-| `IP_PROTO_TCP` | 6 | TCP |
-| `IP_PROTO_UDP` | 17 | UDP |
-| `IP_PROTO_UDPLITE` | 136 | UDP-Lite |
+`TTL=64` 是本次 Linux Request 中实际观察到的字段值，但它不决定这条直连 Ping 的协议分发，所以本篇不在这里展开 TTL 的完整协议机制。
 
 ### 15.2 `ip4_input()` 怎样从 IPv4 走到 `icmp_input()`
 
@@ -1852,13 +1859,14 @@ Ethernet -> netif->linkoutput -> Port
 - 使用位置：TUN/TAP、`/dev/net/tun`、`TUNSETIFF`、`IFF_NO_PI`
 - 支撑内容：TUN 读写 IP packet、TAP 读写 Ethernet frame 的 userspace 接口语义
 
+
 <a id="source-s8"></a>
-### [S8] ITU-T X.200 / ISO/IEC 7498-1 OSI Reference Model
-- 类型：标准
-- 版本：ITU-T X.200 (07/1994)
-- URL/文档：[ITU-T X.200](https://www.itu.int/rec/T-REC-X.200)
-- 使用位置：L2/L3 与 OSI 七层
-- 支撑内容：层号与层名称
+### [S8] Cloudflare — 什么是 Internet 协议？
+- 类型：公开技术学习资料
+- 版本：访问日期 2026-10-03
+- URL/文档：[Cloudflare — 什么是 Internet 协议？](https://www.cloudflare.com/zh-cn/learning/network-layer/internet-protocol/)
+- 使用位置：“阅读源码前”“进入源码前：先建立这次 Ping 的协议模型”
+- 支撑内容：IPv4 packet、源/目的地址与上层协议标识的入门心智模型；具体实现仍以目标 lwIP 源码和 RFC 791 为准
 
 <a id="source-s9"></a>
 ### [S9] RFC 826 — An Ethernet Address Resolution Protocol
@@ -1871,19 +1879,19 @@ Ethernet -> netif->linkoutput -> Port
 ### [S10] RFC 791 — Internet Protocol
 - 类型：协议规范
 - URL/文档：[RFC 791 — Internet Protocol](https://www.rfc-editor.org/rfc/rfc791.html)
-- 使用位置：IPv4 Header、IHL、TTL、MTU/fragmentation
-- 支撑内容：IPv4 Header 字段和 datagram/fragmentation 语义
+- 使用位置：Frame 3 的 IPv4 Header、IHL 与 Protocol 分发
+- 支撑内容：IPv4 Header 字段、Header length 与上层 Protocol 标识
 
 <a id="source-s11"></a>
 ### [S11] RFC 792 — Internet Control Message Protocol
 - 类型：协议规范
 - URL/文档：[RFC 792 — Internet Control Message Protocol](https://www.rfc-editor.org/rfc/rfc792.html)
-- 使用位置：ICMP Echo Request/Reply、Identifier/Sequence、ICMP Time Exceeded
-- 支撑内容：ICMP Echo 消息格式与语义，以及 Time Exceeded Type 11 / Code 0、1 的错误报告语义
+- 使用位置：ICMP Echo Request/Reply、Identifier/Sequence
+- 支撑内容：ICMP Echo 消息格式与 Request/Reply 语义
 
 <a id="source-s12"></a>
 ### [S12] Stage 2 实际 Ping 抓包
-- 类型：用户实验
+- 类型：项目实验抓包
 - 文件：[ `docs/assets/stage2-ping.pcap` ](assets/stage2-ping.pcap)
 - 日期：2026-09-30
 - Link type：Ethernet
@@ -1904,16 +1912,27 @@ Ethernet -> netif->linkoutput -> Port
 - 使用位置：真实物理 Ethernet 接口的 RX 地址过滤、promiscuous/all-multicast 说明
 - 支撑内容：`ndo_set_rx_mode`/`ndo_set_rx_mode_async` 接收 unicast 与 multicast 地址列表；`net_device` 维护 promiscuity、allmulti、unicast/multicast 地址状态，具体下沉方式由驱动/硬件实现
 
-<a id="source-s15"></a>
-### [S15] `traceroute(8)` Linux manual
-- 类型：Linux traceroute manual
-- URL/文档：[traceroute(8) manual](https://man7.org/linux/man-pages/man8/traceroute.8.html)
-- 使用位置：TTL 与 ICMP Time Exceeded 的关系
-- 支撑内容：traceroute 从较小 TTL 开始发送 probe，并通过沿途网关返回的 ICMP Time Exceeded 逐跳发现路径
 
-<a id="source-s16"></a>
-### [S16] lwIP Core 初始化与 timeout 初始化
+<a id="source-s15"></a>
+### [S15] lwIP Core 初始化与 timeout 初始化
 - 版本：`d08f4773edd0182b7910fc8f046eed82ffcd67c9`
 - URL/文档：[`src/core/init.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/init.c)、[`src/core/timeouts.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/timeouts.c)、[`src/include/lwip/priv/tcp_priv.h`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/include/lwip/priv/tcp_priv.h)
 - 使用位置：`lwip_init()` 的模块初始化顺序、`sys_timeouts_init()`、TCP timer 按需启动说明
 - 支撑内容：证明协议模块与 timeout 基础设施在 `tcpip_thread` 创建前初始化，以及 TCP cyclic timer 不在启动阶段直接常驻运行
+
+<a id="source-s16"></a>
+### [S16] Cisco — Address Resolution Protocol
+- 类型：厂商网络协议说明 / ARP 前置阅读
+- 版本：访问日期 2026-10-02
+- URL/文档：[Address Resolution Protocol](https://www.cisco.com/c/en/us/td/docs/routers/ios-xe/ip-addressing/ip-addressing/m_arp-config-arp-0.html)
+- 使用位置：“阅读源码前：建议提前阅读”
+- 支撑内容：Layer 2/Layer 3 address mapping、ARP cache、broadcast Request 与目标节点 Reply 的完整过程及示意图
+
+<a id="source-s17"></a>
+### [S17] Cisco — Understand Ping and Traceroute Commands
+- 类型：厂商网络协议/诊断说明 / Ping 前置阅读
+- 版本：访问日期 2026-10-02
+- URL/文档：[Understand Ping and Traceroute Commands](https://www.cisco.com/c/en/us/support/docs/ios-nx-os-software/ios-software-releases-121-mainline/12778-ping-traceroute.html)
+- 使用位置：“阅读源码前：建议提前阅读”
+- 支撑内容：ICMP Echo 的 Ping 行为，以及 ARP resolution 失败如何阻止 Ethernet 上的 Ping 正常封装与发送
+

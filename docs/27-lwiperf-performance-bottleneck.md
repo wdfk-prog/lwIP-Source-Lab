@@ -6,9 +6,16 @@
 
 [TOC]
 
-Stage 8～10 已经分别解释 TCP 数据发送、ACK 清队列、拥塞窗口与重传；Stage 12 解释了 pbuf/mem/memp；Stage 19～22 又把 checksum、DMA、descriptor ring 与 PHY 速率补到了 Driver/硬件边界。Stage 27 不重新逐章复述这些机制，而是从 upstream `lwiperf` 的真实 Raw TCP 入口开始，把它们放进同一条“吞吐为什么上不去”的执行链。[S1](#source-s1)[S3](#source-s3)
 
-本篇不把某个配置值直接写成“最佳参数”。吞吐量取决于链路带宽、RTT、TCP 窗口、发送队列、内存、CPU、Driver 与 PHY 等共同约束；没有实际目标板测量，就只能建立可证伪的定位方法，不能给出无条件调优结论。[S3](#source-s3)[S4](#source-s4)
+`lwiperf` 是 lwIP 自带的 TCP 吞吐测试应用模块，不是 TCP Core 本身；官方文档把它定位为可与 PC 端 iPerf2 配合的最小 TCP client/server 性能测量实现。[S6](#source-s6) 当前实现直接使用 Raw TCP API，也就是绕过 Socket/Netconn、直接注册 TCP Core callback 的回调式 API，建立连接、累计 application bytes 并按持续时间计算 `bandwidth_kbitpsec`。[S1](#source-s1)
+
+进入源码前先区分几个经常被混用的性能量。**PHY line rate** 是物理链路协商出的名义速率；**throughput** 是某一层单位时间实际传送的数据量；**application goodput** 更强调真正交付给应用的有效数据，不包含下层 header、重传等开销。lwiperf 当前 report 只用 `bytes_transferred / duration` 计算应用侧传输速率，它不直接等于 Ethernet wire rate，也没有同时给出 CPU cycles、packet rate、drop、retransmission 或 descriptor occupancy。[S1](#source-s1)[S6](#source-s6)
+
+另一个必须先建立的量是 BDP（Bandwidth-Delay Product，带宽时延积）：在给定带宽与 RTT（Round-Trip Time，往返时延）下，要让发送端持续填满链路，通常需要足够的 in-flight data。于是 TCP receive window、`cwnd`、`snd_buf`/`snd_queuelen`、pbuf/memp、CPU、checksum/copy、Driver ring、DMA/MAC 与 PHY 都可能成为限制层；性能定位的目标不是“一次调很多宏”，而是找到**最先达到上限或最先出现异常证据的那一层**。[S3](#source-s3)[S4](#source-s4)[S5](#source-s5)
+
+Stage 8～10 已经分别解释 TCP 数据发送、ACK 清队列、拥塞窗口与重传；Stage 12 解释了 pbuf/mem/memp；Stage 19～22 又把 checksum、DMA、descriptor ring 与 PHY 速率补到了 Driver/硬件边界。Stage 27 不重复这些完整机制，而是从 upstream `lwiperf` 的真实 Raw TCP 入口开始，把它们接成一条“吞吐为什么上不去”的可证伪证据链。[S1](#source-s1)[S3](#source-s3)
+
+本篇没有真实目标板吞吐、CPU、cache miss、descriptor occupancy 或 retransmission 测量，因此不会给出所谓“最佳 TCP 宏值”。源码只能证明限制可能在哪里出现；最终瓶颈必须由实际平台证据确认。
 
 ## 1. 当前 example 编译了 lwiperf，但默认不启动
 
@@ -374,99 +381,23 @@ flowchart TD
 
 如果启用该选项，测试本身增加了逐字节 CPU 工作。比较两个 build 的吞吐时，必须确认测试 workload 一致，否则“协议栈性能变化”可能只是测试代码变化。
 
-## 14. `tcpip_thread` 可能成为串行化瓶颈
+## 14. 跨层瓶颈不再逐篇复述，用证据面把前文机制接起来
 
-在 `NO_SYS=0` 且未采用特殊 core locking 设计时，大量协议处理集中在 lwIP Core execution context。Stage 11 已经解释 mailbox 与 Core Locking；在性能测试中，它们体现为执行资源竞争：
+Stage 11/12/19/21/22 已经分别把 Core thread、allocator、checksum、descriptor ring 与 PHY 讲清楚。性能篇不需要把这些机制再解释一次，而是把它们变成 **同一次 lwiperf 压力下应该观察的不同证据面**。lwIP 官方 Optimization hints 也强调 checksum routine、network-interface service 频率和 buffer overflow 都可能成为性能关键点，同时指出单纯把 memory options 调得很大通常不会自动带来明显提速。[S7](#source-s7)
 
-```text
-RX interrupt / driver task
-        ↓
-input submission
-        ↓
-tcpip_thread
-        ├─ IP/TCP RX
-        ├─ ACK processing
-        ├─ Raw callbacks
-        ├─ timers
-        └─ other protocol work
-```
+| 层次 | 性能现象 | 需要回看的证据 | 主讲文章 |
+| --- | --- | --- | --- |
+| TCP flow/congestion | sender 经常等 ACK / window | `snd_wnd`、`cwnd`、RTT、ACK cadence | Stage 8～10 |
+| TCP enqueue resource | `tcp_write()` 返回 `ERR_MEM` | `snd_buf`、`snd_queuelen`、`tcp_seg` | 本篇 + Stage 12 |
+| Core execution | RX/ACK/callback 延迟 | `tcpip_thread` 是否被长 callback/其他 work 占用 | Stage 11 |
+| memory/pbuf | allocation/drop 上升 | MEM/MEMP/PBUF stats | Stage 12 |
+| checksum/copy CPU | CPU 饱和但窗口/ring 不缺资源 | software checksum、copy path、Cache 行为 | Stage 19/20/43 |
+| Driver TX/RX | ring full、buffer starvation、drop | descriptor reclaim/refill、Driver counters | Stage 21/43 |
+| PHY/link | throughput 顶在固定上界 | negotiated speed/duplex/link errors | Stage 22/44 |
 
-如果 `lwiperf_tcp_recv()` 或其他 callback 做大量计算，TCP Core 本身也会被延迟。吞吐下降和 RTT/ACK 延迟增大可能同时出现。
+这样出现“吞吐低”时，下一步不是继续放大某一个 buffer，而是先判断 **等待发生在哪一层**。例如 cwnd 下降可能是 Driver drop 的后果，`ERR_MEM` 也可能来自 TCP queue/pbuf resource，而不是 C heap 已耗尽。
 
-## 15. checksum 与 memcpy 是 CPU 路径，不是 TCP window 问题
-
-Stage 19 已经说明 software checksum 与 hardware offload 的边界；Stage 20 又说明 copy/zero-copy ownership。性能分析时可以把 CPU data path 拆开：
-
-```text
-application bytes
-   ↓
-tcp_write copy? / reference?
-   ↓
-TCP/IP checksum
-   ↓
-Ethernet Driver copy / scatter-gather
-   ↓
-DMA
-```
-
-如果 CPU utilization 已接近饱和，而窗口、ACK 和 descriptor queue 都没有明显空闲等待，继续增大 TCP buffer 可能不会提高吞吐。此时更合理的候选是 checksum offload、减少 copy、cache/DMA 访问模式或更高效的 Driver path。
-
-这些属于工程分析条件，不是“打开 offload 一定更快”的无条件结论。
-
-## 16. Stage 21 的 descriptor ring 会形成第二层背压
-
-TCP Core 可以 enqueue，不代表 Driver 永远有空闲 TX descriptor。
-
-```text
-TCP output
-  ↓
-netif output
-  ↓
-Driver TX ring
-  ↓
-没有 free descriptor
-```
-
-如果 Driver 不能及时 reclaim completion：
-
-- `linkoutput()` 可能失败或阻塞，取决于 Port contract；
-- TCP 数据仍可能留在上层等待后续输出；
-- CPU 也可能耗在轮询/retry；
-- 物理链路会出现空闲 gap。
-
-反向 RX 路径中，如果 RX descriptors/buffers 长时间得不到 recycle，就可能出现丢包。TCP 会把丢包解释成网络拥塞/丢失并进入重传与 congestion control，最终表现为吞吐下降。
-
-因此“TCP cwnd 下降”可能是结果，不一定是最初的原因。
-
-## 17. PHY negotiated speed 是绝对上界之一
-
-Stage 22 已经把 `netif->link_speed`、PHY auto-negotiation 与 duplex 分开。性能测试前必须先确认物理事实：
-
-```text
-10 Mbit/s link
-100 Mbit/s link
-1 Gbit/s link
-half duplex / full duplex
-```
-
-应用 goodput 不可能长期超过实际 negotiated line rate；而 Ethernet/IP/TCP framing 还会进一步降低 application payload 比例。
-
-所以第一步不是调 `TCP_WND`，而是确认测试对象的真实 link speed 与 duplex。
-
-## 18. SNMP/MIB2 counters 可以成为 Driver 侧旁证
-
-Stage 26 已经讲过 `mib2_counters`。它不能替代 packet capture 或 Driver debug，但可以用于判断“吞吐下降期间有没有同时发生 discard/error”。例如：
-
-```text
-ifInOctets / ifOutOctets
-ifInDiscards / ifOutDiscards
-```
-
-如果 application throughput 下降同时 discard 快速增长，应优先检查资源/ring/Driver path；如果 discard 没有增长但 ACK 间隔明显变大，则 CPU scheduling、window 或 peer behavior 更值得怀疑。
-
-这是证据组合方式，不是单个 counter 的自动根因诊断。
-
-## 19. 一个更可靠的瓶颈定位顺序
+## 15. 一个更可靠的瓶颈定位顺序
 
 面对“iperf 只有预期的一半”这类现象，优先按从硬上限到内部资源的顺序排除：
 
@@ -483,22 +414,13 @@ flowchart TD
 
 这个顺序的目的，是避免一看到吞吐低就同时修改十几个宏，最终失去因果证据。
 
-## 20. throughput、goodput、packet rate 不应混为一个指标
+## 16. 如何解释 lwiperf 的报告值，而不是把一个 kbit/s 当成全部性能
 
-至少要区分：
+`report_fn` 得到的是 `bytes_transferred`、`ms_duration` 与由此计算的 `bandwidth_kbitpsec`。[S1](#source-s1)[S6](#source-s6) 这个值反映 lwiperf application bytes 在测试持续时间内的平均传输速率；它没有把 Ethernet/IP/TCP header 计入分子，也不会单独显示重传、CPU 时间、queue occupancy 或 packet rate，因此不能直接拿来等同于 PHY line rate，更不能仅凭一个数值判断瓶颈位于 TCP、内存还是 Driver。
 
-| 指标 | 当前含义 |
-| --- | --- |
-| PHY line rate | 物理链路比特率 |
-| TCP/application throughput | 一段时间内传输的应用/TCP payload 量 |
-| goodput | 真正有用且非重传的上层数据速率 |
-| packet rate | packets per second，受 packet size 强烈影响 |
-| CPU utilization | 计算资源占用，并不直接等于吞吐 |
-| retransmission rate | 网络/资源/调度问题的重要侧证 |
+如果需要判断“链路利用率为什么低”，至少还应把 RTT/BDP、advertised window、retransmission、CPU load、pbuf/memp pressure、descriptor starvation 与实际 negotiated speed 放到同一证据面。RFC 6349 可以提供更完整的 TCP throughput testing 框架，[S4](#source-s4) 但当前文章已经给出读懂 lwiperf report 所需的最小指标语义，不要求离开正文后才能理解这一数值。
 
-lwiperf 的 `bandwidth_kbitpsec` 是它自身基于 `bytes_transferred` 与 elapsed milliseconds 计算出的应用侧统计，不应被标记成“Ethernet wire speed”。[S1](#source-s1)
-
-## 21. Stage 27 的完整性能心智模型
+## 17. Stage 27 的完整性能心智模型
 
 ```mermaid
 flowchart TD
@@ -518,7 +440,7 @@ flowchart TD
 
 这张图的关键不是“性能有很多因素”，而是每一层都有不同的可观察证据。真正的定位过程应寻找最先达到上限或最先出现异常的层。
 
-## 22. 当前实现边界
+## 18. 当前实现边界
 
 当前目标版本需要保留这些边界：[S1](#source-s1)[S2](#source-s2)[S3](#source-s3)
 
@@ -575,3 +497,19 @@ flowchart TD
 - URL/文档：[RFC 9293](https://www.rfc-editor.org/rfc/rfc9293.html)，[RFC 5681](https://www.rfc-editor.org/rfc/rfc5681.html)
 - 使用位置：“advertised receive window”“ACK”“congestion window”
 - 支撑内容：提供 TCP flow control 与 congestion-control 的协议语义，用于区分规范概念和 lwIP 具体变量实现
+
+<a id="source-s6"></a>
+### [S6] lwIP 官方 lwiperf API 文档
+- 类型：lwIP 官方 Application API 文档
+- 版本：lwIP 2.1.x 文档，访问日期 2026-10-03
+- URL/文档：[Iperf server / lwiperf](https://www.nongnu.org/lwip/2_1_x/group__iperf.html)
+- 使用位置：开篇工具定位、server/client 能力、report 指标边界
+- 支撑内容：官方把 lwiperf 定义为与 iPerf2 配合的最小 TCP client/server 性能测量实现，并列出启动/abort/report API
+
+<a id="source-s7"></a>
+### [S7] lwIP 官方 Optimization hints
+- 类型：lwIP 官方性能文档
+- 版本：lwIP 2.1.x 文档，访问日期 2026-10-03
+- URL/文档：[Optimization hints](https://www.nongnu.org/lwip/2_1_x/optimization.html)
+- 使用位置：跨层瓶颈证据面、checksum、Driver service 频率、buffer overflow、memory sizing 边界
+- 支撑内容：官方指出 checksum routine 与 network-interface service 频率是重要性能点，并提醒单纯增大 memory options 通常不会自动显著提升速度

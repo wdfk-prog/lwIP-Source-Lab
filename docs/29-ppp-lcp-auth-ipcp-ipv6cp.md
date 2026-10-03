@@ -6,9 +6,96 @@
 
 [TOC]
 
+PPP 的控制面不是一个协议一次完成：LCP（Link Control Protocol，链路控制协议）先建立和配置 PPP link；如果双方协商要求认证，再由 PAP（Password Authentication Protocol）或 CHAP（Challenge Handshake Authentication Protocol）确认对端身份；链路进入 Network phase 后，IPCP（Internet Protocol Control Protocol）和 IPv6CP（IPv6 Control Protocol）分别配置 IPv4 与 IPv6 在这条 PPP link 上运行所需的网络层参数。[S3](#source-s3)[S4](#source-s4)[S5](#source-s5)[S6](#source-s6)[S7](#source-s7)
+
+这些 control protocol 在 lwIP 中复用 generic FSM（Finite State Machine，有限状态机）推进 Configure-Request/Ack/Nak/Reject、timeout 与 OPENED 等状态，因此本文需要同时区分“整个 PPP session 的 phase”和“单个控制协议的 FSM state”。[S1](#source-s1)
+
 Stage 28 已经把 PPPoS 串口字节流恢复成 PPP frame，并把 frame 交给 `ppp_input()`。Stage 29 从 `ppp_start()` 中已经出现的 `lcp_open()` / `lcp_lowerup()` 继续，追踪 PPP 为什么不会一收到串口字节就直接允许 IPv4/IPv6，而要依次经过 LCP、可选认证和 Network Control Protocol。[S1](#source-s1)[S3](#source-s3)
 
-本篇把两层状态机同时保留：整个 session 的 `PPP_PHASE_*`，以及 LCP/IPCP/IPv6CP 共用的 generic `fsm`。二者层次不同，不能混成一套状态。
+## 阅读源码前：建议按“PPP 总体 → 认证 → NCP（Network Control Protocol，网络控制协议）”顺序阅读
+
+Stage 29 进入 PPP 最容易混淆的一层：多个 control protocol 共用一套协商框架，却负责不同阶段。下面资料适合提前阅读；正文仍会把每个会改变源码控制流的术语重新解释。[S3](#source-s3)[S4](#source-s4)[S5](#source-s5)[S6](#source-s6)[S7](#source-s7)
+
+1. [RFC 1661 — The Point-to-Point Protocol (PPP)](https://www.rfc-editor.org/rfc/rfc1661.html)
+   - 用途：建立 PPP phase（整个会话阶段）、LCP（链路控制协议）、Authentication（认证阶段）和 Network-Layer Protocol phase（网络层协议阶段）的总体顺序。
+   - 建议重点：§3.2～§3.6 和 §4。
+2. [RFC 1334 — PPP Authentication Protocols](https://www.rfc-editor.org/rfc/rfc1334.html) 与 [RFC 1994 — PPP Challenge Handshake Authentication Protocol (CHAP)](https://www.rfc-editor.org/rfc/rfc1994.html)
+   - 用途：分别理解 PAP 的明文凭据请求/确认模型，以及 CHAP 的 Challenge/Response 模型。
+3. [RFC 1332 — The PPP Internet Protocol Control Protocol (IPCP)](https://www.rfc-editor.org/rfc/rfc1332.html)
+   - 用途：理解 IPv4 参数为什么在 LCP/认证之后再由 IPCP（Internet Protocol Control Protocol，IPv4 网络控制协议）协商。
+4. [RFC 5072 — IP Version 6 over PPP](https://www.rfc-editor.org/rfc/rfc5072.html)
+   - 用途：理解 IPv6CP（IPv6 Control Protocol）、Interface-Identifier（接口标识符）与 PPP IPv6 link-local（链路本地）地址之间的关系。
+5. [lwIP PPP source](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/netif/ppp)
+   - 用途：对照 `fsm.c`、`lcp.c`、`auth.c`、`ipcp.c`、`ipv6cp.c` 的职责边界。
+
+## 先区分两套“状态”：PPP session phase 与单个 control protocol 的 FSM state
+
+Stage 28 只负责把 serial bytes 恢复成 PPP packet。到了 Stage 29，PPP Core 还不能立即把 IPv4/IPv6 当作可用数据面，因为两端必须先把**链路本身是否可用、是否需要认证、网络层参数是否就绪**依次谈妥。[S3](#source-s3)
+
+这里必须先分清两套状态：
+
+- **PPP phase**：描述整个 PPP session 当前处在 Dead、Establish、Authenticate、Network、Running、Terminate 等哪一个大阶段。它回答“整条会话已经走到哪里”。
+- **FSM（Finite State Machine，有限状态机）state**：LCP、IPCP、IPv6CP 各自拥有一份 Configure 协商状态，例如 `REQSENT`、`ACKRCVD`、`ACKSENT`、`OPENED`。它回答“某一个 control protocol 的 Configure 交换走到哪里”。[S1](#source-s1)[S3](#source-s3)
+
+几个后文会第一次真正参与控制流的协议也先建立最低限度定义：
+
+| 名称 | 角色 | 当前阶段解决什么问题 |
+| --- | --- | --- |
+| LCP（Link Control Protocol） | PPP 的链路控制协议 | 先协商 PPP link 的基本参数和能力；只有 LCP OPENED，后续认证/NCP 才有意义 |
+| PAP（Password Authentication Protocol） | 简单的用户名/密码认证协议 | 一端发送 Authenticate-Request，另一端返回 Ack/Nak；凭据不会通过 Challenge 保护 [S4](#source-s4) |
+| CHAP（Challenge Handshake Authentication Protocol） | Challenge/Response 认证协议 | 验证方先发 Challenge，对端计算 Response，再返回 Success/Failure [S5](#source-s5) |
+| NCP（Network Control Protocol） | 一类网络层控制协议的统称 | 在 PPP link 已建立后，为某个 Network-Layer Protocol 配置参数 |
+| IPCP（Internet Protocol Control Protocol） | IPv4 对应的 NCP | 协商/确认 IPv4 参数，OPENED 后才把 IPv4 data plane 标记为可用 [S6](#source-s6) |
+| IPv6CP（IPv6 Control Protocol） | IPv6 对应的 NCP | 协商 IPv6 Interface-Identifier，并据此形成 PPP link-local 地址 [S7](#source-s7) |
+
+Configure 协商还会反复出现四类消息：**Configure-Request** 提出一组 option；**Configure-Ack** 表示原样接受；**Configure-Nak** 表示当前值不接受但给出可协商替代；**Configure-Reject** 表示某个 option 本身不能接受。lwIP 的 generic `fsm.c` 正是把这些通用动作抽出来复用。[S1](#source-s1)[S3](#source-s3)
+
+## Stage 29 协议总流程：LCP → 可选认证 → IPCP/IPv6CP → Network Protocol up
+
+```mermaid
+sequenceDiagram
+    participant A as Local PPP endpoint
+    participant B as Peer PPP endpoint
+
+    A->>B: LCP Configure-Request
+    B-->>A: LCP Configure-Ack/Nak/Reject
+    B->>A: LCP Configure-Request
+    A-->>B: LCP Configure-Ack/Nak/Reject
+    Note over A,B: LCP reaches OPENED
+
+    alt PAP negotiated
+        A->>B: PAP Authenticate-Request
+        B-->>A: PAP Authenticate-Ack/Nak
+    else CHAP negotiated
+        B->>A: CHAP Challenge
+        A->>B: CHAP Response
+        B-->>A: CHAP Success/Failure
+    else no authentication required
+        Note over A,B: enter Network phase directly
+    end
+
+    A->>B: IPCP Configure-Request
+    B-->>A: IPCP Configure-Ack/Nak/Reject
+    A->>B: IPv6CP Configure-Request
+    B-->>A: IPv6CP Configure-Ack/Nak/Reject
+    Note over A,B: one or more Network Protocols become usable
+```
+
+PAP 与 CHAP 在图中被画成同一个“认证阶段”，但二者报文模型并不相同；正文到达各自源码时会单独展开。IPCP 与 IPv6CP 也不是“必须同时成功才算 PPP 成功”的简单绑定关系，lwIP 会分别通过 `np_up()` 记录哪些 Network Protocol 已经 up。[S1](#source-s1)
+
+## 协议阶段与 lwIP 实现的双轨映射
+
+| PPP 阶段 | 协议动作 | lwIP 主要函数 | 关键状态/对象 | 成功后进入 |
+| --- | --- | --- | --- | --- |
+| Establish | 打开 LCP 并通知 lower layer ready | `ppp_start()` → `lcp_open()` / `lcp_lowerup()` | `pcb->phase`、`pcb->lcp_fsm` | LCP Configure FSM |
+| LCP Configure | Req/Ack/Nak/Reject 与 timeout/retry | `fsm_open()`、`fsm_input()` + LCP callbacks | per-protocol `fsm` | `lcp_up()` |
+| Authentication | 根据 LCP option 选择 PAP/CHAP 等 | `link_established()` → `upap_*` / `chap_*` | `auth_pending`、LCP negotiated options | `network_phase()` |
+| Network | 启动一个或多个 NCP | `network_phase()` / `start_networks()` | `num_np_open`、各 NCP FSM | IPCP/IPv6CP Configure |
+| IPCP OPENED | IPv4 network protocol 可用 | `ipcp_up()` → `np_up(PPP_IP)` | IPv4 negotiated options | Stage 30 的地址/DNS应用 |
+| IPv6CP OPENED | IPv6 network protocol 可用 | `ipv6cp_up()` → `np_up(PPP_IPV6)` | Interface-Identifier、IPv6 state | Stage 30 的 link lifecycle |
+| Running | 至少一个 Network Protocol 已 up | `np_up()` | `num_np_up`、PPP phase | IP 数据面开始通过 gate |
+
+后文从 Stage 28 的 `ppp_start()` 接着走，始终把 generic FSM、具体 control protocol 和 session phase 三者分开。
 
 ## 1. 当前 example 打开 PAP/CHAP，但是否实际认证由协商结果决定
 
@@ -49,40 +136,28 @@ void ppp_start(ppp_pcb *pcb) {
 
 二者都进入 generic FSM，但对应不同事件入口。
 
-## 3. LCP/IPCP/IPv6CP 都复用同一套 generic FSM
+## 3. RFC 1661 的 Configure FSM 在 lwIP 中由 `fsm.c` 统一实现
 
-`fsm.h` 定义 10 个状态：[S1](#source-s1)
+RFC 1661 已经给出 LCP automaton 和 Configure packet 的状态/事件语义；这里不再逐状态教学，而只定位 lwIP 的复用关系。[S1](#source-s1)[S3](#source-s3)
+
+`fsm.h` 保存 RFC automaton 对应的 10 个 implementation state：
 
 ```text
-INITIAL
-STARTING
-CLOSED
-STOPPED
-CLOSING
-STOPPING
-REQSENT
-ACKRCVD
-ACKSENT
-OPENED
+INITIAL / STARTING / CLOSED / STOPPED / CLOSING
+STOPPING / REQSENT / ACKRCVD / ACKSENT / OPENED
 ```
 
-核心 negotiation 主要发生在：
+LCP、IPCP、IPv6CP 各自持有一份 `fsm`，但 Configure-Request/Ack/Nak/Reject、timeout/retry 与状态迁移统一进入 `fsm_open()`、`fsm_lowerup()`、`fsm_input()` 和 timer path。协议之间真正不同的是 option callbacks 与 OPENED 后的 `up()` 行为。
 
 ```mermaid
-stateDiagram-v2
-    [*] --> INITIAL
-    INITIAL --> STARTING: fsm_open while lower down
-    INITIAL --> CLOSED: fsm_lowerup
-    CLOSED --> REQSENT: fsm_open / send Configure-Request
-    REQSENT --> ACKRCVD: receive valid Configure-Ack
-    REQSENT --> ACKSENT: accept peer Configure-Request
-    ACKRCVD --> OPENED: accept peer Configure-Request / send Ack
-    ACKSENT --> OPENED: receive valid Configure-Ack
-    OPENED --> REQSENT: renegotiation event
-    OPENED --> STOPPING: close/lower-down path
+flowchart LR
+    A["LCP / IPCP / IPv6CP"] --> B["per-protocol fsm instance"]
+    B --> C["fsm_open() / fsm_input()"]
+    C --> D["shared Configure FSM"]
+    D --> E["protocol-specific callbacks"]
 ```
 
-真实 `fsm.c` 还处理 Nak、Reject、Terminate、Code-Reject、timeout/retry 等分支。本图只保留理解 LCP/IPCP/IPv6CP 正常打开所需的主迁移。[S1](#source-s1)[S3](#source-s3)
+这样阅读后续源码时，重点不再是背 RFC 状态名，而是确认“当前是哪一份 `fsm`、哪一个 option callback、OPENED 后进入哪个 protocol-specific `up()`”。
 
 ## 4. LCP `protent` 把 protocol number 接到 FSM
 
@@ -129,11 +204,11 @@ flowchart LR
     D --> E["fsm_input(&lcp_fsm)"]
 ```
 
-## 5. LCP 真正协商的是 link-level 能力
+## 5. `lcp_up()` 把 LCP 协商结果写回 PPPoS data path
 
-LCP 不分配 IPv4 address。它协商的是 PPP link 本身的参数，例如 MRU、async map、authentication protocol、Protocol-Field-Compression、Address-and-Control-Field-Compression 等。[S1](#source-s1)[S3](#source-s3)
+LCP option 的含义由 RFC 1661/1662 定义；这里直接看 lwIP 在 FSM 到达 `OPENED` 后怎样消费结果。[S1](#source-s1)[S3](#source-s3)
 
-当 LCP FSM 到达 `OPENED`，callback `lcp_up()` 被调用。`lcp_up()` 根据双方 option 结果配置 PPPoS framing：[S1](#source-s1)
+`lcp_up()` 从 negotiated option 计算 MTU/MRU，并把 async map、PFC、ACFC 下发给 Stage 28 的 PPPoS adapter：[S1](#source-s1)
 
 ```c
 mtu = ho->neg_mru? ho->mru: PPP_DEFMRU;
@@ -148,13 +223,13 @@ ppp_recv_config(pcb, mru,
                 go->neg_pcompression, go->neg_accompression);
 ```
 
-继续阅读 `lcp_up()`：完成 framing 参数下发后才调用 `link_established()`。[S1](#source-s1)
+随后 `lcp_up()` 调用：
 
 ```c
 link_established(pcb);
 ```
 
-这就是 PPP phase 从“链路协商”切到“认证/网络协商”的桥。
+因此 Stage 28 的 `pcomp`、`accomp`、`in_accm/out_accm` 不是 PPPoS 自己决定的固定参数，而是 LCP control plane 写回 serial data path 的协商结果。
 
 ## 6. `link_established()` 把 phase 切到 AUTHENTICATE
 
@@ -177,9 +252,11 @@ EAP  -> eap_authwithpeer()
 
 没有任何认证待完成时，直接进入 `network_phase()`。
 
-## 7. PAP：credential 直接进入 Authenticate-Request
+## 7. PAP 标准报文在 lwIP 中落到 `upap_*` 哪些函数
 
-PAP client 入口 `upap_authwithpeer()` 保存 username/password，并在 lower layer ready 后调用 `upap_sauthreq()` 发送 Authenticate-Request：[S1](#source-s1)[S4](#source-s4)
+PAP 的两次交互和 packet format 已由 RFC 1334 §2 定义；本文只保留调用映射。[S1](#source-s1)[S4](#source-s4)
+
+client 入口 `upap_authwithpeer()` 保存 username/password，并在 lower layer ready 后进入 `upap_sauthreq()`，对应标准的 Authenticate-Request：[S1](#source-s1)
 
 ```c
 void upap_authwithpeer(ppp_pcb *pcb, const char *user, const char *password) {
@@ -202,7 +279,7 @@ void upap_authwithpeer(ppp_pcb *pcb, const char *user, const char *password) {
 }
 ```
 
-PAP 的协议语义是 credential exchange，不提供 CHAP 那种 challenge-response。RFC 1334 也明确把 PAP 与 CHAP 作为不同安全性质的认证机制。[S4](#source-s4)
+因此源码阅读重点是 credential 保存位置、pending state 与实际 send call，而不是再次解释 PAP 为什么是 two-way handshake。
 
 ## 8. PAP Ack 最终进入 `auth_withpeer_success()`
 
@@ -225,11 +302,11 @@ auth_pending == 0 ?
 network_phase()
 ```
 
-## 9. CHAP：Challenge → Response → Success/Failure
+## 9. CHAP 标准四类消息怎样进入 `chap_input()` 分发
 
-CHAP 与 PAP 最大差异是 peer 先发 Challenge，本端根据 challenge、identifier、secret 生成 Response，peer 再返回 Success/Failure。[S1](#source-s1)[S5](#source-s5)
+CHAP 的 Challenge/Response/Success/Failure 与 packet format 直接见 RFC 1994；这里仅追 lwIP parser 如何映射这些 Code。[S1](#source-s1)[S5](#source-s5)
 
-当前 `chap_input()` 直接按 code 分发：[S1](#source-s1)
+`chap_input()` 按 Code 分发：[S1](#source-s1)
 
 ```c
 switch (code) {
@@ -246,33 +323,33 @@ case CHAP_FAILURE:
 }
 ```
 
-client 收到 `CHAP_SUCCESS` 后，`chap_handle_status()` 最终调用：[S1](#source-s1)
+client 收到 `CHAP_SUCCESS` 后，`chap_handle_status()` 最终调用：
 
 ```c
 auth_withpeer_success(pcb, PPP_CHAP, pcb->chap_client.digest->code);
 ```
 
-认证失败则进入 `auth_withpeer_fail()`，并最终导致 PPP link 关闭，而不是继续打开 IPCP/IPv6CP。
+认证失败则进入 `auth_withpeer_fail()` 并触发 link close path。Challenge 的 hash 计算属于 CHAP 协议定义，本篇不再展开其算法，只保留 lwIP 从 Code 到 handler 再到 PPP phase 推进的链路。
 
-## 10. Authentication Protocol 是 LCP option，不是“PPP frame type 自己决定”
+## 10. `link_established()` 为什么已经知道该走 PAP 还是 CHAP
 
-PAP/CHAP packet 确实各有 PPP Protocol value，但是否要求某种认证是在 LCP negotiation 中通过 Authentication-Protocol option 达成的。[S3](#source-s3)[S4](#source-s4)[S5](#source-s5)
+RFC 1661/1994 已经规定 authentication protocol 通过 LCP Authentication-Protocol option 协商；lwIP 的实现结果保存在 LCP negotiated options 中。[S1](#source-s1)[S3](#source-s3)[S5](#source-s5)
 
-因此正确顺序是：
+因此源码顺序是：
 
 ```text
-LCP Configure negotiation
+LCP option callbacks
         ↓
-双方确认 authentication option
+negotiated auth flags in go/ho
         ↓
-LCP OPENED
+lcp_up()
         ↓
-AUTHENTICATE phase
+link_established()
         ↓
-PAP / CHAP packet exchange
+upap_auth*() / chap_auth_*() / no-auth
 ```
 
-而不是“先收到 PAP frame，再决定要不要 PAP”。
+PAP/CHAP packet 的 PPP Protocol value 只负责 `ppp_input()` 收包后的 demux；“本次 session 是否要求认证、要求哪一种”在更早的 LCP negotiation 中已经决定。
 
 ## 11. `network_phase()` 不直接配置 IP，而是启动 NCP
 
@@ -338,39 +415,29 @@ static void ipcp_input(ppp_pcb *pcb, u_char *p, int len) {
 
 这和 LCP 的 control-flow skeleton 完全相同：差异主要在各 protocol 的 option callbacks，而不是 FSM engine 本身。
 
-## 13. IPCP 协商 IPv4 network-layer 参数
+## 13. RFC 1332 的 IPCP option 怎样进入 `ipcp.c` callbacks
 
-IPCP 的典型 option 包括 local/remote IPv4 address、VJ compression、DNS server request 等。[S1](#source-s1)[S6](#source-s6)
+IPCP 的 NCP 语义与 Configuration Options 直接见 RFC 1332 §2～§3；这里只追 lwIP 的 implementation mapping。[S1](#source-s1)[S6](#source-s6)
 
-它不处理 serial escaping，也不重新协商 MRU/ACCM——那些属于 LCP。
-
-正常路径：
+当前 `ipcp_fsm` 仍通过 `fsm_open()` / `fsm_input()` 交换 Configure packet；区别在 `ipcp.c` 的 option callbacks 会读取/更新 local/remote IPv4 address、compression 以及 DNS request 等状态。FSM 到达 OPENED 后进入 `ipcp_up()`，再把协商结果写入 netif，并最终调用 `np_up(PPP_IP)`。[S1](#source-s1)
 
 ```mermaid
 flowchart LR
-    A["network_phase()"] --> B["ipcp_open()"]
-    B --> C["fsm_open(ipcp_fsm)"]
-    C --> D["Configure-Request"]
-    D --> E["Ack/Nak/Reject exchange"]
-    E --> F["FSM OPENED"]
-    F --> G["ipcp_up()"]
-    G --> H["sifaddr() / sifup()"]
-    H --> I["np_up(PPP_IP)"]
+    A["ipcp_open()"] --> B["fsm_open(ipcp_fsm)"]
+    B --> C["ipcp option callbacks"]
+    C --> D["FSM OPENED"]
+    D --> E["ipcp_up()"]
+    E --> F["sifaddr() / sifup()"]
+    F --> G["np_up(PPP_IP)"]
 ```
 
-Stage 30 会继续展开 `sifaddr()`、DNS 与 route。
+Stage 30 再继续展开 `sifaddr()`、DNS 与 route，避免在本篇把 IPCP 标准字段表重新复制一遍。
 
-## 14. IPv6CP 不是 DHCPv6，也不分配完整 IPv6 prefix
+## 14. RFC 5072 的 IPv6CP Interface-Identifier 怎样落到 `ipv6cp.c`
 
-`ipv6cp_open()` 同样调用 generic FSM：[S1](#source-s1)
+IPv6CP 的职责、Interface-Identifier option 与 PPP link-local address 形成方式直接见 RFC 5072 §3～§5；本文只看 lwIP 选择了哪些 option。[S1](#source-s1)[S7](#source-s7)
 
-```c
-static void ipv6cp_open(ppp_pcb *pcb) {
-    fsm_open(&pcb->ipv6cp_fsm);
-}
-```
-
-当前 lwIP `ipv6cp_init()` 默认协商 Interface-Identifier：[S1](#source-s1)[S7](#source-s7)
+`ipv6cp_init()` 当前默认启用 Interface-Identifier negotiation：[S1](#source-s1)
 
 ```c
 wo->accept_local = 1;
@@ -378,7 +445,7 @@ wo->neg_ifaceid = 1;
 ao->neg_ifaceid = 1;
 ```
 
-IPv6CP 解决的是 PPP link 上 IPv6 network control，例如 Interface-Identifier。它不是 SLAAC RA，也不是 DHCPv6 server/client。[S7](#source-s7)
+这说明当前 lwIP `ipv6cp.c` 的主协商对象是 PPP link 两端的 IPv6 interface identifier。它与 Ethernet 上的 RA/SLAAC、DHCPv6 是不同实现路径；更完整的协议区别由 RFC 5072 与 Stage 15 承担，本篇不再扩写 IPv6 地址配置教程。
 
 ## 15. `ipv6cp_up()` 先生成 link-local，再 `np_up(PPP_IPV6)`
 
@@ -491,33 +558,26 @@ ppp_recv_config()
 
 这就是为什么 PPP Core 与 PPPoS framing 不能完全割裂：LCP control plane 会配置 link adapter data path。
 
-## 20. 正常协商的完整协议时序
+## 20. 把 RFC phase 映射回 lwIP 的正常成功路径
+
+RFC 1661 已经提供 PPP phase diagram；下面这张图不再表示“PPP 协议教程”，而是把本篇已经读过的 lwIP 函数挂回标准 phase，便于确认源码链没有断点。[S1](#source-s1)[S3](#source-s3)
 
 ```mermaid
-sequenceDiagram
-    participant A as Local PPP
-    participant B as Peer PPP
-    A->>B: LCP Configure-Request
-    B->>A: LCP Configure-Request
-    A-->>B: Configure-Ack/Nak/Reject
-    B-->>A: Configure-Ack/Nak/Reject
-    Note over A,B: LCP reaches OPENED
-    alt authentication negotiated
-        B->>A: PAP/CHAP exchange
-        A-->>B: authentication result
-    end
-    A->>B: IPCP Configure-Request
-    B->>A: IPCP Configure-Request
-    A-->>B: Ack/Nak/Reject
-    B-->>A: Ack/Nak/Reject
-    A->>B: IPv6CP Configure-Request
-    B->>A: IPv6CP Configure-Request
-    A-->>B: Ack/Nak/Reject
-    B-->>A: Ack/Nak/Reject
-    Note over A,B: first NCP up -> PPP_PHASE_RUNNING
+flowchart TD
+    A["ppp_start()"] --> B["ESTABLISH / lcp_open()"]
+    B --> C["lcp_fsm -> OPENED"]
+    C --> D["lcp_up() -> link_established()"]
+    D --> E{"authentication negotiated?"}
+    E -->|yes| F["upap_* / chap_*"]
+    E -->|no| G["network_phase()"]
+    F --> G
+    G --> H["ipcp_open() / ipv6cp_open()"]
+    H --> I["NCP fsm -> OPENED"]
+    I --> J["ipcp_up() / ipv6cp_up()"]
+    J --> K["np_up() -> PPP_PHASE_RUNNING"]
 ```
 
-具体 PAP/CHAP、IPCP、IPv6CP 可以只启用其中一部分；图表示的是当前实现允许形成的组合，而不是每条 PPP link 都必然包含全部协议。[S1](#source-s1)
+PAP、CHAP、IPCP、IPv6CP 是否全部出现由 build config 与 LCP/NCP negotiation 决定；图只表达本篇源码中可能形成的主成功链。
 
 ## 21. 当前 example 的认证能力边界
 
@@ -592,15 +652,15 @@ flowchart TD
 - 类型：IETF 标准规范
 - 版本：RFC 1661，1994
 - URL/文档：[RFC 1661](https://www.rfc-editor.org/rfc/rfc1661.html)
-- 使用位置：“LCP”“PPP phases”“Authentication-Protocol option”“NCP”
+- 使用位置：“建议提前阅读”“LCP”“PPP phases”“Authentication-Protocol option”“NCP”
 - 支撑内容：提供 PPP link establishment、authentication 与 network-layer protocol configuration 的规范语义
 
 <a id="source-s4"></a>
 ### [S4] RFC 1334：PPP Authentication Protocols
 - 类型：IETF 标准规范
-- 版本：RFC 1334，1992
+- 版本：RFC 1334，1992；文档整体已被 RFC 1994 标记为 Obsoleted，本篇仅使用其中 §2 的 PAP 定义
 - URL/文档：[RFC 1334](https://www.rfc-editor.org/rfc/rfc1334.html)
-- 使用位置：“PAP Authenticate-Request/Ack/Nak”“PAP credential exchange”
+- 使用位置：“建议提前阅读”“PAP Authenticate-Request/Ack/Nak”“PAP credential exchange”
 - 支撑内容：提供 PAP 的协议语义，并用于与 CHAP 的 challenge-response 区分
 
 <a id="source-s5"></a>
@@ -608,7 +668,7 @@ flowchart TD
 - 类型：IETF 标准规范
 - 版本：RFC 1994，1996
 - URL/文档：[RFC 1994](https://www.rfc-editor.org/rfc/rfc1994.html)
-- 使用位置：“CHAP Challenge/Response/Success/Failure”
+- 使用位置：“建议提前阅读”“CHAP Challenge/Response/Success/Failure”
 - 支撑内容：提供 CHAP challenge-response authentication 的标准报文与状态语义
 
 <a id="source-s6"></a>
@@ -616,7 +676,7 @@ flowchart TD
 - 类型：IETF 标准规范
 - 版本：RFC 1332，1992
 - URL/文档：[RFC 1332](https://www.rfc-editor.org/rfc/rfc1332.html)
-- 使用位置：“IPCP”“IPv4 address negotiation”“IP-Compression-Protocol”
+- 使用位置：“建议提前阅读”“IPCP”“IPv4 address negotiation”“IP-Compression-Protocol”
 - 支撑内容：提供 IPCP 的 Network Control Protocol 语义，用于对照 lwIP `ipcp.c`
 
 <a id="source-s7"></a>
@@ -624,5 +684,5 @@ flowchart TD
 - 类型：IETF 标准规范
 - 版本：RFC 5072，2007
 - URL/文档：[RFC 5072](https://www.rfc-editor.org/rfc/rfc5072.html)
-- 使用位置：“IPv6CP”“Interface-Identifier”“IPv6 over PPP”
+- 使用位置：“建议提前阅读”“IPv6CP”“Interface-Identifier”“IPv6 over PPP”
 - 支撑内容：提供 IPv6CP 与 IPv6 datagram over PPP 的标准语义，避免把 IPv6CP 与 DHCPv6/SLAAC 混淆

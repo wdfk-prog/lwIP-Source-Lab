@@ -2,41 +2,104 @@
 
 # 教程 23：从 `ethernet_input()` 到 `LWIP_HOOK_VLAN_SET`——802.1Q VLAN Tag、VID/PCP 与硬件 Offload
 
-> 摘要：从 Ethernet RX/TX 真实路径追踪 802.1Q C-Tag、TCI、VID/PCP、VLAN hook、per-PCB hint、MTU 与硬件 VLAN filtering/offload 边界。
+> 摘要：沿 Ethernet RX/TX 真实路径追踪 802.1Q 标签解析、字段映射、VLAN 策略 hook 与软硬件卸载边界。
 
 [TOC]
 
-Stage 19～22 已经把 lwIP 从 checksum、`netif->linkoutput()`、DMA descriptor、PHY 一直追到真实 Ethernet Driver 边界。接下来还缺一个经常直接出现在 MAC/交换机配置里的二层对象：**802.1Q VLAN tag**。
+VLAN（Virtual Local Area Network，虚拟局域网）用于在同一套 Ethernet 基础设施上建立彼此隔离的二层广播域。IEEE 802.1Q 定义了常见的 Customer VLAN Tag（C-Tag）：在线上 Ethernet frame 中插入 4-byte tag，其中 TPID（Tag Protocol Identifier）标识 tag 类型，TCI（Tag Control Information）内部再保存 **VID（VLAN Identifier）**、**PCP（Priority Code Point）**与 **DEI（Drop Eligibility Indicator）**。[S3](#source-s3)[S5](#source-s5)
 
-VLAN 不属于 IP routing，也不是 TCP/UDP 属性。它位于源 MAC 与原始 EtherType 之间，改变的是 Ethernet frame 的二层标识。当前 lwIP upstream 提供的是一个相对克制的模型：`ethernet_input()` 能识别一个 `0x8100` C-Tag，`LWIP_HOOK_VLAN_CHECK` 可以决定 RX 是否接受；发送时 `ethernet_output()` 可以通过 `LWIP_HOOK_VLAN_SET` 或 `LWIP_VLAN_PCP` 插入一个 tag，然后仍然通过同一个 `netif->linkoutput()` 交给 Driver。[S1](#source-s1)
+标题中的 hardware offload（硬件卸载）指 Ethernet MAC（Media Access Control，媒体访问控制）/Driver 代替 lwIP software path 做 VLAN tag insertion、stripping 或 filtering。这里的 hook 是项目可提供的策略扩展点；Port 是把 lwIP 接到具体 OS/Driver/hardware 的平台适配层。lwIP Core 只定义软件解析/构造与 hook 边界，是否由 MAC/DMA（Direct Memory Access，直接内存访问）硬件完成，需要 Port/Driver 单独建立契约。[S1](#source-s1)[S6](#source-s6)
 
-这篇沿真实执行路径回答四个问题：tag 在 `pbuf` 里如何被解析与插入；TCI 的 PCP/DEI/VID 如何进入源码；lwIP 的 VLAN 支持为什么不等于 Linux 风格的 `eth0.10` 虚拟网卡；以及软件 tagging 与 MAC 硬件 VLAN offload 的职责边界。
+## 0. 阅读源码前：建议提前阅读
 
-## 1. 先从线上 frame 看 VLAN 插在哪里
+以下资料用于标准语义和工程扩展，正文仍会完整解释当前源码主线需要的 tag layout、字段和 RX/TX 行为：
 
-普通 Ethernet II frame 的头部是：
+1. [IEEE 802.1Q-2022](https://standards.ieee.org/ieee/802.1Q/10323/)：VLAN 感知网桥、tagging 和优先级/Traffic Class 等标准语义来源。[S3](#source-s3)
+2. [IANA IEEE 802 Numbers](https://www.iana.org/assignments/ieee-802-numbers/ieee-802-numbers.xhtml)：用于核对 `0x8100` Customer VLAN Tag Type 和 `0x88A8` Service VLAN Tag Type 等 EtherType 编号。[S4](#source-s4)
+3. [Cisco — Configuring 802.1Q VLAN Interfaces](https://www.cisco.com/c/en/us/td/docs/iosxr/ncs5000/interfaces/711x/configuration/guide/b-interfaces-hardware-component-cg-ncs5000-711x/configuring-802-vlan-interfaces.html)：作为带 tag/不带 tag frame 与 VLAN interface 的工程视角补充。[S7](#source-s7)
+4. [STM32H7 HAL/LL Driver User Manual](https://www.st.com/resource/en/user_manual/um2217-description-of-stm32h7-hal-and-lowlayer-drivers-stmicroelectronics.pdf)：用于理解真实 MAC hardware 可能提供 VLAN compare、tag insertion/replacement 等能力；本文只把它作为 offload 示例，不把 ST HAL 行为泛化成 lwIP 规范。[S6](#source-s6)
+
+## 1. 先建立 802.1Q tag 的最小协议模型
+
+没有 802.1Q tag 的 Ethernet II frame 头部可以简化成：
 
 ```text
 Destination MAC | Source MAC | EtherType | Payload
       6               6           2
 ```
 
-单个 802.1Q C-Tag 插入后变成：
+插入一个常见 Customer VLAN Tag（C-Tag）后变成：
 
 ```text
-Destination MAC | Source MAC | 0x8100 | TCI | Inner EtherType | Payload
-      6               6          2      2          2
+Destination MAC | Source MAC | TPID 0x8100 | TCI | Inner EtherType | Payload
+      6               6              2         2          2
 ```
 
-IANA 的 EtherType registry 把 `0x8100` 登记为 Customer VLAN Tag Type，也就是 C-Tag；IEEE 802.1Q 是 VLAN bridge/tagging 的标准来源。[S3](#source-s3)[S4](#source-s4)
+因此 tagged frame 比原 frame 多 4 bytes。TPID（Tag Protocol Identifier）告诉 parser“这里有 VLAN tag”；TCI（Tag Control Information）保存 PCP、DEI 和 VID；Inner EtherType 才是后续 IPv4、IPv6、ARP 等真正的上层协议分发表 key。[S3](#source-s3)[S4](#source-s4)
 
-与未打 tag 的 frame 相比，tagged frame 多了 4 bytes：
+TCI 的 16 bit 按当前标准语义划分为：
 
 ```text
-TPID 0x8100 + TCI = 4 bytes
+15            13 12 11                         0
++---------------+--+-----------------------------+
+|      PCP      |DEI|             VID             |
++---------------+--+-----------------------------+
+      3 bit      1 bit          12 bit
 ```
 
-这里必须先消除一个源码命名歧义。lwIP 的数据结构是：
+这里还要提前区分三个容易混淆的机制：
+
+| 机制 | 解决的问题 | lwIP 中对应什么 |
+| --- | --- | --- |
+| VLAN tagging | frame 属于哪个 VLAN、携带什么 PCP/DEI | `ethernet_input()` / `ethernet_output()` 解析或插入 4-byte tag |
+| VLAN filtering | 当前接口/系统是否接受某个 VID | `LWIP_HOOK_VLAN_CHECK` 等 policy hook |
+| logical VLAN interface | 为不同 VLAN 建立独立 IP-layer interface/address/route 视图 | lwIP generic VLAN path 不会自动创建，需要应用/Port 自己建模 |
+
+### 1.1 先看完整 RX/TX 协议动作，再进入函数
+
+RX：
+
+```mermaid
+flowchart LR
+    A["Driver receives tagged Ethernet frame"] --> B["ethernet_input() sees outer 0x8100"]
+    B --> C["read TCI and inner EtherType"]
+    C --> D["optional VLAN policy check"]
+    D --> E["remove Ethernet + VLAN header"]
+    E --> F["dispatch IPv4 / IPv6 / ARP"]
+```
+
+TX：
+
+```mermaid
+flowchart LR
+    A["IPv4/IPv6 output chooses destination MAC"] --> B["ethernet_output()"]
+    B --> C["hook or protocol PCB hint selects TCI"]
+    C --> D["insert 0x8100 + TCI + inner EtherType"]
+    D --> E["netif->linkoutput()"]
+    E --> F["Driver, optional hardware offload"]
+```
+
+协议动作与当前 lwIP 实现的主要映射如下：
+
+| 802.1Q 动作 | lwIP 实现落点 | 关键字段/对象 |
+| --- | --- | --- |
+| 判断 tagged frame | `ethernet_input()` | outer `eth_hdr->type == PP_HTONS(ETHTYPE_VLAN)` |
+| 读取 TCI/VID | `struct eth_vlan_hdr`、`VLAN_ID()` | `prio_vid` |
+| RX policy | `LWIP_HOOK_VLAN_CHECK` / legacy check | VID / `netif` |
+| 恢复真正 L3 协议 | `ethernet_input()` | inner EtherType |
+| TX 决定是否插 tag | `LWIP_HOOK_VLAN_SET` 或 `LWIP_VLAN_PCP` | 16-bit TCI，后者可使用 protocol control block（PCB，协议控制块）的 per-packet hint |
+| 构造 tagged header | `ethernet_output()` | `0x8100` + TCI + inner EtherType |
+| 交给硬件 | `netif->linkoutput()` | Driver-defined contract |
+
+下面开始逐步映射这些字段和分支。
+
+### 1.2 线上字段在后文源码里分别决定什么
+
+前面的 frame layout 已经说明 tag 插入位置。进入源码前只保留一个阅读规则：`eth_hdr->type` 先告诉 `ethernet_input()` 当前是否存在 `0x8100` tag；存在时，后续分发不能继续使用 outer EtherType，而要读取 tag 后面的 inner EtherType。TCI 则独立承担 PCP/DEI/VID，不是另一个 EtherType。[S1](#source-s1)
+
+## 2. 标准字段进入 lwIP 后，对应的是哪些成员
+
+标准 frame layout 不再重画；这里只保留读源码必须知道的实现映射。`src/include/lwip/prot/ethernet.h` 中的结构是：[S1](#source-s1)
 
 ```c
 struct eth_hdr {
@@ -54,81 +117,43 @@ struct eth_vlan_hdr {
 } PACK_STRUCT_STRUCT;
 ```
 
-在当前实现中，外层 `eth_hdr->type` 保存 `0x8100`；`eth_vlan_hdr.prio_vid` 保存 TCI；而 `eth_vlan_hdr.tpid` 实际被用来保存**原始/inner EtherType**。因此这里的字段名 `tpid` 不应按 IEEE wire-format 名称机械理解。[S1](#source-s1)
+当前实现的关键对应关系是：
 
-可以把 lwIP 当前内存视图画成：
+| 线上语义 | lwIP 当前字段/判断 |
+| --- | --- |
+| 外层 TPID `0x8100` | `eth_hdr->type` |
+| TCI | `eth_vlan_hdr.prio_vid` |
+| inner EtherType | `eth_vlan_hdr.tpid` |
+| VID | `VLAN_ID(vlanhdr)` |
+| PCP/DEI/VID 的 TX 组合 | `pcb_tci_set_pcp_dei_vid()` / hook 返回值 |
+
+因此 `eth_vlan_hdr.tpid` 这个成员名不能按线上的“outer TPID”机械理解；在当前 parser/builder 中它保存的是 inner EtherType。[S1](#source-s1)
 
 ```mermaid
 flowchart LR
-    A["eth_hdr.dest"] --> B["eth_hdr.src"]
-    B --> C["eth_hdr.type = 0x8100"]
-    C --> D["vlan.prio_vid = TCI"]
-    D --> E["vlan.tpid = inner EtherType"]
-    E --> F["IPv4 / IPv6 / ARP payload"]
+    A["eth_hdr.type = 0x8100"] --> B["vlan.prio_vid = TCI"]
+    B --> C["vlan.tpid = inner EtherType"]
+    C --> D["IPv4 / IPv6 / ARP 分发"]
 ```
 
-这张图是后面读 `ethernet_input()` 与 `ethernet_output()` 的关键。
+这张图表达的是 **lwIP 内存视图**，不是另一份 802.1Q 协议图。
 
-## 2. TCI 不是一个 VLAN ID：它同时包含 PCP、DEI 与 VID
+## 2.1 `prio_vid` 不能整体当作 VLAN ID
 
-TCI 是 16 bit：
+前面的协议模型已经拆过 TCI 位域。进入源码后真正要记住的是：`eth_vlan_hdr.prio_vid` 保存完整 16-bit TCI，而 VID 只是低 12 bit；因此检查 VLAN membership 时要使用 `VLAN_ID(vlanhdr)`，不能直接把整个 `prio_vid` 当成 VID。[S1](#source-s1)
 
-```text
-15            13 12 11                         0
-+---------------+--+-----------------------------+
-|      PCP      |DEI|             VID             |
-+---------------+--+-----------------------------+
-      3 bit      1 bit          12 bit
-```
+标准可用于普通 VLAN 标识的 VID 范围是 1～4094；VID 0 具有 priority-tagged 语义，4095 保留。[S5](#source-s5) 当前 `LWIP_HOOK_VLAN_SET` 返回 16-bit TCI 后，lwIP 会按值写入 header，并不会替项目验证该值是否符合业务 VLAN 规划。
 
-三个字段职责不同：
+## 3. `CFI` 与 `DEI`：只解释源码里的命名差异
 
-| 字段 | 位宽 | 作用 |
-| --- | ---: | --- |
-| PCP | 3 bit | Priority Code Point，用于二层优先级/QoS 分类 |
-| DEI | 1 bit | Drop Eligibility Indicator，表示拥塞时的丢弃倾向 |
-| VID | 12 bit | VLAN Identifier |
-
-RFC 9892 直接引用 IEEE 802.1Q 语义，确认 PCP 为 3 bit、VID 为 12 bit；RFC 4363 则把可用于标识具体 VLAN 的 VID 范围写成 1～4094。[S5](#source-s5)
-
-因此 `0` 与 `4095` 不能按普通 VLAN ID 使用：
-
-```text
-VID 1..4094 : 普通 VLAN identifier
-VID 0       : 不代表一个普通 VLAN；常用于 priority-tagged 语义
-VID 4095    : reserved，不是普通 VLAN identifier
-```
-
-当前 lwIP 本身不会在 `LWIP_HOOK_VLAN_SET` 返回后验证“这个 VID 是否具有标准业务语义”。`ethernet_output()` 只要求返回值在 `0..0xffff`，然后原样写进 `prio_vid`。[S1](#source-s1)
-
-所以：
-
-> hook 能写入 16-bit TCI，不等于所有 16-bit 值都代表一个合法业务 VLAN 配置。
-
-## 3. `CFI` 与 `DEI`：当前源码里能看到历史术语残留
-
-`src/include/lwip/opt.h` 对 `LWIP_VLAN_PCP` 的说明仍写着：
-
-```text
-VID / CFI / PCP
-```
-
-但当前 `src/include/lwip/ip.h` 提供的实际宏已经叫。下面继续阅读 `pcb_tci_set_pcp_dei_vid()` 宏：
+当前 `src/include/lwip/opt.h` 的 `LWIP_VLAN_PCP` 注释还能看到旧术语 `CFI`，但 `src/include/lwip/ip.h` 的实际 helper 已使用 `dei`。继续阅读 `pcb_tci_set_pcp_dei_vid()` 这个宏定义：[S1](#source-s1)
 
 ```c
 #define pcb_tci_set_pcp_dei_vid(pcb, pcp, dei, vid) \
   pcb_tci_set(pcb, (((pcp) & 7) << 13) | (((dei) & 1) << 12) | ((vid) & 0xFFF))
 ```
 
-也就是说，当前代码接口使用的是 `dei`。IEEE 802.1Q-2011 起，C-Tag 中位于 PCP 与 VID 之间的这一 bit 已从旧称 CFI 转为 DEI；RFC 7780 也明确记录了这个术语变化。[S1](#source-s1)[S5](#source-s5)
-
-阅读当前代码时应以：
-
-```text
-PCP | DEI | VID
-```
-
-作为 TCI 的现代语义，而不要因为 `opt.h` 某段旧注释仍写 CFI 就把当前标准语义倒退回旧名称。
+802.1Q-2011 之后该位采用 DEI（Drop Eligibility Indicator）语义；RFC 7780 对 CFI → DEI 的历史变化有公开说明。[S5](#source-s5) 本文后续统一按 `PCP | DEI | VID` 阅读当前 lwIP 代码，不再展开字段标准史。
 
 ## 4. 当前 example 默认没有打开 VLAN
 
@@ -948,7 +973,7 @@ TX：
 ```mermaid
 flowchart TD
     A["IPv4 output + ARP resolved MAC"] --> B["ethernet_output()"]
-    B --> C["hook or PCB hint selects TCI"]
+    B --> C["hook or protocol PCB hint selects TCI"]
     C --> D["reserve 18-byte L2 header"]
     D --> E["outer type = 0x8100"]
     E --> F["TCI + inner type = 0x0800"]
@@ -1044,16 +1069,16 @@ Stage 23 的核心结论可以压缩成四条：
 - 类型：标准规范
 - 版本：IEEE 802.1Q-2022，Active Standard
 - URL/文档：[IEEE 802.1Q-2022](https://standards.ieee.org/ieee/802.1Q/10323/)
-- 使用位置：“802.1Q 所在协议层”“VLAN bridge/tagging 的规范来源”“TCI 现代语义”
-- 支撑内容：确认 IEEE 802.1Q 是 VLAN/Bridged Networks 的现行标准来源
+- 使用位置：“建议提前阅读”“VLAN/Bridged Networks 标准边界”“TCI 现代语义”
+- 支撑内容：作为 802.1Q 的标准来源，用于核对 VLAN tagging、TCI 与 bridge 语义；正文仍独立建立当前源码主线需要的协议模型
 
 <a id="source-s4"></a>
 ### [S4] IANA IEEE 802 Ethertype registry
 - 类型：权威编号注册表
-- 版本：IANA IEEE 802 Numbers，访问日期 2026-10-02
+- 版本：IANA IEEE 802 Numbers，访问日期 2026-10-03
 - URL/文档：[IANA IEEE 802 Numbers](https://www.iana.org/assignments/ieee-802-numbers/ieee-802-numbers.xhtml)
-- 使用位置：“0x8100 C-Tag”“0x88A8 S-Tag”“QinQ 边界”
-- 支撑内容：确认 `0x8100` 为 Customer VLAN Tag Type，`0x88A8` 为 IEEE 802.1Q Service VLAN tag identifier
+- 使用位置：“802.1Q 前置阅读”“0x8100 C-Tag”“0x88A8 S-Tag”“QinQ 边界”
+- 支撑内容：提供 EtherType 编号的权威注册信息
 
 <a id="source-s5"></a>
 ### [S5] IETF 对 802.1Q 字段的可追溯说明
@@ -1070,3 +1095,11 @@ Stage 23 的核心结论可以压缩成四条：
 - URL/文档：[STM32H7 HAL/LL Driver User Manual](https://www.st.com/resource/en/user_manual/um2217-description-of-stm32h7-hal-and-lowlayer-drivers-stmicroelectronics.pdf)
 - 使用位置：“硬件 VLAN filtering”“TX VLAN configuration/identifier”“software 与 hardware offload 边界”
 - 支撑内容：提供一个具体 MAC/Driver 实例，证明真实 Ethernet hardware 可在 RX/TX 路径承担 VLAN filtering/tag configuration，而这些能力不属于 lwIP Core 自动行为
+
+<a id="source-s7"></a>
+### [S7] Cisco 802.1Q VLAN Interfaces
+- 类型：厂商官方网络技术文档
+- 版本：Cisco IOS XR NCS 5000 Series 7.11.x 文档，访问日期 2026-10-03
+- URL/文档：[Configuring 802.1Q VLAN Interfaces](https://www.cisco.com/c/en/us/td/docs/iosxr/ncs5000/interfaces/711x/configuration/guide/b-interfaces-hardware-component-cg-ncs5000-711x/configuring-802-vlan-interfaces.html)
+- 使用位置：“建议提前阅读”“tagged/untagged 与 logical VLAN interface 边界”
+- 支撑内容：作为工程视角补充，用于交叉核对 tagged frame、VLAN interface 与 trunk/access 类概念；正文仍独立解释当前源码所需的 tag layout

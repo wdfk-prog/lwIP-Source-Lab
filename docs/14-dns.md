@@ -6,31 +6,75 @@
 
 [TOC]
 
-Stage 13 已经解释 DHCPACK 怎样把 IPv4、netmask、gateway 写进 `netif`，并且出现了一个后续交叉点：DHCP Option 6 可以把 DNS Server 地址交给 lwIP resolver。Stage 5 又已经建立 `udp_new()`、`udp_bind()`、`udp_recv()` 与 `udp_input()` 的 Raw UDP 模型；Stage 11 则解释 `tcpip_thread`、mailbox 与 software timeout。
+DNS（Domain Name System，域名系统）把人类可读的 hostname 映射为 Resource Record（资源记录）等结构化数据。当前 lwIP 实现的是 **stub resolver**：应用把 hostname 交给 lwIP，lwIP 向已经配置好的 DNS Server 发送 Query；这个 DNS Server 通常是 recursive resolver（递归解析器），它可以代表 Client 继续访问 root、TLD（Top-Level Domain，顶级域）与 authoritative server（权威服务器），而 lwIP 本身并不实现那条递归/迭代查询链。[S11](#source-s11)[S12](#source-s12)
 
-DNS 正好把这些机制组合起来：[S1](#source-s1)[S2](#source-s2)[S3](#source-s3)
+本篇只追踪普通 unicast DNS 查询。当前实验通过 UDP 发送 DNS message，Server 使用目标端口 53；请求使用 TXID（Transaction ID，事务标识符）与响应关联。Question 中的 QNAME 表示要查询的域名，QTYPE 表示记录类型，本文主线使用 A Record 查询 IPv4 地址，lwIP 也支持 AAAA Record 查询 IPv6 地址；Response 的 Answer 中携带 Resource Record 和 DNS TTL（缓存生存时间）。这里的 DNS TTL 与 IPv4 Header 的 TTL 不是同一个字段。[S7](#source-s7)[S8](#source-s8)[S13](#source-s13)
 
-```text
-DHCPACK
-  -> dns_setserver()
-  -> dns_servers[]
+## 0. 阅读源码前：先建立 DNS resolver 协议模型
 
-应用请求 hostname
-  -> dns_gethostbyname()
-  -> cache hit: 同步返回
-  -> cache miss: 创建异步 DNS Query
-  -> UDP PCB / port
-  -> DNS Server:53
-  -> UDP response
-  -> udp_input() 匹配 PCB
-  -> dns_recv()
-  -> cache
-  -> dns_found() callback
+### 0.1 建议提前阅读
+
+1. [Cloudflare Learning Center — What is DNS?](https://www.cloudflare.com/learning/dns/what-is-dns/)
+   - 用途：建立 Client、recursive resolver、root/TLD/authoritative server 与缓存的整体关系。[S11](#source-s11)
+2. [RFC 1034 — Domain Names: Concepts and Facilities](https://www.rfc-editor.org/rfc/rfc1034.html)
+   - 用途：核对 namespace、resolver、name server 与 Resource Record 的概念边界。[S12](#source-s12)
+3. [RFC 1035 — Domain Names: Implementation and Specification](https://www.rfc-editor.org/rfc/rfc1035.html)
+   - 用途：核对 DNS Header、Question/Answer、QNAME、QTYPE、Flags、TTL 与 wire format。[S7](#source-s7)
+4. [RFC 5452 — Measures for Making DNS More Resilient against Forged Answers](https://www.rfc-editor.org/rfc/rfc5452.html)
+   - 用途：理解随机 TXID、随机 UDP source port 与 Response matching 为什么是 resolver 的安全边界。[S8](#source-s8)
+
+这些资料用于权威核对和继续深入；不打开外链也不影响下面理解当前 DNS Query/Response 与 lwIP 源码链。
+
+### 0.2 一份 DNS Query/Response 最少要认识哪些字段
+
+DNS message 由 Header 和若干 section 组成。本文只需要当前路径真正读取或构造的字段；A Record 的基础格式来自 RFC 1035，AAAA Record 的 IPv6 扩展由 RFC 3596 定义：[S7](#source-s7)[S13](#source-s13)
+
+| 对象 | 当前含义 | 本文中的源码作用 |
+| --- | --- | --- |
+| TXID | 16-bit transaction identifier | `dns_send()` 写入 Query，`dns_recv()` 用于定位当前 resolver entry |
+| QR flag | Query/Response 标志 | `0` 表示 Query，`1` 表示 Response |
+| RD flag | Recursion Desired | Client 请求 DNS Server 代表自己继续递归解析 |
+| QNAME | 查询名称的 label 编码 | `3com.com` 在线上不是带点字符串，而是按 label 长度编码 |
+| QTYPE | 要查询的 Resource Record 类型 | `A` 查询 IPv4，`AAAA` 查询 IPv6 |
+| QCLASS | 记录类别 | 本文使用 `IN`（Internet）class |
+| Answer TTL | 该 Resource Record 可缓存多久 | lwIP 转换为 `dns_table[]` 的 cache 生命周期 |
+| RDATA | Answer 的实际记录数据 | A Record 中最终解析为 IPv4 address |
+
+Cache hit 与 cache miss 也必须先区分：如果 `dns_table[]` 已有仍有效的结果，`dns_gethostbyname()` 可以同步返回；cache miss 才创建异步 Query，未来由 `dns_recv()` 解析 Response 并调用 application callback。[S2](#source-s2)
+
+### 0.3 一次 cache miss 的协议总流程
+
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant R as lwIP stub resolver
+    participant S as Configured DNS Server UDP 53
+
+    A->>R: dns_gethostbyname(hostname)
+    R->>S: DNS Query with TXID and QNAME
+    S-->>R: DNS Response with same TXID and Answer
+    Note over R: Validate response and update dns_table cache
+    R-->>A: dns_found(name and resolved address)
 ```
 
-本篇只沿普通 unicast DNS client 主线展开，不把 mDNS、DNSSEC、DoT/DoH、完整递归 DNS Server 算法混进来。当前系列使用的 upstream revision 仍为 `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
+DNS Server 地址并不是凭空出现。当前 Host 实验中，Stage 13 的 DHCPACK Option 6 调用 `dns_setserver()`，把 Server 地址写入 `dns_servers[]`；Stage 14 再从这个配置继续完成 Query。[S5](#source-s5)[S9](#source-s9)
 
-源码块若从函数中部截取，会在代码块前明确写出所属函数；执行路径阅读版只删除与当前主线无关的条件编译/旁支，不使用 `...` 伪装缺失源码。
+### 0.4 协议动作怎样映射到 lwIP resolver
+
+UDP PCB（Protocol Control Block，协议控制块）保存 resolver 使用的本地 UDP port、地址绑定和 receive callback；随机 source port 模式下，cache miss 时会按需创建这样的 PCB。
+
+| 协议/生命周期阶段 | lwIP 入口 | 关键对象 | 下一步 |
+| --- | --- | --- | --- |
+| DNS Server 配置 | `dhcp_handle_ack()` → `dns_setserver()` | `dns_servers[]` | resolver 获得目标 Server |
+| 应用查询 | `dns_gethostbyname()` | hostname、callback | cache hit 同步返回或进入 enqueue |
+| 建立异步 transaction | `dns_enqueue()` / `dns_check_entry()` | `dns_table[]`、request callback | 分配 TXID 并发送 Query |
+| 构造 Query | `dns_send()` | DNS Header、QNAME、QTYPE、UDP PCB | `udp_sendto()` 到 Server:53 |
+| 接收 Response | `udp_input()` → `dns_recv()` | TXID、source endpoint、flags、Answer | 校验并解析 Resource Record |
+| 更新缓存 | `dns_correct_response()` | address、TTL、entry state | cache 可供后续同步命中 |
+| 返回应用 | `dns_call_found()` | callback / callback_arg | `dns_found()` |
+| retry 与过期 | `dns_tmr()` | retry counter / cache TTL | 重发、失败 callback 或删除 cache |
+
+下面进入 Source-driven 主线后，将沿真实调用顺序继续追踪这些阶段，而不是再单独另写一份“DNS 协议篇”。
 
 ## 1. 真实应用入口：`apps_init()` 先注册 5 秒 timeout，而不是立即查询 DNS
 
@@ -492,55 +536,11 @@ if (p != NULL) {
   pbuf_take(p, &hdr, SIZEOF_DNS_HDR);
 ```
 
-这里首次出现：
+`DNS_FLAG1_RD` 对应 RFC 1035 的 **Recursion Desired** bit。`RD=1` 表示 stub resolver 请求当前 DNS Server 代表 Client 继续完成递归解析；它并不表示 lwIP 自己去访问 root/TLD/authoritative server。[S7](#source-s7) 本次 Frame 5 的 Flags 实测为 `0x0100`，其中 `QR=0`、`RD=1`，与 `hdr.flags1 = DNS_FLAG1_RD` 直接对应。[S9](#source-s9)
 
-```c
-DNS_FLAG1_RD
-```
+### 11.1 当前 lwIP 实现的是 stub resolver，而不是 recursive resolver
 
-`RD` 是 **Recursion Desired**，中文可以直接理解为：
-
-> **希望 DNS Server 帮客户端执行递归查询。**
-
-RFC 1035 对 RD 的语义是：Query 中设置该 bit 后，告诉 name server，如果它支持递归服务，希望它继续把问题追查到最终答案，而不是只返回“下一步应该去问谁”的 referral。[S7](#source-s7)
-
-本次 Frame 5 的 DNS Flags 实测为 `0x0100`：`QR=0` 表示 Query，`RD=1`，其余 response-only 标志位未设置。这与 `hdr.flags1 = DNS_FLAG1_RD` 直接对应。[S9](#source-s9)
-
-### 11.1 当前 lwIP 是“存根解析器（stub resolver）”
-
-`stub resolver` 建议直接翻译成：
-
-> **存根解析器 / 轻量 DNS 客户端解析器。**
-
-它当前做的事情是：
-
-```text
-应用：请解析 3com.com
-    ↓
-lwIP resolver：构造 Query，RD=1
-    ↓
-已经配置好的 DNS Server
-    ↓
-DNS Server 负责继续完成递归解析
-    ↓
-返回最终 A/AAAA answer
-```
-
-它不会自己在 lwIP 内部实现下面整条递归链：
-
-```text
-Root DNS
-  -> .com DNS
-  -> 3com.com authoritative DNS
-```
-
-因此原文中如果只写：
-
-```text
-current client is stub resolver
-```
-
-对初学者是不够的。真正需要记住的是：**lwIP 只把问题交给配置好的 resolver server，而不是自己实现完整 recursive resolver。**[S2](#source-s2)[S7](#source-s7)
+Cloudflare 与 RFC 1034 已经把 recursive resolver、root/TLD/authoritative server 的关系讲清楚，本篇不再复述那条通用解析链。[S11](#source-s11)[S12](#source-s12) 对当前源码只需要建立一条实现边界：`dns.c` 把 Query 发给 `dns_servers[]` 中已经配置好的 resolver server，并等待最终 Response；它本身没有实现从 root 到 authoritative server 的递归/迭代解析过程。[S2](#source-s2)
 
 ## 12. `3com.com` 在线上不是普通带点字符串：QNAME 使用 label 编码
 
@@ -569,33 +569,7 @@ pbuf_put_at(p, query_idx, 0);
 query_idx++;
 ```
 
-RFC 1035 的 DNS name wire format 使用：
-
-```text
-label length + label bytes
-```
-
-所以：
-
-```text
-3com.com
-```
-
-在线上概念上是：
-
-```text
-04 '3' 'c' 'o' 'm' 03 'c' 'o' 'm' 00
-```
-
-而不是把 ASCII：
-
-```text
-'3' 'c' 'o' 'm' '.' 'c' 'o' 'm'
-```
-
-原样发出去。[S7](#source-s7)
-
-Frame 5 的 DNS payload 中可以直接找到同一段真实字节：[S9](#source-s9)
+QNAME 不是把 `3com.com` 这串文本原样写进报文，而是按 label 编码：每个 label 前先写一个长度 byte，最后用 `0` 结束。因此 `3com.com` 对应“长度 4 + `3com` + 长度 3 + `com` + 结束 0”。`dns_send()` 的循环正是在构造这一格式。[S7](#source-s7) Frame 5 的 DNS payload 中可以直接找到：[S9](#source-s9)
 
 ```text
 04 33 63 6f 6d 03 63 6f 6d 00
@@ -617,16 +591,7 @@ qry.cls = PP_HTONS(DNS_RRCLASS_IN);
 pbuf_take_at(p, &qry, SIZEOF_DNS_QUERY, query_idx);
 ```
 
-本篇主要实验是 IPv4，因此通常看到：
-
-```text
-QTYPE  = A
-QCLASS = IN
-```
-
-如果 request address type 选择 IPv6，则 Query Type 改为 AAAA。
-
-本次 Frame 5 的 Question 区实测 `QTYPE=0x0001`、`QCLASS=0x0001`，即 `A / IN`，与当前 IPv4 查询路径完全一致。[S9](#source-s9)
+QTYPE 决定希望得到哪一种 Resource Record：`A` 返回 IPv4 address，`AAAA` 返回 IPv6 address；QCLASS=`IN` 表示 Internet class。[S7](#source-s7)[S13](#source-s13) 当前代码分支因此在 IPv4 request 写 `DNS_RRTYPE_A`，IPv6 request 写 `DNS_RRTYPE_AAAA`。本次 Frame 5 的 Question 区实测 `QTYPE=0x0001`、`QCLASS=0x0001`，即 `A / IN`，与当前 IPv4 路径一致。[S9](#source-s9)
 
 ## 14. `dns_send()` 最终只是把 DNS Payload 交给 UDP，目的端口固定 53
 
@@ -1379,8 +1344,8 @@ Stage 14 resolver state/cache/callback
 - 类型：Internet Standard
 - 版本：RFC 1035，1987-11
 - URL/文档：[RFC 1035](https://www.rfc-editor.org/rfc/rfc1035.html)
-- 使用位置：QNAME label、RD、Resource Record TTL、A/AAAA Query 基本语义
-- 支撑内容：DNS wire format、Recursion Desired 与 DNS cache TTL 的标准定义
+- 使用位置：QNAME label、RD、Resource Record TTL、A Query 基本语义
+- 支撑内容：DNS wire format、Recursion Desired、A Record 与 DNS cache TTL 的标准定义
 
 <a id="source-s8"></a>
 ### [S8] RFC 5452 — Measures for Making DNS More Resilient against Forged Answers
@@ -1406,3 +1371,29 @@ Stage 14 resolver state/cache/callback
 - URL/文档：[dnsmasq man page](https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html)
 - 使用位置：Host DHCP+DNS 实验中的 `--interface`、`--bind-interfaces`、`--listen-address`、`--dhcp-option` 与 `--address`
 - 支撑内容：说明实验 dnsmasq 如何约束监听接口并同时提供 DHCP/DNS 配置
+
+
+<a id="source-s11"></a>
+### [S11] Cloudflare Learning Center — DNS 整体工作模型
+- 类型：高质量公开学习资料
+- 版本：在线资料，访问日期 2026-10-02
+- URL/文档：[What is DNS?](https://www.cloudflare.com/learning/dns/what-is-dns/)
+- 使用位置：文章开头的 DNS 前置阅读、stub resolver 与 recursive/authoritative 角色边界
+- 支撑内容：DNS client、recursive resolver、root/TLD/authoritative server、缓存与一次典型 DNS lookup 的整体心智模型。
+
+<a id="source-s12"></a>
+### [S12] RFC 1034 — Domain Names: Concepts and Facilities
+- 类型：Internet Standard 基础规范
+- 版本：RFC 1034，1987-11
+- URL/文档：[RFC 1034](https://www.rfc-editor.org/rfc/rfc1034.html)
+- 使用位置：文章开头的 DNS 前置阅读、resolver/name server 概念边界
+- 支撑内容：DNS namespace、resolver、name server、resource record 与查询体系的概念模型；具体 wire format 继续由 RFC 1035 支撑。
+
+
+<a id="source-s13"></a>
+### [S13] RFC 3596 — DNS Extensions to Support IP Version 6
+- 类型：IETF Standards Track
+- 版本：RFC 3596，2003-10
+- URL/文档：[RFC 3596](https://www.rfc-editor.org/rfc/rfc3596.html)
+- 使用位置：协议基线、QTYPE A/AAAA 对照
+- 支撑内容：AAAA Resource Record 与 IPv6 address query 的标准定义；A Record 仍由 RFC 1035 支撑。

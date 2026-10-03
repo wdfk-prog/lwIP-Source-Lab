@@ -2,104 +2,147 @@
 
 # 教程 22：从 PHY Auto-Negotiation 到 `netif_set_link_up()`——Link Up/Down、MAC 速率与协议栈恢复
 
-> 摘要：从 PHY 链路检测与自动协商进入 lwIP link state，区分 admin up 与 physical link，并追踪 MAC speed/duplex、DHCP、ND6 与组播报告恢复。
+> 摘要：建立 Ethernet PHY link lifecycle，解释 Auto-Negotiation、MAC speed/duplex、admin/link 状态与 lwIP link-up/down 恢复链。
 
 [TOC]
 
-Stage 21 已经建立 DMA ring 的运行模型，但 descriptor ring 能正常工作还有一个更底层前提：**PHY 真的已经建立链路，而且 MAC 的 speed/duplex 配置与 PHY 协商结果一致。**
+Stage 21 已经把 descriptor ring、completion 和 backpressure 串成了一个稳定的数据面模型，但 DMA 能不能真正发送/接收还有一个更底层前提：**PHY 已经建立物理链路，而且 MAC 的速率与双工模式和 PHY 的协商结果一致。**
 
-这篇不把 PHY 当作“网线插上就是 up”的黑盒，而是沿一条真实链路走完：PHY 通过 MDIO 报告 link/auto-negotiation 结果，Driver 配置 MAC，然后调用 lwIP 的 `netif_set_link_up()` / `netif_set_link_down()`；Core 再据此触发 DHCP、AutoIP、ARP/IGMP/MLD、ND6 与 link callback。[S1](#source-s1)[S3](#source-s3)
+PHY（Physical Layer Transceiver，物理层收发器）负责把 MAC（Media Access Control，媒体访问控制）产生的数字链路数据转换成双绞线上的物理信号，并检测对端是否存在。Auto-Negotiation（自动协商）是 Ethernet PHY 之间交换能力并选择共同工作模式的机制；这里的 speed 指链路速率（本文关注 10/100 Mbit/s），duplex 指半双工或全双工工作方式。协商完成后，Driver 需要读回 resolved speed/duplex，配置 MAC，然后才应该把“link 可用”这一事实通知 lwIP。[S3](#source-s3)[S4](#source-s4)
 
-## 1. 先消歧：`NETIF_FLAG_UP` 和 `NETIF_FLAG_LINK_UP` 不是同一件事
+## 阅读前建议：先把 PHY、Auto-Negotiation 与 link state 建立起来
 
-`src/include/lwip/netif.h` 同时定义了 administrative state 与 physical/link state。[S1](#source-s1)
+1. [LAN8742A/LAN8742Ai Datasheet](https://ww1.microchip.com/downloads/aemDocuments/documents/OTH/ProductDocuments/DataSheets/DS_LAN8742_00001989A.pdf) §3.2：重点看 Auto-Negotiation、Link Status、Auto-Negotiation Complete 以及协商后 speed/duplex 的读回方式。[S4](#source-s4)
+2. [Microchip Ethernet Link Testing Techniques](https://onlinedocs.microchip.com/oxy/GUID-E4098E15-180F-4086-BC4A-070E637A8B56-en-US-1/GUID-B7445640-86EE-4040-90AD-EAA07D5D8F90.html)：用于建立 cable/link、Auto-Negotiation 和寄存器检查的工程心智模型。[S5](#source-s5)
+3. [lwIP `netif` API and source](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core)：用于对照 `netif_set_up/down()` 与 `netif_set_link_up/down()` 的不同语义。[S1](#source-s1)
+
+正文不会把这些资料当作必读前置。下面先从系统边界开始，把“PHY 发生了什么、Driver 做什么、lwIP 又做什么”连成一条完整控制流。
+
+## 1. 先看系统位置：PHY、MAC、Driver、lwIP 是四个层次
+
+在典型 MCU Ethernet 系统中，PHY 和 MAC 之间通常通过 MII/RMII 一类数据接口交换 Ethernet symbol/frame 数据；CPU/Driver 通过 MDIO/MDC（也常称 SMI management interface）读写 PHY 管理寄存器。lwIP 并不直接操作 PHY 寄存器，它只接收 Port/Driver 汇报的 link state。[S3](#source-s3)[S4](#source-s4)
+
+```mermaid
+flowchart LR
+    A["lwIP netif"] --> B["Ethernet Port / Driver"]
+    B --> C["MAC + DMA"]
+    C <-->|"MII/RMII data"| D["PHY"]
+    B <-->|"MDIO/MDC management"| D
+    D <-->|"copper link"| E["Link Partner PHY"]
+```
+
+四层职责可以这样划分：
+
+| 层次 | 主要职责 |
+| --- | --- |
+| PHY | 信号检测、Auto-Negotiation、link status、resolved speed/duplex |
+| MAC/DMA | 按当前 speed/duplex 发送/接收 frame，管理 descriptor/ring |
+| Driver/Port | 读取 PHY、配置 MAC、选择 polling/interrupt policy、通知 lwIP |
+| lwIP `netif` | 保存软件接口和 link 状态，触发 DHCP/AutoIP/ND6/report/callback 等协议层动作 |
+
+这张表也是 Stage 22 与 Stage 44 的边界：本篇解释通用 lifecycle；Stage 44 再追 STM32H750/RT-Thread 具体线程、PHY driver 和 DHCP 恢复调用链。
+
+## 2. Auto-Negotiation 解决的是“双方怎样选出共同链路模式”
+
+Link partner 指网线另一端的 PHY，例如交换机端口 PHY。双方并不知道对端支持什么能力，所以 PHY 可以通过 Auto-Negotiation 交换能力广告，并选择双方共同支持的工作模式。以 LAN8742A 为例，协商属于 PHY 层活动，独立于 MAC 控制器；协商结果可以通过管理寄存器读回。[S4](#source-s4)
+
+对 10/100 Ethernet，最常见的结果维度是：
+
+- 10 Mbit/s 或 100 Mbit/s；
+- half-duplex（半双工）或 full-duplex（全双工）。
+
+Full-duplex 表示发送和接收可以同时进行；half-duplex 受共享介质/冲突模型约束。Driver 不能凭经验跳过 resolved result，而应以目标 PHY/链路实际状态为准。[S4](#source-s4)
+
+```mermaid
+sequenceDiagram
+    participant P1 as Local PHY
+    participant P2 as Link Partner PHY
+    participant D as Driver
+
+    P1->>P2: advertise supported modes
+    P2->>P1: advertise supported modes
+    Note over P1,P2: Auto-Negotiation selects common mode
+    P1-->>D: link up + resolved speed/duplex via MDIO/SMI
+```
+
+这条过程发生在 PHY 内部，不是 lwIP 状态机。
+
+## 3. “Link Up” 不应该早于 MAC 配置完成
+
+PHY 报告 link up 并不意味着上层立即可以安全发送。Driver 还需要把 resolved speed/duplex 配置到 MAC，使 MAC 时序与 PHY 当前模式一致；必要时还要启动/恢复 DMA 和 MAC TX/RX。[S3](#source-s3)
+
+因此一个稳定的通用顺序是：
+
+```mermaid
+flowchart TD
+    A["PHY detects partner / cable"] --> B["Auto-Negotiation completes"]
+    B --> C["Driver reads resolved speed / duplex"]
+    C --> D["Configure MAC"]
+    D --> E["Start/enable MAC + DMA data path"]
+    E --> F["notify lwIP: netif_set_link_up()"]
+```
+
+反过来，link down 时 Driver 也必须考虑停止/保护数据面、清理 pending DMA ownership 或让等待者退出；这些硬件操作并不是 `netif_set_link_down()` 自动完成的。Stage 21 的 descriptor lifecycle 在这里与 link lifecycle 汇合。
+
+## 4. `NETIF_FLAG_UP` 与 `NETIF_FLAG_LINK_UP` 是两个正交状态
+
+lwIP 在 `struct netif` 中区分 administrative state 与 physical/link state。[S1](#source-s1)
 
 ```c
 #define NETIF_FLAG_UP           0x01U
 #define NETIF_FLAG_LINK_UP      0x04U
 ```
 
-对应查询宏也是两个：
+二者含义不同：
 
-```c
-#define netif_is_up(netif) \
-  (((netif)->flags & NETIF_FLAG_UP) ? (u8_t)1 : (u8_t)0)
-#define netif_is_link_up(netif) \
-  (((netif)->flags & NETIF_FLAG_LINK_UP) ? (u8_t)1 : (u8_t)0)
-```
-
-二者回答的问题不同：
-
-| 状态 | 问题 |
+| 状态 | 回答的问题 |
 | --- | --- |
 | `NETIF_FLAG_UP` | 软件上是否允许这个 netif 参与协议处理 |
-| `NETIF_FLAG_LINK_UP` | Driver 判断物理链路是否可用 |
+| `NETIF_FLAG_LINK_UP` | Driver 是否认为底层 link 当前可用 |
 
-因此：
+所以这四种组合都具有清晰语义：
+
+| Admin | Link | 含义 |
+| --- | --- | --- |
+| down | down | 接口停用且物理 link 不可用 |
+| up | down | 软件接口启用，但网线/PHY 当前没有有效物理链路 |
+| down | up | 物理链路存在，但软件接口被管理性关闭 |
+| up | up | 软件与物理条件都允许正常协议活动 |
+
+这一步非常重要，因为很多“网线插了但 DHCP 不工作”“接口 up 但发不出去”的问题，本质上是把两个 flag 当成了同一个状态。
+
+## 5. `netif_set_up/down()` 管软件状态，`netif_set_link_up/down()` 管链路状态
+
+`netif_set_up()` 设置的是 `NETIF_FLAG_UP`；`netif_set_down()` 清除它，并执行 ARP/ND6 等更重的软件状态清理。[S1](#source-s1)
+
+`netif_set_link_up()` / `netif_set_link_down()` 则用于 Driver 汇报物理链路事件。上游源码的函数注释也直接写明：它们由 Driver 在 link goes up/down 时调用。[S1](#source-s1)
+
+这意味着下面两种调用不能互相替代：
 
 ```text
-netif up + link down
+netif_set_up()
+≠ “网线插上”
+
+netif_set_link_up()
+≠ “把接口软件启用”
 ```
 
-是合法状态，表示接口在软件上启用，但网线/PHY 当前没有 carrier；而：
+某个 Port 可以在 link event 中同时修改 admin state，这是平台 policy；但不能把这种具体实现策略泛化成 lwIP Core 规定。
 
-```text
-netif down + link up
-```
+## 6. Link-up 在 lwIP 里是一个协议恢复触发点
 
-也可能短暂存在，表示物理 carrier 存在，但软件管理状态关闭。
-
-## 2. `netif_set_up()` 是 administrative transition，不等于“网线接通”
-
-进入 `netif_set_up()`：[S1](#source-s1)
-
-```c
-void
-netif_set_up(struct netif *netif)
-{
-  LWIP_ASSERT_CORE_LOCKED();
-
-  LWIP_ERROR("netif_set_up: invalid netif", netif != NULL, return);
-
-  if (!(netif->flags & NETIF_FLAG_UP)) {
-    netif_set_flags(netif, NETIF_FLAG_UP);
-
-    MIB2_COPY_SYSUPTIME_TO(&netif->ts);
-
-    NETIF_STATUS_CALLBACK(netif);
-
-    netif_issue_reports(netif,
-                        NETIF_REPORT_TYPE_IPV4 | NETIF_REPORT_TYPE_IPV6);
-#if LWIP_IPV6
-    nd6_restart_netif(netif);
-#endif
-  }
-}
-```
-
-这里设置的是 `NETIF_FLAG_UP`。随后 `netif_issue_reports()` 还会再检查 **link 与 admin 是否都 up**，只有两者同时满足才真的发送 gratuitous ARP、IGMP/MLD report 等。[S1](#source-s1)
-
-所以 `netif_set_up()` 不是“强制把 link 变成 up”。
-
-## 3. `netif_set_link_up()` 才是 Driver 把物理链路变化通知给 Core 的入口
-
-进入 `netif_set_link_up()`：[S1](#source-s1)
+目标版本 `netif_set_link_up()` 在第一次看到 link 从 down 变 up 时会：[S1](#source-s1)
 
 ```c
 void
 netif_set_link_up(struct netif *netif)
 {
-  LWIP_ASSERT_CORE_LOCKED();
-
-  LWIP_ERROR("netif_set_link_up: invalid netif", netif != NULL, return);
-
   if (!(netif->flags & NETIF_FLAG_LINK_UP)) {
     netif_set_flags(netif, NETIF_FLAG_LINK_UP);
 
 #if LWIP_DHCP
     dhcp_network_changed_link_up(netif);
 #endif
-
 #if LWIP_AUTOIP
     autoip_network_changed_link_up(netif);
 #endif
@@ -115,217 +158,23 @@ netif_set_link_up(struct netif *netif)
 }
 ```
 
-这条调用链说明 link-up 不是一个纯 flag update。它还是多个协议状态机的恢复触发点：
+这里第一次把 PHY link 与上层协议状态真正连起来：
 
 ```mermaid
 flowchart TD
-    A["Driver detects PHY link up"] --> B["netif_set_link_up()"]
-    B --> C["set NETIF_FLAG_LINK_UP"]
-    C --> D["DHCP link-up handling"]
-    C --> E["AutoIP link-up handling"]
-    C --> F["ARP / IGMP / MLD reports"]
-    C --> G["nd6_restart_netif()"]
-    C --> H["link callback"]
+    A["Driver calls netif_set_link_up()"] --> B["set NETIF_FLAG_LINK_UP"]
+    B --> C["DHCP link-up handling"]
+    B --> D["AutoIP link-up handling"]
+    B --> E["ARP / IGMP / MLD reports"]
+    B --> F["IPv6 ND6 restart"]
+    B --> G["link callback"]
 ```
 
-Stage 13、15、15、17、15 中分别看到过 DHCP、ND6、SLAAC、IGMP、MLD，这里第一次能看到它们如何在“物理链路重新出现”时被一个 netif event 串起来。
+因此 link up 不是一个纯硬件状态位，它会成为 DHCP 等协议重新评估网络可达性的触发条件。Stage 13 已经讲 DHCP；Stage 17 已经讲 IGMP；Stage 15 建立了 IPv4/IPv6 总览。本篇只说明这些机制如何被同一个 link event 重新串起来，不重新展开各协议内部状态机。
 
-## 4. `netif_set_link_down()` 的行为并不是 `netif_set_link_up()` 的机械镜像
+## 7. 为什么 `netif_issue_reports()` 还要同时检查 admin 和 link
 
-继续进入 `netif_set_link_down()`：[S1](#source-s1)
-
-```c
-void
-netif_set_link_down(struct netif *netif)
-{
-  LWIP_ASSERT_CORE_LOCKED();
-
-  LWIP_ERROR("netif_set_link_down: invalid netif", netif != NULL, return);
-
-  if (netif->flags & NETIF_FLAG_LINK_UP) {
-    netif_clear_flags(netif, NETIF_FLAG_LINK_UP);
-
-#if LWIP_AUTOIP
-    autoip_network_changed_link_down(netif);
-#endif
-
-#if LWIP_ACD
-    acd_network_changed_link_down(netif);
-#endif
-
-#if LWIP_IPV6 && LWIP_ND6_ALLOW_RA_UPDATES
-    netif->mtu6 = netif->mtu;
-#endif
-
-    NETIF_LINK_CALLBACK(netif);
-  }
-}
-```
-
-当前版本里，link-down 会清 `NETIF_FLAG_LINK_UP`，通知 AutoIP/ACD，恢复 `mtu6` 的特定状态并触发 link callback；它没有在这里直接调用一个对称的 `dhcp_network_changed_link_down()`。[S1](#source-s1)
-
-这意味着不能凭“up 路径做了什么”推测 down 路径也一定一一对应。源码必须按实际分支阅读。
-
-## 5. `netif_set_down()` 比 link-down 更重：它是软件接口停用
-
-进入 `netif_set_down()`：[S1](#source-s1)
-
-```c
-void
-netif_set_down(struct netif *netif)
-{
-  LWIP_ASSERT_CORE_LOCKED();
-
-  LWIP_ERROR("netif_set_down: invalid netif", netif != NULL, return);
-
-  if (netif->flags & NETIF_FLAG_UP) {
-    netif_clear_flags(netif, NETIF_FLAG_UP);
-    MIB2_COPY_SYSUPTIME_TO(&netif->ts);
-
-#if LWIP_IPV4 && LWIP_ARP
-    if (netif->flags & NETIF_FLAG_ETHARP) {
-      etharp_cleanup_netif(netif);
-    }
-#endif
-
-#if LWIP_IPV6
-    nd6_cleanup_netif(netif);
-#endif
-
-    NETIF_STATUS_CALLBACK(netif);
-  }
-}
-```
-
-这里会清理 ARP/ND6 状态，因此语义比“carrier 暂时掉线”更强。
-
-某个具体 Port 可以选择在 PHY link down 时同时调用 `netif_set_down()` 与 `netif_set_link_down()`；但这是 Port policy，不是 lwIP Core 强制要求。后面 STM32H7 示例正好体现了这种策略。[S3](#source-s3)
-
-## 6. 当前 Unix TAP Port 为什么几乎看不到真实 PHY 自动协商
-
-当前项目的 Unix `tapif` 是 Host file descriptor Port，没有 MCU PHY。初始化时它会把 TAP 设备打开并直接调用 `netif_set_link_up(netif)`。[S2](#source-s2)
-
-因此 Stage 2 以来的 TAP 实验中：
-
-```text
-TAP fd ready
-→ Port declares link up
-```
-
-不存在真实的：
-
-```text
-PHY cable detect
-→ auto-negotiation
-→ speed/duplex resolve
-→ MAC reconfiguration
-```
-
-所以 Host TAP 非常适合协议栈数据面，但不适合验证 PHY/MAC link negotiation。
-
-## 7. upstream Win32 `pcapif` 展示了“定时检测 link → 通知 netif”的完整桥接
-
-`pcapif` 是一个更接近真实 link monitor 的 upstream Port。它可选择每 500 ms 通过 helper 获取 adapter link state；如果 event 变化，就调用 `netif_set_link_up()` 或 `netif_set_link_down()`，随后用 `sys_timeout()` 安排下一次检查。[S2](#source-s2)
-
-主链是：
-
-```mermaid
-flowchart LR
-    A["sys_timeout 500 ms"] --> B["pcapif_check_linkstate()"]
-    B --> C["pcapifh_linkstate_get()"]
-    C --> D{"state changed?"}
-    D -- "up" --> E["netif_set_link_up()"]
-    D -- "down" --> F["netif_set_link_down()"]
-    E --> A
-    F --> A
-```
-
-这条链很重要，因为它说明 `netif_set_link_*()` 不要求由硬中断直接调用；Driver 可以通过 polling/task/timer 检测 physical state，再在符合 Core locking 规则的上下文中通知 lwIP。
-
-## 8. 真正 MCU PHY 通常通过 MDIO/MDC 暴露管理寄存器
-
-以 LAN8742 为例，MAC 与 PHY 除了 MII/RMII 数据接口，还通过 Serial Management Interface 访问 PHY control/status registers。STM32H7 Ethernet HAL 对外提供 `HAL_ETH_ReadPHYRegister()` / `HAL_ETH_WritePHYRegister()`；CubeH7 lwIP Port 再把它们包装成 LAN8742 Driver 的 bus IO callback。[S3](#source-s3)[S4](#source-s4)
-
-因此不要把两组信号混在一起：
-
-| 接口 | 作用 |
-| --- | --- |
-| MII/RMII | 实际 Ethernet 数据在 MAC 与 PHY 之间传输 |
-| MDC/MDIO | CPU/MAC 管理逻辑读写 PHY register |
-
-link status、auto-negotiation complete、speed/duplex resolve 都属于后者的管理面信息。
-
-## 9. Auto-negotiation 在 PHY 内部完成，不是 lwIP 状态机
-
-LAN8742 数据手册说明 auto-negotiation 是 PHY 层机制：两个 link partner 通过 Fast Link Pulse 交换能力，并选择双方都支持的最高优先级模式；协商结果再通过 PHY status/control registers 提供给控制器读取。[S4](#source-s4)
-
-对 LAN8742 这类 10/100 PHY，常见结果包括：
-
-- 100M Full Duplex；
-- 100M Half Duplex；
-- 10M Full Duplex；
-- 10M Half Duplex。
-
-Basic Status Register 还区分：
-
-- Link Status；
-- Auto-Negotiate Complete；
-- Auto-Negotiate Ability。
-
-这些状态先存在 PHY，不会自动修改 lwIP `netif->flags`。[S4](#source-s4)
-
-## 10. PHY link up 之后还不能马上通知 lwIP：MAC speed/duplex 必须先匹配
-
-如果 PHY 最终协商为 100M full-duplex，而 MAC 仍按 10M/half-duplex 配置，物理 carrier 虽然存在，数据面仍可能错误。
-
-ST CubeH7 的 `ethernet_link_check_state()` 给出了完整顺序：[S3](#source-s3)
-
-```text
-LAN8742_GetLinkState()
-        ↓
-解析 10/100 + half/full
-        ↓
-HAL_ETH_GetMACConfig()
-        ↓
-修改 MAC Speed / Duplex
-        ↓
-HAL_ETH_SetMACConfig()
-        ↓
-HAL_ETH_Start()
-        ↓
-netif_set_up()
-        ↓
-netif_set_link_up()
-```
-
-这里“先配置 MAC，再告诉 lwIP link up”是关键顺序。
-
-## 11. STM32H7 示例的 link-down 策略比 lwIP Core 的 link-down 更激进
-
-同一个 `ethernet_link_check_state()` 在检测到 PHY down 时，会停止 Ethernet HAL，然后调用 `netif_set_down()` 和 `netif_set_link_down()`。[S3](#source-s3)
-
-因此它的策略是：
-
-```text
-PHY link down
-→ stop MAC/DMA
-→ administrative down
-→ physical link down
-```
-
-而 lwIP Core 本身允许只执行：
-
-```text
-netif_set_link_down()
-```
-
-保持 `NETIF_FLAG_UP` 不变。
-
-这就是 Core contract 与 Port policy 的典型区别。具体产品希望 cable 拔出时保留 IP/admin configuration，还是把接口完整 down，再决定是否照搬 Cube 示例。
-
-## 12. Link-up 之后 `netif_issue_reports()` 为什么要同时检查两个 flag
-
-`netif_issue_reports()` 的开头逻辑是：[S1](#source-s1)
+目标版本 `netif_issue_reports()` 开头先检查两个 flag：[S1](#source-s1)
 
 ```c
 if (!(netif->flags & NETIF_FLAG_LINK_UP) ||
@@ -334,173 +183,155 @@ if (!(netif->flags & NETIF_FLAG_LINK_UP) ||
 }
 ```
 
-只有 physical link 与 administrative state 都允许，lwIP 才会发恢复性 control traffic。
+这是一个很好的系统边界：
 
-IPv4 侧可能包括 gratuitous ARP 与 IGMP membership report；IPv6 侧包括 MLD group report，并配合 `nd6_restart_netif()` 重新建立 ND/Router discovery 行为。[S1](#source-s1)
+- 只有 admin up：软件想工作，但物理链路不存在，发送 report 没意义；
+- 只有 link up：物理 carrier 存在，但接口被软件禁用，也不应该主动发协议 report；
+- 两者都 up：才具备“可以对网络重新宣告状态”的条件。
 
-这解释了为什么两个 flag 必须分开存在：任何一个单独为真都不足以真正发 packet。
+随后函数会根据配置发送 gratuitous ARP、重新报告 IGMP/MLD membership 等。[S1](#source-s1)
 
-## 13. DHCP 在 cable reconnect 时为什么会重新进入 discover/reboot 路径
+## 8. Link-down 与 Link-up 不是机械镜像
 
-`netif_set_link_up()` 直接调用 `dhcp_network_changed_link_up(netif)`。Stage 13 已经读过该函数：BOUND/RENEWING/REBINDING 等状态会进入 reboot 流程，其他需要重新获取配置的状态可能重新 discover。[S1](#source-s1)
+当前版本 `netif_set_link_down()` 会清 `NETIF_FLAG_LINK_UP`，通知 AutoIP/ACD，处理特定 IPv6 MTU 状态，并触发 link callback；它没有在这里调用一个对称的 DHCP link-down handler。[S1](#source-s1)
 
-因此 cable reconnect 不是“把旧 IP flag 打开”这么简单。Core 会根据 DHCP 当前 state 判断旧 lease 是否需要重新确认。
+这说明两件事：
 
-这也是 link event 应该准确反映 physical state 的原因：Driver 如果频繁抖动地调用 link up/down，会反复触发协议恢复动作。
+1. 协议恢复/退化策略必须以实际源码为准，不能从 up path 推导 down path；
+2. Driver 在 link down 时还要做的 MAC/DMA 停止、descriptor/waiter 处理属于 Driver policy，不由这一个 lwIP API 承担。
 
-## 14. IPv6 link-up 会触发 `nd6_restart_netif()`，所以它不仅影响 Neighbor Cache
+而 `netif_set_down()` 的语义更强：它清 administrative up，并清理 ARP/ND6 等软件接口状态。[S1](#source-s1)
 
-`netif_set_link_up()` 和 `netif_set_up()` 都可能调用 `nd6_restart_netif()`。[S1](#source-s1)
+## 9. Link callback 与 status callback 监听的是不同事件
 
-Stage 15 总览中的 ND、RS/RA、SLAAC 依赖 link-local address、neighbor discovery 与 router discovery。link 恢复后，Core 需要重新启动相应行为，而不是只保留旧邻居项继续发送。
+lwIP 提供两类容易混淆的 callback：[S1](#source-s1)
 
-因此下面这条链是跨多个旧章节的统一入口：
+| callback | 主要事件 |
+| --- | --- |
+| link callback | `NETIF_FLAG_LINK_UP` 的 up/down 变化 |
+| status callback | interface administrative up/down 或地址等状态变化 |
 
-```text
-PHY carrier restored
-→ MAC configured
-→ netif_set_link_up()
-→ ND6 restart
-→ RS/RA/neighbor activity resumes
-```
+如果应用想知道“网线/PHY 是否掉线”，优先理解 link callback；如果应用想知道“接口软件状态/IP 配置是否变化”，则 status callback 更接近这个语义。
 
-## 15. IGMP/MLD membership 也需要在 link 恢复后重新向网络声明
+应用层若把二者混成一个“网络好了/坏了”的布尔值，就容易错误地认为“link up == 已经拿到 IP == 业务可以连接”。实际上这是三个不同层次。
 
-`netif_issue_reports()` 在 link/admin 都 up 时会调用：
+## 10. Link Up、Netif Up、IP Ready、业务可用是四个不同条件
 
-- IPv4 `igmp_report_groups()`；
-- IPv6 `mld6_report_groups()`。[S1](#source-s1)
-
-这不是重新创建 membership object，而是把本机已有 membership 重新向链路上的 multicast infrastructure 宣告。
-
-所以 Stage 17 的 IGMP group state 与 Stage 15 概览中的 IPv6 multicast/MLD 并不孤立；它们也受 link lifecycle 驱动。
-
-## 16. Link callback 与 status callback 也必须分清
-
-lwIP 提供两类回调概念：[S1](#source-s1)
-
-- `NETIF_STATUS_CALLBACK`：administrative up/down 或地址等状态变化；
-- `NETIF_LINK_CALLBACK`：physical link up/down。
-
-应用若关心“网线是否插着”，应该观察 link callback；若关心“接口是否被软件启用、地址是否可用”，status callback 更接近需求。
-
-混用二者会导致经典错误：把 DHCP 地址变化误当 PHY link event，或把 cable unplug 当成接口配置被删除。
-
-## 17. Auto-negotiation 结果变化不一定伴随 link flag 从 down 变 up
-
-某些 PHY/交换机环境可能在重新协商、节能、link partner 变化后得到新的 speed/duplex。此时 Driver 仍需要确保 MAC 配置和 PHY resolve 一致。
-
-本篇使用的 CubeH7 示例主要在 link transition 时重新配置 MAC；更复杂产品可能需要处理“link 仍然存在但 negotiated mode 变化”的场景。具体机制取决于 PHY interrupt/status 能力和 Driver policy，lwIP Core 不感知 10M/100M/full/half 这些物理属性。[S3](#source-s3)[S4](#source-s4)
-
-## 18. Poll PHY 还是用 PHY interrupt，同样属于 Driver policy
-
-常见方式有两种：
-
-| 方式 | 触发 | 特点 |
-| --- | --- | --- |
-| periodic PHY polling | task/timer 定期读 MDIO status | 简单，检测延迟由周期决定 |
-| PHY interrupt | PHY IRQ 通知 link/status change | latency 低，但需处理 IRQ/debounce/status clear |
-
-无论哪种方式，最终都应该汇入一个受控的 link-state handler：读取/确认 PHY 状态、必要时配置 MAC，然后在正确 lwIP Core/locking 上下文调用 `netif_set_link_up/down()`。
-
-upstream `pcapif` 的 500 ms polling 和 STM32H7 的 `ethernet_link_check_state()` 分别提供了两种“检测层与 Core 通知层分离”的例子。[S2](#source-s2)[S3](#source-s3)
-
-## 19. Link flap 会放大成协议栈事件风暴，因此 Driver 需要稳定的状态边沿
-
-`netif_set_link_up/down()` 自己会检查 flag，只有状态真正变化时才执行内部动作。这可以过滤“连续重复通知同一个状态”。[S1](#source-s1)
-
-但如果 PHY 在短时间内真的交替报告 up/down，Core 会看到真实边沿，并可能反复执行 DHCP reboot、ND6 restart、IGMP/MLD report、callbacks。
-
-因此 PHY debounce/stability window 是否需要存在，是 Driver/产品问题。lwIP 不替 PHY 判断 carrier 是否已经稳定。
-
-## 20. Link down 时 DMA ring 怎么办，不由 `netif_set_link_down()` 自动解决
-
-Stage 21 的 TX/RX descriptors 属于 MAC/DMA Driver。`netif_set_link_down()` 只更新 lwIP link state 和相关协议逻辑，不会替 Driver：
-
-- stop MAC DMA；
-- reclaim TX descriptors；
-- flush hardware queue；
-- recycle RX buffers；
-- clear DMA error status。
-
-所以实际 link-down 流程通常至少有两条同步变化：
+一个 Ethernet 产品的恢复过程通常至少经历：
 
 ```mermaid
 flowchart LR
-    A["PHY link down"] --> B["Driver stops/reconfigures MAC DMA"]
-    A --> C["netif_set_link_down()"]
-    B --> D["descriptor/buffer recovery"]
-    C --> E["lwIP protocol recovery state"]
+    A["PHY Link Up"] --> B["MAC configured / data path ready"]
+    B --> C["netif Link Up"]
+    C --> D["IP configuration ready"]
+    D --> E["DNS / route / remote service reachable"]
+    E --> F["application session ready"]
 ```
 
-顺序与并发保护必须由 Port 设计。
+所以：
 
-## 21. 一个稳定的 MCU link-management 流程应该明确四个层次
+- PHY link up 只说明物理层已经建立；
+- lwIP link up 说明 Driver 已把链路变化通知协议栈；
+- IP ready 还可能等待 DHCP 等过程；
+- 云连接/MQTT/HTTP 还要等待路由、DNS、TLS 和远端服务。
 
-把本篇压缩成四层：
+这个层次区分会在 Stage 44/45 继续使用。
+
+## 11. Polling 还是 PHY interrupt，是 Driver policy
+
+PHY link state 可以通过周期 polling 管理寄存器，也可以使用 PHY interrupt 作为边沿通知。两者最终都需要 Driver 在合适的执行上下文中读取稳定状态、配置 MAC，并调用 `netif_set_link_up/down()`。
+
+upstream Win32 `pcapif` 虽然不是 MCU PHY Driver，但它展示了一个很清楚的 Port 模型：定时获取 adapter link state，只有状态发生变化时才调用 `netif_set_link_up()` 或 `netif_set_link_down()`，随后重新安排下一次检查。[S2](#source-s2)
+
+```mermaid
+flowchart LR
+    A["poll / interrupt event"] --> B["read current link state"]
+    B --> C{"state edge?"}
+    C -- "no" --> D["no netif transition"]
+    C -- "up" --> E["configure/start data path"]
+    E --> F["netif_set_link_up()"]
+    C -- "down" --> G["stop/protect data path"]
+    G --> H["netif_set_link_down()"]
+```
+
+关键不是“必须 polling 还是 interrupt”，而是 **只在稳定状态边沿产生一次上层 transition**。
+
+## 12. Link flap 为什么必须做状态边沿控制
+
+Link flap 指物理链路在很短时间内反复 up/down。每一次 `netif_set_link_up()` 都可能触发 DHCP/AutoIP、report、ND6 restart 和 callback；如果 Driver 把 PHY 寄存器瞬时抖动直接放大成大量上层 event，就会形成协议状态机反复重启和业务重连风暴。[S1](#source-s1)
+
+因此 Driver 常需要明确：
+
+- PHY status 读取是否需要稳定判定；
+- 是否只有 resolved state 真正变化才重配 MAC；
+- link state 是否只在边沿改变时通知 lwIP；
+- reconfiguration 期间是否暂停 DMA/TX；
+- 上层业务重连是否还需要额外 debounce/backoff。
+
+这些是 Driver/product policy，不是 `netif_set_link_*()` 自动提供的功能。
+
+## 13. Auto-Negotiation 结果变化不一定等于 link flag 变化
+
+例如某些硬件/交换机重协商后，link 可能保持 up，但 resolved speed/duplex 发生变化。Driver 如果只盯 `link up/down` 一个位，就可能错过 MAC 需要重新配置的情况。
+
+因此一个完整 PHY monitor 至少区分：
 
 ```text
-PHY
-  link detect / auto-negotiation / resolved speed-duplex
-        ↓ MDIO status
-Driver
-  configure MAC / start-stop DMA / recover descriptors
-        ↓
-Port
-  call netif_set_link_up/down in valid Core context
-        ↓
-lwIP Core
-  DHCP / AutoIP / ARP / IGMP / MLD / ND6 / callbacks
+link presence
+resolved speed
+resolved duplex
+(optional) remote fault / negotiation status
 ```
 
-只要四层边界清晰，很多问题就能快速定位：
+只有当 MAC 配置和 PHY resolved state 一致后，数据面才真正稳定。具体 STM32H750 Port 怎样存储和比较这些状态留到 Stage 44。
 
-- PHY 一直 down：查 cable/clock/strap/MDIO/auto-negotiation；
-- PHY up 但无流量：查 MAC speed/duplex、RMII clock、DMA ring；
-- MAC 能收发但 DHCP 不恢复：查 `netif_set_link_up()` 是否正确通知 Core；
-- link callback 正常但接口仍不发包：再检查 `NETIF_FLAG_UP` 是否为真。
+## 14. Host TAP 为什么看不到真实 Auto-Negotiation
 
-## 22. 当前 Host 实验能验证哪一段
+当前系列的 Unix TAP Port 在初始化成功后直接调用 `netif_set_link_up(netif)`；它没有外接 MCU PHY，也没有 MDIO、Auto-Negotiation 或 MAC speed/duplex reconfiguration。[S2](#source-s2)
 
-Unix TAP 可以验证 `netif_set_link_up/down()` 之后的 Core 行为，但不能验证真实 PHY negotiation。
+所以 Host TAP 能验证的是：
 
-Win32 `pcapif` 则能展示一个真实的“OS adapter link monitor → lwIP link event”桥接，但它仍不是 MCU MII/RMII PHY。
+- `netif_set_link_up/down()` 进入 Core 后的语义；
+- link callback / status callback 的区别；
+- link event 与协议栈动作之间的关系。
 
-若要验证 Stage 22 的完整链，需要目标板具备可读 PHY status，并观察：
+但它不能验证：
+
+- PHY 寄存器读取是否正确；
+- Auto-Negotiation 是否完成；
+- speed/duplex 是否解析正确；
+- MAC 是否按 resolved state 重配置；
+- link down 时 DMA/descriptor 是否安全停机。
+
+这些需要真实 MCU/PHY Driver 证据。
+
+## 15. Stage 44 会把这套通用生命周期落到具体 STM32H750/RT-Thread 实现
+
+本篇刻意不展开 STM32H7 `ethernet_link_check_state()`、HAL PHY register、RT-Thread `phy` thread 或 DHCP 恢复调用链。这里需要建立的是可迁移模型：
 
 ```text
-PHY register / PHY driver state
-→ MAC speed/duplex
-→ DMA start/stop
-→ netif flags
-→ DHCP/ND6/multicast reports
+PHY detects / negotiates
+→ Driver reads stable resolved state
+→ MAC/DMA configuration follows PHY
+→ Driver emits link edge to lwIP
+→ lwIP restarts/refreshes protocol state
+→ IP/application continue recovery
 ```
 
-本篇没有在当前会话执行目标板 PHY 实验；这些行为依据源码与厂商官方资料建立。
+Stage 44 再回答具体平台问题：谁创建 PHY monitor thread、谁调用 `eth_device_linkchange()`、RT-Thread 怎样跨线程到 lwIP、`netif_set_link_up()` 后 DHCP 在当前 Port 中实际怎样恢复。
 
-## 23. Stage 19～22 已经把 lwIP 一直追到物理链路管理边界
+## 16. 从 Stage 19～22，Ethernet Port 的完整边界已经建立
 
-从 Stage 19 开始，系列已经连续走完：
+Stage 19 解决 checksum ownership；Stage 20 解决 pbuf/DMA buffer ownership；Stage 21 解决 descriptor ring 和 backpressure；Stage 22 再补上 PHY/MAC/link lifecycle。
 
-```text
-checksum generation/verification
-        ↓
-netif->linkoutput()
-        ↓
-pbuf / DMA buffer ownership
-        ↓
-descriptor ring / ISR / backpressure
-        ↓
-MAC / DMA
-        ↓
-PHY auto-negotiation / link state
-        ↓
-netif_set_link_up/down()
-        ↓
-DHCP / ND6 / IGMP / MLD recovery
-```
+到这里，一个 Ethernet Port 的关键责任可以压缩成四条独立但相互连接的 contract：
 
-Stage 22 的核心判断是：**PHY link、MAC configuration、Driver DMA state 与 lwIP netif state 是四个不同对象；正确 Port 必须把它们按明确顺序连接，而不能把“网线插上”简化成一个 flag。**
+1. **Packet contract**：lwIP 交给 Driver 的 pbuf/frame 是什么形态；
+2. **Memory contract**：CPU、Driver、DMA 谁拥有/何时回收 buffer；
+3. **Resource contract**：descriptor/ring/buffer pool 满时怎样形成 backpressure；
+4. **Link contract**：PHY resolved state 怎样变成 MAC 配置和 lwIP link transition。
+
+后面的 MCU 平台篇不再重新发明这些概念，而是验证具体 Driver 是否正确实现它们。
 
 ## 资料来源
 
@@ -510,8 +341,8 @@ Stage 22 的核心判断是：**PHY link、MAC configuration、Driver DMA state 
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
 - 定位：`src/include/lwip/netif.h`：`NETIF_FLAG_UP`、`NETIF_FLAG_LINK_UP`；`src/core/netif.c`：`netif_set_up()`、`netif_set_down()`、`netif_set_link_up()`、`netif_set_link_down()`、`netif_issue_reports()`；`src/core/ipv4/dhcp.c`：`dhcp_network_changed_link_up()`
 - URL/文档：[lwIP upstream commit](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9)
-- 使用位置：“admin vs link”“link up/down Core 行为”“DHCP/ND6/IGMP/MLD 恢复”“callback”
-- 支撑内容：证明 current lwIP link/admin flags 是独立状态，以及 link transition 会触发哪些协议与 callback
+- 使用位置：“admin vs link”“link up/down Core 行为”“协议恢复”“callback”
+- 支撑内容：证明目标版本 lwIP 的 link/admin flags 是独立状态，以及 link transition 会触发哪些协议动作和 callback
 
 <a id="source-s2"></a>
 ### [S2] lwIP Unix TAP 与 Win32 pcapif link-state Port
@@ -519,22 +350,30 @@ Stage 22 的核心判断是：**PHY link、MAC configuration、Driver DMA state 
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
 - 定位：`contrib/ports/unix/port/netif/tapif.c`；`contrib/ports/win32/pcapif.c`：`pcapif_check_linkstate()`、`PCAPIF_LINKCHECK_INTERVAL_MS`
 - URL/文档：[lwIP contrib ports](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/contrib/ports)
-- 使用位置：“Host TAP 边界”“500 ms link polling”“Port 到 Core 的 link bridge”
+- 使用位置：“Host TAP 边界”“link polling”“Port 到 Core 的 link bridge”
 - 支撑内容：证明不同 Port 可以直接宣告 link up，也可以周期检测外部 adapter 状态后调用 `netif_set_link_up/down()`
 
 <a id="source-s3"></a>
-### [S3] ST STM32CubeH7 lwIP Ethernet Port 与 STM32H7 HAL ETH
-- 类型：厂商官方 Driver/Port 示例
-- 版本：GitHub master，访问日期 2026-10-02
-- 定位：CubeH7 `ethernetif.c`：`low_level_init()`、`ethernet_link_check_state()`、`ETH_PHY_IO_ReadReg()`、`ETH_PHY_IO_WriteReg()`；HAL ETH：`HAL_ETH_ReadPHYRegister()`、`HAL_ETH_WritePHYRegister()`、`HAL_ETH_GetMACConfig()`、`HAL_ETH_SetMACConfig()`、`HAL_ETH_Start()`、`HAL_ETH_Stop()`
-- URL/文档：[STM32CubeH7 ethernetif.c](https://github.com/STMicroelectronics/STM32CubeH7/blob/master/Projects/STM32H743I-EVAL/Applications/LwIP/LwIP_TFTP_Server/Src/ethernetif.c)；[STM32H7 HAL ETH driver](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/master/Src/stm32h7xx_hal_eth.c)
-- 使用位置：“MDIO bridge”“resolved speed/duplex”“MAC reconfiguration”“具体 link-up/down policy”
-- 支撑内容：提供一个真实 STM32 Port 从 LAN8742 state 到 MAC speed/duplex、HAL start/stop 与 lwIP netif transition 的实现样本
+### [S3] STM32H7 Ethernet Port/HAL 文档与实现样本
+- 类型：厂商官方 Driver/Port 资料
+- 版本：STM32CubeH7 / STM32H7 HAL，访问日期 2026-10-03
+- 定位：CubeH7 `ethernetif.c` 的 PHY/MAC link handling；HAL ETH `HAL_ETH_GetMACConfig()`、`HAL_ETH_SetMACConfig()`、PHY register API
+- URL/文档：[STM32CubeH7 ethernetif.c](https://github.com/STMicroelectronics/STM32CubeH7/blob/master/Projects/STM32H743I-EVAL/Applications/LwIP/LwIP_TFTP_Server/Src/ethernetif.c)、[UM2217 STM32H7 HAL and LL Drivers](https://www.st.com/resource/en/user_manual/um2217-stm32cubeh7-stm32cube-embedded-software-package-for-stm32h7-series-stmicroelectronics.pdf)
+- 使用位置：“PHY/MAC/Driver 系统边界”“MAC speed/duplex 必须跟随 resolved state”“Stage 44 承接”
+- 支撑内容：提供具体 MCU Port 如何读取 PHY、配置 MAC 并启停 Ethernet data path 的实现样本；本文只用于通用机制映射
 
 <a id="source-s4"></a>
 ### [S4] Microchip LAN8742A/LAN8742Ai 数据手册
 - 类型：PHY 厂商数据手册
 - 版本：DS00001989A
-- URL/文档：[LAN8742A/LAN8742Ai Datasheet](https://www.microchip.com/content/dam/mchp/documents/OTH/ProductDocuments/DataSheets/DS_LAN8742_00001989A.pdf)
-- 使用位置：“Auto-negotiation”“Basic Status Register”“link status / AN complete”“10/100 与 duplex resolve”
-- 支撑内容：说明 auto-negotiation 属于 PHY 层活动、Link Status/Auto-Negotiation Complete 寄存器语义以及协商后的 speed/duplex 能力选择
+- URL/文档：[LAN8742A/LAN8742Ai Datasheet](https://ww1.microchip.com/downloads/aemDocuments/documents/OTH/ProductDocuments/DataSheets/DS_LAN8742_00001989A.pdf)
+- 使用位置：“Auto-Negotiation”“link partner”“resolved speed/duplex”“MDIO/SMI 管理结果”
+- 支撑内容：说明 Auto-Negotiation 属于 PHY 层活动、双方交换能力并选择共同模式，以及协商结果可通过管理寄存器读回
+
+<a id="source-s5"></a>
+### [S5] Microchip Ethernet Link Testing Techniques
+- 类型：PHY 厂商官方工程资料
+- 版本：访问日期 2026-10-03
+- URL/文档：[Ethernet Link Testing Techniques](https://onlinedocs.microchip.com/oxy/GUID-E4098E15-180F-4086-BC4A-070E637A8B56-en-US-1/GUID-B7445640-86EE-4040-90AD-EAA07D5D8F90.html)
+- 使用位置：“阅读前建议”“PHY/Auto-Negotiation 工程模型”
+- 支撑内容：提供铜缆 Ethernet link procedure、forced/auto-negotiation 和 link-status 验证方法，用于承接更深入 PHY 调试

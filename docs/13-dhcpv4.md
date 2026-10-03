@@ -6,38 +6,78 @@
 
 [TOC]
 
-本文沿当前系列的同一阅读方法继续：从真实入口进入源码，明确对象从哪里创建、callback 在哪里绑定、报文如何进入状态机、Timer 如何推动重试，最后再用真实抓包验证线上行为。
+DHCPv4（Dynamic Host Configuration Protocol for IPv4，IPv4 动态主机配置协议）解决的是“主机刚接入网络、还没有可用 IPv4 配置时，怎样从网络中的 DHCP Server 获得地址、子网掩码、默认网关、DNS Server 与租约生命周期参数”。当前 lwIP 充当 DHCP Client；Client 使用 UDP 68，Server 使用 UDP 67。由于 Client 在第一次请求时可能仍是 `0.0.0.0`，首次租约阶段允许依赖广播和链路层可达性完成配置交换。[S3](#source-s3)[S6](#source-s6)
 
-本文源码块采用统一约定：只有明确写成“上游连续源码片段”的代码块才视为未经重排的上游片段；其余源码块均是基于当前目标 revision 裁剪的执行路径阅读版。阅读版只删除与当前主线无关的条件编译和调试输出，不重排保留语句，不使用省略号代替缺失源码。
+本文还会遇到 ACD（Address Conflict Detection，IPv4 地址冲突检测）。ACD 不是 DHCP 的另一种报文，而是在候选 IPv4 地址真正投入使用前，通过 ARP（Address Resolution Protocol，地址解析协议）Probe / Announcement 检查地址是否与同一链路上的其他节点冲突；当前 Host/TAP 实验构建启用了 `LWIP_DHCP_DOES_ACD_CHECK`，且 Ethernet `netif` 带 `NETIF_FLAG_ETHARP`；在这一实现路径里，DHCPACK 后会从 DHCP 状态机桥接到 ACD，确认地址可用后才进入 `dhcp_bind()`。[S4](#source-s4)[S5](#source-s5)[S8](#source-s8)
 
-本文使用的 lwIP 目标源码 revision 与 Stage 9～12 保持一致：`d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
+## 0. 阅读源码前：先把 DHCPv4 的协议动作看懂
 
-这篇只回答一个问题：**一个尚未配置 IPv4 地址的 `netif`，怎样通过 DHCPv4 获得地址，并在真正使用地址前经过 ACD，再进入 BOUND 和后续续租生命周期。**
+### 0.1 建议提前阅读
 
-主线是：
+下面资料用于加速理解和核对规范，不是正文的强制前置条件：
 
-```text
-example_app
-  -> dhcp_set_struct()
-  -> dhcp_start()
-  -> dhcp_discover()
-  -> DHCPDISCOVER
-  -> DHCPOFFER
-  -> dhcp_recv()
-  -> dhcp_handle_offer()
-  -> dhcp_select()
-  -> DHCPREQUEST
-  -> DHCPACK
-  -> dhcp_handle_ack()
-  -> dhcp_check()
-  -> ACD Probe / Announcement
-  -> dhcp_bind()
-  -> netif_set_addr()
-  -> BOUND
-  -> T1 RENEWING / T2 REBINDING
+1. [Microsoft Learn — Troubleshooting guide for Dynamic Host Configuration Protocol (DHCP)](https://learn.microsoft.com/en-us/windows-server/troubleshoot/troubleshoot-dhcp-issue)
+   - 用途：快速建立 Client / Server、首次租约、续租（Renew）与重绑定（Rebind）的整体视角。[S14](#source-s14)
+2. [RFC 2131 — Dynamic Host Configuration Protocol](https://www.rfc-editor.org/rfc/rfc2131.html) 与 [RFC 2132 — DHCP Options and BOOTP Vendor Extensions](https://www.rfc-editor.org/rfc/rfc2132.html)
+   - 用途：核对 DHCP message、状态推进、租约与 Option 的规范语义。[S6](#source-s6)
+3. [RFC 5227 — IPv4 Address Conflict Detection](https://www.rfc-editor.org/rfc/rfc5227.html)
+   - 用途：理解 DHCPACK 之后为什么还会出现 ARP Probe / Announcement。[S8](#source-s8)
+
+### 0.2 DORA、transaction ID 与 DHCP Option 分别解决什么问题
+
+首次获得租约时，最常见的四步交互可以记作 DORA：Discover、Offer、Request、Acknowledgement。它不是一个新的协议层，只是对四种 DHCP message 的缩写。[S6](#source-s6)
+
+| 阶段 | 方向 | 当前消息解决的问题 | Client 侧下一步 |
+| --- | --- | --- | --- |
+| DHCPDISCOVER | Client → Server | “当前链路上有哪些 DHCP Server 可以提供配置？” | 等待一个或多个候选 OFFER |
+| DHCPOFFER | Server → Client | 提供候选 IPv4 地址以及 Server/租约相关参数 | 选择候选并发送 REQUEST |
+| DHCPREQUEST | Client → Server | 明确请求哪个 Server 提供的哪个地址 | 等待 DHCPACK，或收到 DHCPNAK 表示请求被拒绝 |
+| DHCPACK | Server → Client | 确认租约以及最终配置参数 | 保存 lease/T1/T2，并在当前 lwIP 配置下进入 ACD |
+
+每次 DHCP transaction 都带 `xid`（transaction ID，事务标识符）。Client 生成 `xid`，Response 带回同一个值，接收端据此避免把无关 transaction 的消息误认为当前请求的响应。DHCP Option 则是在固定 BOOTP/DHCP message 头部之后携带的可变配置项；本文会遇到 Message Type、Requested IP、Server Identifier、Lease Time、T1、T2、Subnet Mask、Router 与 DNS Server 等 Option。[S3](#source-s3)[S6](#source-s6)
+
+Lease（租约）意味着地址只在一定时间内有效。T1 是 Renewal Time：到达 T1 后，Client 优先向原 Server 续租；T2 是 Rebinding Time：如果续租仍未成功，到达 T2 后 Client 扩大请求范围，尝试从可达 DHCP Server 重新确认租约。租约最终过期仍未成功时，地址不能继续被当作有效租约使用。[S6](#source-s6)
+
+### 0.3 一次成功 DHCP + ACD 会话先看协议总流程
+
+下面只画本文实际会进入源码的主线。OFFER/ACK 在线上的广播或单播细节受 Client 状态、flags 与 Server 行为影响，因此图中只表达消息方向，不把某一种链路层投递方式泛化成所有 DHCP 会话。[S6](#source-s6)
+
+```mermaid
+sequenceDiagram
+    participant C as DHCP Client UDP 68
+    participant S as DHCP Server UDP 67
+    participant L as Local Ethernet link
+
+    C->>S: DHCPDISCOVER with xid
+    S-->>C: DHCPOFFER candidate IPv4 and lease
+    C->>S: DHCPREQUEST selected address and server
+    S-->>C: DHCPACK lease and network options
+    C->>L: ARP Probe for candidate IPv4
+    C->>L: ARP Announcement after conflict check
+    Note over C: dhcp_bind() installs IPv4 configuration
+    C->>S: DHCPREQUEST at T1 for renewal
+    Note over C,S: If renewal fails until T2, enter rebinding
 ```
 
-## 1. 先解释本篇第一次真正需要的几个词
+因此“收到 ACK”与“接口已经正式拥有地址”在当前 **Ethernet + ACD enabled** 主线里不是同一个时刻。ACK 先把候选配置写入 `struct dhcp`，ACD 成功后 `dhcp_bind()` 才把地址写进 `netif`；若 ACD 未启用或接口没有 `NETIF_FLAG_ETHARP`，ACK 分支可以直接进入 `dhcp_bind()`。[S4](#source-s4)[S5](#source-s5)
+
+### 0.4 协议动作怎样落到本文的 lwIP 源码
+
+PCB（Protocol Control Block，协议控制块）是 lwIP 保存一个协议端点运行状态的对象；这里的 UDP PCB 保存 DHCP Client 使用的 UDP endpoint 与 receive callback。
+
+| 协议阶段 | 协议对象/状态 | lwIP 入口或 handler | 关键对象 | 完成后的下一步 |
+| --- | --- | --- | --- | --- |
+| 启动 Client | INIT / SELECTING | `dhcp_start()` → `dhcp_discover()` | `struct dhcp`、UDP PCB | 发送 DHCPDISCOVER |
+| 接收候选 | DHCPOFFER | `udp_input()` → `dhcp_recv()` → `dhcp_handle_offer()` | `xid`、offered address、server id | `dhcp_select()` |
+| 选择地址 | DHCPREQUEST | `dhcp_select()` | Requested IP / Server Identifier Options | 等待 ACK |
+| 接受租约 | DHCPACK | `dhcp_recv()` → `dhcp_handle_ack()` | lease / T1 / T2 / mask / gateway | 当前 Ethernet+ACD build 进入 `dhcp_check()` |
+| 地址冲突检测 | ARP Probe / Announcement | `acd_start()` / `acd_tmr()` | `struct acd` | `ACD_IP_OK` callback |
+| 正式采用地址 | BOUND | `dhcp_conflict_callback()` → `dhcp_bind()` | `netif` IPv4 fields | T1/T2 lifecycle |
+| 续租/重绑定 | RENEWING / REBINDING | `dhcp_coarse_tmr()` | lease timers | REQUEST / ACK 或租约失效 |
+
+下面进入真实源码时，正文会始终回到这张表中的“当前协议阶段”，而不是把 DHCP 协议与 C 函数拆成两条互不相干的叙事。
+
+## 1. 进入 `dhcp_start()` 前，还必须区分两个 lwIP 接口状态
 
 ### 1.1 `administrative up` 与 `link up`
 
@@ -50,22 +90,6 @@ netif_set_addr()        -> IPv4 配置变化
 ```
 
 Stage 0/2 已经区分这些状态；本篇只保留 DHCP 需要的边界：`dhcp_start()` 要求 `netif` administratively up，但 link down 时只进入 INIT，不发 DISCOVER。
-
-### 1.2 DORA、ACD、IANA、Lease 与 RENEWING
-
-- **DISCOVER / OFFER / REQUEST / ACK**：客户端广播寻找 DHCP Server、Server 提供候选配置、客户端明确选择、Server 最终确认租约。[S6](#source-s6)
-- **ACD**：Address Conflict Detection。ACK 后先确认候选 IPv4 地址没有在局域网中被占用。[S5](#source-s5)[S8](#source-s8)
-- **IANA**：Internet Assigned Numbers Authority。DHCP Server/Client 使用 IANA 登记的 UDP 67/68。[S3](#source-s3)
-- **Lease**：地址租期。本次实验为 3600 s；T1=1800 s，T2=3150 s。[S10](#source-s10)
-- **Subnet Mask**：本次为 `255.255.255.0`，即 `/24`，用于判断 IPv4 目标是否属于本地 subnet。
-- **RENEWING**：T1 到期后优先向原 DHCP Server 续租；若一直失败到 T2，则进入 **REBINDING**，改为广播 REQUEST。[S6](#source-s6)
-
-```text
-0 s       BOUND
-1800 s    T1 -> RENEWING
-3150 s    T2 -> REBINDING
-3600 s    lease expiry
-```
 
 ## 2. 真实入口：`test_netif_init()` 先绑定 `struct dhcp`，再调用 `dhcp_start()`
 
@@ -1084,9 +1108,9 @@ dhcp_coarse_tmr(void)
 }
 ```
 
-## 21. RENEWING 与 REBINDING：为什么一个单播、一个广播
+## 21. RFC 2131 的 T1/T2 在 lwIP 中分别落到哪条发送路径
 
-T1 到期后进入 `dhcp_renew()`，state 变成 RENEWING。当前实现向原 DHCP Server 单播 REQUEST。[S4](#source-s4)[S6](#source-s6)
+RFC 2131 已经定义 T1/T2 对应的 Renew/Rebind 行为，本篇不再重复解释协议理由，只看它们在 lwIP 的发送目标如何落地。[S6](#source-s6) T1 到期后进入 `dhcp_renew()`，state 变成 RENEWING；当前实现向原 DHCP Server 发送 REQUEST。[S4](#source-s4)
 
 ```c
     result = udp_sendto_if(dhcp_pcb, p_out,
@@ -1289,3 +1313,12 @@ flowchart TD
 - URL/文档：[`src/core/ipv4/ip4.c`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/core/ipv4/ip4.c)
 - 使用位置：OFFER/ACK 在 `netif` 仍是 `0.0.0.0` 时为什么能进入 DHCP client
 - 支撑内容：目的 UDP 端口为 68 的 DHCP packet 可按 link-layer addressing 特例进入当前 ingress `netif`。
+
+
+<a id="source-s14"></a>
+### [S14] Microsoft Learn — DHCP DORA、端口与租约生命周期导读
+- 类型：厂商官方学习/排障资料
+- 版本：在线文档，访问日期 2026-10-02
+- URL/文档：[Troubleshooting guide for Dynamic Host Configuration Protocol (DHCP)](https://learn.microsoft.com/en-us/windows-server/troubleshoot/troubleshoot-dhcp-issue)
+- 使用位置：文章开头的 DHCP 前置阅读导航
+- 支撑内容：Client/Server/Relay 角色、DORA、UDP 67/68、Renew 与 Rebind 的快速心智模型；协议规范仍以 RFC 2131/2132 为准。

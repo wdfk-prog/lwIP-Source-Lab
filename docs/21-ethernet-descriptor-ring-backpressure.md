@@ -2,385 +2,320 @@
 
 # 教程 21：从 DMA Descriptor Ring 到 `netif->input()`——ISR、Polling、TX Completion 与 Backpressure
 
-> 摘要：沿真实 Ethernet Driver 边界解释 TX/RX descriptor ring、OWN 状态、ISR 与 polling、资源回收、RX starvation 和 backpressure 如何影响 lwIP。
+> 摘要：建立 Ethernet DMA descriptor ring 的生产者—消费者模型，解释 TX/RX ownership、completion、refill、backpressure 与线程上下文边界。
 
 [TOC]
 
-Stage 20 已经解决“buffer 属于谁”；Stage 21 继续追问一个更具体的问题：**当 DMA descriptor 不够、TX queue 满、RX buffer 用光或中断来不及处理时，packet 会停在哪里，谁负责恢复系统继续前进？**
+Stage 20 已经建立了 pbuf、DMA buffer 与 Driver 之间的 ownership contract，但 ownership 正确并不等于系统一定稳定。Ethernet DMA 通常通过一个固定数量的 descriptor（描述符）循环工作：CPU/Driver 不断提交要发送的 buffer，DMA 不断消费；RX 方向则由 DMA 填充 buffer，Driver 再把完成的 packet 交给 lwIP。只要“提交速度、完成速度、回收速度”失去平衡，有限 ring 就会被占满或耗尽。[S1](#source-s1)
 
-lwIP Core 并不规定某一种 DMA descriptor 格式，也没有一个统一的 Ethernet ISR API。真正的 descriptor ring、OWN bit、interrupt status、tail pointer 都属于具体 MAC/DMA Driver。为了把这层讲清，本篇仍以 lwIP upstream Ethernet skeleton 作为 Core contract，再用 ST 官方 STM32H7 Ethernet HAL 作为一个具体 ring/interrupt 实现样本。[S1](#source-s1)[S2](#source-s2)
+Backpressure（背压）指下游资源不足时，压力如何向上游传播：TX ring full 时，Driver 需要决定等待、排队、返回错误还是丢包；RX 没有可回填 buffer 时，DMA 可能无法继续接收。Completion（完成事件）表示 DMA 已结束某次 descriptor 操作，refill（回填）表示 Driver 给 RX descriptor 补上下一块可接收 buffer；ISR（Interrupt Service Routine，中断服务程序）则是硬件中断到达 CPU 后最先执行的处理上下文。它们都不是 TCP 的 congestion control，而是 Driver 资源管理的一部分。
 
-## 1. Stage 21 的入口仍然是 `low_level_output()`，但这次关注它“失败时怎么办”
+## 阅读前建议：先把 ring、completion 与 Driver service 频率放在一起看
 
-upstream Ethernet Interface Skeleton 在 `low_level_output()` 注释里留下了一条非常重要的工程提醒：[S1](#source-s1)
+1. [lwIP Ethernet Interface Skeleton](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/contrib/examples/ethernetif/ethernetif.c)：重点看 `low_level_output()` 关于 DMA queue full 的注释，以及 RX/TX pbuf contract。[S1](#source-s1)
+2. [lwIP Optimization hints](https://www.nongnu.org/lwip/2_1_x/optimization.html)：重点看网卡没有及时 service 时的 RX buffer overflow，以及 RTOS 环境下由中断唤醒高优先级处理任务的建议。[S4](#source-s4)
+3. [STM32H7 HAL Ethernet Driver](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/7e541d92019e18f98d211fc4ab9197ec8e8105f6/Src/stm32h7xx_hal_eth.c)：只作为一个 descriptor ring/ownership/completion 实现样本；具体 STM32H7 调用链留到 Stage 43。[S2](#source-s2)
 
-> 当 DMA queue 已满时，如果 `low_level_output()` 直接返回 `ERR_MEM`，可能出现奇怪结果；因为除 TCP timer 等少数情况外，stack 不会自动重新发送刚刚因为 Driver queue 满而丢掉的 packet。
+## 1. Descriptor、buffer、ring、queue 先分开
 
-这句话说明：**DMA ring 满不是普通的“内存申请失败”语义。** 它更接近一种短暂的发送资源拥塞。
+Descriptor 是硬件/Driver 用来描述一次 DMA buffer 操作的小型元数据结构，通常包含 buffer 地址、长度、状态位和 ownership 位。多个 descriptor 按固定数组或链表循环使用，就形成 descriptor ring。
 
-如果 Driver 直接做：
-
-```text
-TX descriptor full
-→ return ERR_MEM
-→ drop current frame
-```
-
-上层并不一定会把这个 frame 原样重新送回来。TCP 最终可能通过 retransmission 恢复，但 UDP、ARP、ICMP 或控制报文不具备同样的重试语义。[S1](#source-s1)
-
-因此 Stage 21 的核心不是“descriptor ring 是循环数组”，而是：**ring occupancy 是 Driver 层 backpressure，必须和 packet ownership、唤醒机制、协议层重试语义一起设计。**
-
-## 2. DMA ring 是什么：固定数量 descriptor 在 CPU 与 DMA 之间循环交接
-
-以 STM32H7 HAL 为具体例子，初始化时会建立 TX/RX descriptor list；HAL 源码维护 `CurTxDesc`、`RxDescIdx` 等索引，并通过固定数量 `ETH_TX_DESC_CNT` / `ETH_RX_DESC_CNT` 形成循环使用关系。[S2](#source-s2)
-
-概念上可以画成：
+这和 Stage 20 的对象层次关系如下：
 
 ```mermaid
 flowchart LR
-    D0["Desc 0"] --> D1["Desc 1"]
-    D1 --> D2["Desc 2"]
-    D2 --> D3["Desc N-1"]
-    D3 --> D0
+    A["lwIP pbuf / pbuf chain"] --> B["Driver software queue / submit"]
+    B --> C["DMA descriptor ring"]
+    C --> D["DMA buffers"]
+    D --> E["MAC / wire"]
 ```
 
-这里的“ring”不是 lwIP 数据结构，而是 MAC DMA Driver 的资源池。每个 descriptor 通常至少描述：
+四层资源不能混写：
 
-- buffer address；
-- buffer length；
-- frame first/last segment；
-- checksum/CRC/offload attributes；
-- ownership / completion status；
-- error flags。
-
-具体 bit 定义取决于 MAC IP，本篇只把 STM32H7 作为实例，不把这些字段泛化为所有网卡。[S2](#source-s2)
-
-## 3. TX descriptor 的关键状态不是“空/满”，而是 CPU 与 DMA ownership
-
-STM32H7 HAL 的 `ETH_Prepare_Tx_Descriptors()` 会先检查当前 descriptor 是否仍由 DMA 持有，或者当前 slot 是否还保存着未释放 packet context；若是，就返回 busy。[S2](#source-s2)
-
-因此一个 TX slot 可以抽象为：
-
-```mermaid
-stateDiagram-v2
-    [*] --> CPU_FREE
-    CPU_FREE --> CPU_PREPARED: "Driver writes buffer/len/flags"
-    CPU_PREPARED --> DMA_OWNED: "set OWN / update tail"
-    DMA_OWNED --> COMPLETE: "DMA sends frame"
-    COMPLETE --> CPU_FREE: "reclaim descriptor + release packet"
-```
-
-OWN bit 的真正意义是：**哪一方此刻可以修改 descriptor/buffer metadata。**
-
-- CPU_FREE：Driver 可以改；
-- DMA_OWNED：CPU 不能擅自重写；
-- COMPLETE：硬件已经结束当前 descriptor，Driver 需要做 reclaim；
-- reclaim 后才再次可用于下一包。
-
-这和 Stage 20 的 pbuf ownership 是两套关联但不同的状态机：descriptor 可以已经完成，而 pbuf reference 还没释放；也可以 pbuf 已经加 ref，但 descriptor 尚未真正交给 DMA。
-
-## 4. `HAL_ETH_Transmit_IT()` 展示了“提交”与“完成”是两个事件
-
-ST HAL 的 interrupt-mode TX API 会把 packet context 保存到 TX descriptor list，准备 descriptors，然后通过 DMA tail pointer 启动传输；函数可以在硬件真正发送完成之前返回。之后 TX complete interrupt 再进入 `HAL_ETH_IRQHandler()`，并调用 TX completion callback。[S2](#source-s2)
-
-这条异步桥接必须显式展开：
-
-```mermaid
-sequenceDiagram
-    participant L as lwIP/Driver
-    participant H as HAL/DMA
-    participant I as ETH IRQ
-
-    L->>H: build descriptors + submit
-    H-->>L: return before wire completion
-    H->>I: TX complete interrupt
-    I->>L: Tx complete callback
-    L->>L: reclaim descriptor / release pbuf ref
-```
-
-因此 asynchronous TX Driver 不能把 `low_level_output()` 返回当作“DMA 已经不再访问 buffer”的依据。
-
-## 5. Polling TX 与 Interrupt TX 的区别不是“有没有 DMA”，而是谁等待 completion
-
-ST HAL 同时提供 blocking/polling TX 和 interrupt TX。[S2](#source-s2)
-
-两者都可以使用 DMA descriptors；区别在于 completion 的等待方式：
-
-| 模式 | 提交后行为 | completion 处理 |
+| 资源 | 典型 owner | 数量耗尽时的现象 |
 | --- | --- | --- |
-| blocking/polling TX | 调用线程等待 descriptor ownership 归还或 timeout | 当前线程轮询 |
-| interrupt TX | API 先返回 | IRQ/callback reclaim |
+| lwIP pbuf / memp | lwIP | packet/protocol object 分配失败 |
+| Driver software queue | Driver/RTOS | 尚未进入 DMA 的 packet 排队增长 |
+| DMA descriptor ring | Driver + DMA | 无 descriptor 可提交/接收 |
+| DMA buffer pool | Driver/HAL | descriptor 没有 buffer 可挂接 |
 
-因此“DMA 模式”和“中断模式”不是同义词。DMA 可以被 polling 驱动，也可以被 interrupt 驱动。
+一个系统可能 descriptor 还有空位但 RX buffer pool 已空，也可能 pbuf 很充足但 TX ring 已满。排障时必须先确认到底是哪一层资源耗尽。
 
-对 lwIP Port 来说，真正需要回答的是：`linkoutput()` 要不要阻塞等待 TX slot？如果异步返回，如何保持 pbuf reference？如果 ring 满，如何等待/唤醒？
+## 2. Ring 本质上是一个有限容量生产者—消费者系统
 
-## 6. 为什么 upstream skeleton 建议 ring 满时“等待空间”而不是直接 drop
-
-继续回到 lwIP upstream 的 `low_level_output()` contract。它明确指出 stack 不会普遍重试 Driver 因 DMA queue full 丢掉的 packet。[S1](#source-s1)
-
-因此一种常见的 RTOS Driver 设计是：
-
-```text
-low_level_output()
-    ↓
-检查 TX descriptor
-    ├─ 有空位 → enqueue
-    └─ 无空位 → 等待 TX completion semaphore/event
-                     ↓
-                 descriptor reclaimed
-                     ↓
-                 retry enqueue
-```
-
-这里的 semaphore/event 属于 Port/Driver，不属于 lwIP Ethernet API 强制要求。核心目标是把“暂时没有 descriptor”转换成受控 backpressure，而不是无条件丢包。
-
-需要同时避免另一个极端：**不能在 lwIP Core context 中无限等待。** 如果 TX completion 因 link down、DMA error 或 IRQ 丢失永远不来，无限阻塞会冻结整个 TCP/IP core。因此实际实现通常还要有 timeout、error recovery 或 link-state abort 路径。
-
-## 7. TX ring size 与 `pbuf chain` fragment 数是耦合资源
-
-Stage 20 已看到一个 packet 可能由多个 pbuf fragment 组成。如果 scatter-gather 模式下“一段 pbuf 对应一个或多个 TX descriptor”，那么单个大 packet 就可能消耗多个 descriptor。
-
-因此下面两个数量不能分开看：
-
-```text
-TX ring descriptor count
-        ×
-每个 frame 的 pbuf fragment count
-```
-
-`LWIP_NETIF_TX_SINGLE_PBUF` 和 `TCP_OVERSIZE` 可以影响 pbuf fragment 数，但都不是 descriptor ring 的替代品。[S1](#source-s1)
-
-当 `ETH_TX_DESC_CNT` 很小、TCP segment 又经常形成多个 pbuf 时，ring occupancy 会比“每包一个 descriptor”的直觉快得多达到上限。
-
-## 8. RX ring 的状态方向正好相反：DMA 先拥有 buffer
-
-RX 一开始通常是 Driver 准备好 buffer/descriptor，然后交给 DMA。网卡收到 frame 后，DMA 填数据并把完成状态留给 CPU。
-
-可以抽象为：
-
-```mermaid
-stateDiagram-v2
-    [*] --> DMA_READY
-    DMA_READY --> FRAME_READY: "DMA fills buffer"
-    FRAME_READY --> DRIVER_OWNED: "CPU observes completion"
-    DRIVER_OWNED --> LWIP_OWNED: "netif->input(p)"
-    LWIP_OWNED --> RECYCLED: "last pbuf_free()"
-    RECYCLED --> DMA_READY: "rebuild descriptor"
-```
-
-对于 RX copy Driver，`DRIVER_OWNED → LWIP_OWNED` 之间会 memcpy 到新 PBUF_POOL，原 DMA buffer 可以很快回 ring。
-
-对于 RX zero-copy，DMA buffer 必须等 lwIP 最后一个 reference 释放后才能真正 RECYCLED。于是 RX ring 可用 descriptor 数量和 lwIP/application 持包时间直接耦合。[S1](#source-s1)[S3](#source-s3)
-
-## 9. `HAL_ETH_ReadData()` 展示了 CPU 如何从 RX descriptor ring 消费完成帧
-
-在 STM32H7 HAL 中，`HAL_ETH_ReadData()` 从当前 RX descriptor index 开始检查 descriptor 是否已经不再由 DMA 拥有，再根据 first/last descriptor 标记组合一个完整 frame；处理后推进 ring index。[S2](#source-s2)
-
-这说明 RX poll 函数的核心工作是：
-
-```text
-查看当前 descriptor ownership
-→ 找到完整 frame
-→ 把多个 segment 链起来
-→ 把 packet context 返回给上层
-→ 为后续 descriptor recycle 更新索引
-```
-
-lwIP 本身并不读取 OWN bit；这些细节必须在 `low_level_input()` 下面解决。
-
-## 10. RX Interrupt 不应该直接把整个 TCP/IP 栈跑在硬中断里
-
-ST HAL 的 `HAL_ETH_IRQHandler()` 在收到 RX complete 状态时调用 RX callback；TX complete 时调用 TX callback。[S2](#source-s2)
-
-但是“IRQ callback 被调用”不等于“应该在 ISR 里一路调用 `ethernet_input()`、`ip4_input()`、`tcp_input()`”。
-
-在 OS 模式下，更常见的边界是：
+TX 中，CPU/Driver 是 producer，DMA/MAC 是 consumer；RX 中，DMA/MAC 产生“已接收 packet”，CPU/Driver 消费并 refill descriptor。
 
 ```mermaid
 flowchart LR
-    A["ETH IRQ"] --> B["clear status"]
-    B --> C["signal semaphore / task notification"]
-    C --> D["Ethernet RX task"]
-    D --> E["drain RX descriptors"]
-    E --> F["netif->input()"]
-    F --> G["tcpip_thread / Core"]
+    subgraph TX["TX"]
+      T1["CPU/Driver prepare"] --> T2["descriptor submitted"] --> T3["DMA consumes"] --> T4["completion/reclaim"]
+    end
+    subgraph RX["RX"]
+      R1["Driver supplies empty buffer"] --> R2["DMA owns descriptor"] --> R3["frame complete"] --> R4["CPU consumes/refills"]
+    end
 ```
 
-这能缩短 ISR 时间，并让 pbuf allocation、cache maintenance、descriptor rebuild 和 `netif->input()` 运行在普通线程环境。
+Ring depth 只是缓存“生产速率与消费速率短时间不一致”的容量。它不能长期弥补 consumer 跟不上 producer 的问题。
 
-具体是 semaphore、event flag、task notification 还是 poll loop，是 Port/RTOS 选择；lwIP Core 只要求线程/locking 规则正确。[S1](#source-s1)
+## 3. TX descriptor 的关键不是“空/满”，而是 ownership 状态
 
-## 11. Polling RX 与 Interrupt RX 的真正区别在“谁触发 drain”
+许多 MAC/DMA 用一个 OWN bit 或等价状态表示 descriptor 当前由 CPU 还是 DMA 控制。具体 bit 名因硬件不同，但通用生命周期一致：[S2](#source-s2)
 
-ST HAL 文档明确区分：[S2](#source-s2)
-
-- `HAL_ETH_Start()`：不启用传输完成中断，应用通过 `HAL_ETH_ReadData()` polling；
-- `HAL_ETH_Start_IT()`：启用 completion interrupt，接收后进入 RX callback。
-
-无论哪种方式，最终都必须消费 RX descriptors 并把 packet 送到 `netif->input()`。
-
-所以可以把三种常见策略看成：
-
-| 策略 | 触发 | 优点 | 风险 |
-| --- | --- | --- | --- |
-| 纯 polling | 周期性/主循环调用 drain | 简单、无中断抖动 | 空闲时浪费 CPU，poll 周期影响 latency |
-| 每包中断 | 每次 RX complete 唤醒 | 低流量 latency 好 | 高 PPS 时中断频率高 |
-| interrupt + batch drain | IRQ 只唤醒，task 一次消费多包 | 延迟与吞吐折中 | Driver 状态机更复杂 |
-
-第三种不是 lwIP 强制机制，但它通常更容易把 ISR 与 packet processing 分层。
-
-## 12. RX starvation：不是“没有 packet”，而是“没有 buffer 可以继续交给 DMA”
-
-zero-copy RX 的一个典型压力场景是：application 长时间持有很多 pbuf，custom free 尚未发生，于是 RX pool 无法提供新 buffer。
-
-ST CubeH7 示例用专用 RX pool 和 `RxAllocStatus` 表示这种资源压力；当 `HAL_ETH_RxAllocateCallback()` 无法取得 custom pbuf 时，状态切换为 allocation error；后续 custom free 归还对象时再允许 RX descriptor rebuild 继续推进。[S3](#source-s3)
-
-这条链说明 RX starvation 的资源关系是：
-
-```text
-application holds pbuf
-        ↓
-custom RX buffer not returned
-        ↓
-RX pool decreases
-        ↓
-DMA descriptors cannot all be rebuilt
-        ↓
-RX throughput drops / receive stops
+```mermaid
+stateDiagram-v2
+    [*] --> CPU_Free
+    CPU_Free --> CPU_Prepared: 填 buffer 地址 / 长度 / flags
+    CPU_Prepared --> DMA_Owned: 提交 descriptor
+    DMA_Owned --> Complete: DMA 发送结束或报错
+    Complete --> CPU_Free: Driver reclaim
 ```
 
-这和 heap “还有多少字节”不是同一个问题；即使系统总体 RAM 还很多，固定 RX buffer pool 仍可能被耗尽。
+这里要区分三个事件：
 
-## 13. `pbuf_free_custom()` 是 RX backpressure 的反向释放信号
+1. **submit**：CPU 把 descriptor 交给 DMA；
+2. **completion**：DMA 已经不再访问当前 TX buffer；
+3. **reclaim**：Driver 读取 completion 状态、释放关联资源并把 descriptor 重新纳入可提交集合。
 
-Stage 20 已经看到 custom free 是 ownership 回程。到了 Stage 21，它还有另一个意义：**它也是 RX resource pressure 缓解的时刻。**
+如果 TX 采用 Stage 20 的 direct-DMA/zero-copy，pbuf 引用也必须在 completion/reclaim 时同步闭环，而不是在 submit 时释放。
 
-一个 RX buffer 从 lwIP 回到 Driver pool 后，Driver 才能重新挂入 descriptor ring。因此在 zero-copy 模式下，`pbuf_free()` 的时机直接影响 NIC 可接收的 burst 深度。
+## 4. `linkoutput()` 返回与 TX completion 不是同一语义
 
-这也是为什么应用层“不必要地长期保存 RX pbuf”会变成底层丢包或 starvation 问题。
-
-## 14. Backpressure 要区分 TX 与 RX：二者传播方向完全不同
-
-TX backpressure 是从硬件向发送者反向传播：
-
-```text
-TX ring full
-← Driver
-← linkoutput()
-← lwIP output path
-← application/protocol
-```
-
-RX backpressure 则更多体现为“接收资源耗尽”：
-
-```text
-application holds pbuf
-→ RX buffers unavailable
-→ DMA ring cannot refill
-→ incoming frames may be dropped by MAC/DMA
-```
-
-因此不能用一个统一的 `ERR_MEM` 概念解释两边。
-
-## 15. TCP 可以最终重传，不代表 Driver 可以把 TX ring full 当成正常丢包策略
-
-TCP 的可靠性会让部分 TX drop 最终通过 RTO/fast retransmit 恢复，但代价是：
-
-- latency 上升；
-- congestion control 可能误判网络拥塞；
-- retransmission 增加带宽与 CPU；
-- ARP、ICMP、UDP 等其他 packet 没有 TCP 的端到端恢复机制。
-
-所以“反正 TCP 会重传”不是一个正确的 Driver backpressure 设计原则。upstream skeleton 对 DMA queue full 的警告正是为了避免这种误用。[S1](#source-s1)
-
-## 16. Driver queue 满时最危险的是在错误上下文里等待
-
-如果 `low_level_output()` 运行在 `tcpip_thread`，Driver 选择阻塞等待 TX descriptor 时，就等于阻塞整个 lwIP Core。短时间、可界定的等待可能可接受，但必须明确其后果。
-
-如果 TX completion callback 又依赖同一个被阻塞线程才能执行，就可能形成自锁：
-
-```text
-Core thread waits for descriptor
-        ↓
-completion event queued to Core thread
-        ↓
-Core thread cannot process event
-        ↓
-descriptor never reclaimed
-```
-
-因此等待机制必须考虑 completion 是 ISR、独立 driver task，还是 Core callback。Stage 11 的 thread/core-locking 模型在这里再次成为硬前提。
-
-## 17. Descriptor ring、buffer pool、pbuf pool 是三个不同资源层
-
-实际嵌入式 Ethernet 系统常同时存在：
-
-| 资源 | 谁管理 | 耗尽时表现 |
-| --- | --- | --- |
-| DMA descriptor ring | Driver/HAL | 无 slot 可提交/接收 |
-| RX/TX DMA buffer pool | Driver/Port | descriptor 没有可挂 buffer |
-| lwIP pbuf/memp/mem | lwIP Core | packet object / protocol object 分配失败 |
-
-它们可以互相耦合，但不能混为一个“内存不足”。
-
-例如 zero-copy RX 时，descriptor 数还有空槽，但 custom RX pool 全被 application 持有，仍然无法补 descriptor；反之 pbuf pool 充足也不意味着 TX descriptor 可用。
-
-## 18. 真实 Driver 还必须处理 DMA error，而不是只等正常 completion
-
-ST HAL IRQ handler除了 RX/TX completion，还检查 DMA abnormal/error status；fatal bus error 等状态会进入错误处理路径。[S2](#source-s2)
-
-因此 ring state machine 不能只设计成功路径：
-
-```text
-submit
-→ complete
-→ reclaim
-```
-
-还必须存在：
-
-```text
-submit
-→ DMA error / link loss / timeout
-→ stop/reset/reclaim policy
-→ wake blocked sender
-```
-
-否则“等待 descriptor”的 backpressure 机制在异常情况下会变成永久阻塞。
-
-## 19. Host TAP 能验证的是调度边界，不是硬件 descriptor
-
-当前 Linux TAP 环境仍然没有硬件 DMA ring，因此无法在 PCAP 中直接看到 descriptor OWN bit 或 reclaim index。
-
-但可以用它验证两个上层不变量：
-
-1. `netif->linkoutput()` 仍然是发送 Driver 边界；
-2. RX 最终必须通过 `netif->input()` 回到 lwIP Core。
-
-真正的 ring occupancy、IRQ latency、RX starvation、descriptor error 只能在有对应 MAC/DMA Driver 的目标板上验证，或使用专门模拟 ring 状态的测试 harness。
-
-## 20. 从 Stage 20 到 Stage 21，所有权已经变成一个生产者—消费者系统
-
-把整个机制压缩起来：
+有些 Driver 采用 polling/blocking TX：`linkoutput()` 内部一直等到当前 frame 完成再返回；另一些 Driver 采用 interrupt/asynchronous TX：函数只完成 enqueue/submit，实际 completion 稍后通过 ISR 或 worker 处理。[S2](#source-s2)
 
 ```mermaid
 flowchart TD
-    A["lwIP TX producer"] --> B["TX descriptor ring"]
-    B --> C["DMA/MAC consumer"]
-    C --> D["TX completion"]
-    D --> B
-
-    E["DMA/MAC RX producer"] --> F["RX descriptor ring"]
-    F --> G["Driver RX task"]
-    G --> H["lwIP/application consumer"]
-    H --> I["pbuf_free/custom free"]
-    I --> F
+    A["linkoutput(p)"] --> B{"Driver policy"}
+    B -- "blocking/polling" --> C["等待 descriptor completion"]
+    C --> D["reclaim then return"]
+    B -- "async/interrupt" --> E["submit then return"]
+    E --> F["ISR/worker handles completion"]
+    F --> G["reclaim descriptor / pbuf ref"]
 ```
 
-因此 Stage 21 的核心判断是：**descriptor ring 不是一个被动数组，而是连接 CPU、DMA、lwIP 和 application 的有限容量生产者—消费者系统。**
+这两种设计都可以使用 DMA；区别是“谁等待 completion”以及调用方何时重新获得执行权。不能把“DMA”与“异步”简单画等号。
 
-Stage 22 将继续处理另一个会让整个 ring 突然失效的外部事件：PHY link down/up。下一篇会明确区分 administrative up/down 与 physical link up/down，并追踪 auto-negotiation 结果如何反向配置 MAC speed/duplex，再通知 DHCP、ND6、IGMP/MLD 等 Core 模块。
+## 5. TX ring full 时，Driver 必须定义 backpressure policy
+
+upstream Ethernet skeleton 在 `low_level_output()` 注释里明确提醒：如果 DMA queue full 时直接返回 `ERR_MEM`，可能产生奇怪结果，因为 stack 一般不会自动重试这个被丢弃的 packet（TCP timer 是一个例外场景）；实现者可以考虑等待 DMA queue 出现空间。[S1](#source-s1)
+
+这不是“必须阻塞”的规范，而是在提醒 Driver：**ring full 不能被当成一个无代价的普通丢包点。** 常见策略各有前提：
+
+| 策略 | 优点 | 风险/前提 |
+| --- | --- | --- |
+| 短时等待 descriptor | 不丢当前 frame | 不能无限等；completion 必须能在等待期间发生 |
+| Driver software queue | `linkoutput()` 可快速返回 | 需要额外内存、队列上限和 drop policy |
+| 返回错误 | 实现简单 | 上层未必重试，可能形成隐蔽丢包 |
+| 主动 drop | 延迟可控 | 必须接受协议/业务层可见的 packet loss |
+
+所以 backpressure 不是“用哪个 err_t”，而是一套 **资源耗尽时怎样把压力向上游传播** 的 policy。
+
+## 6. 最危险的等待是 completion 依赖被阻塞的同一个执行上下文
+
+假设 `low_level_output()` 当前运行在 lwIP `tcpip_thread` 中，并且 ring full 后它阻塞等待一个 descriptor；如果 TX completion 又需要把事件排回 `tcpip_thread` 才能 reclaim，就会形成自锁：
+
+```mermaid
+sequenceDiagram
+    participant C as tcpip_thread
+    participant D as Driver ring
+    participant I as ISR/event source
+
+    C->>D: submit, ring full
+    C->>C: wait for free descriptor
+    I-->>C: queue completion event
+    Note over C: thread 正在等待，无法处理 completion
+    Note over D: descriptor 无法 reclaim
+```
+
+因此选择 wait/semaphore/queue 前必须先回答：
+
+- completion 在 ISR 中直接 reclaim，还是只通知 worker？
+- worker 是独立 Driver task，还是 lwIP Core thread？
+- 等待者持有什么锁？
+- link down / DMA error 时谁负责唤醒等待者？
+
+Stage 11 的线程与 Core locking 模型在这里直接决定 Driver policy 是否安全。
+
+## 7. `pbuf chain` 会放大 TX descriptor 消耗
+
+Stage 20 已经说明一个 Ethernet frame 可能由多个 pbuf fragment 组成。如果硬件 scatter-gather 设计按 fragment 映射 descriptor，那么“一个 packet”不一定只占一个 descriptor。
+
+```text
+单个 packet 的 descriptor 消耗
+    ≈ 实际 fragment 数 × 每 fragment 的硬件映射需求
+```
+
+因此 TX ring depth 与以下因素是耦合的：
+
+- pbuf chain fragment 数；
+- MAC 每个 descriptor 能描述几个 buffer segment；
+- 同时在飞的 frame 数；
+- completion/reclaim 延迟；
+- software queue 是否提前吸收 burst。
+
+`LWIP_NETIF_TX_SINGLE_PBUF` 可以减少部分 chain，但不能替代 ring capacity 设计。[S1](#source-s1)
+
+## 8. RX 的压力点不是“ring full”，而是“无法 refill”
+
+RX 初始化时，Driver 通常先给每个 RX descriptor 挂上可写 buffer，再把 ownership 交给 DMA。收到 frame 后，descriptor/buffer 变成 CPU 可处理状态；Driver 取走 packet 后还需要给 ring 补回一个新的可接收 buffer。[S2](#source-s2)
+
+```mermaid
+stateDiagram-v2
+    [*] --> DMA_Ready
+    DMA_Ready --> RX_Complete: frame arrives
+    RX_Complete --> CPU_Processing: descriptor returns to CPU
+    CPU_Processing --> Refilled: Driver installs reusable/new buffer
+    Refilled --> DMA_Ready: descriptor returned to DMA
+```
+
+如果 RX 是 copy path，Driver copy 完 frame 后通常可以很快复用原 DMA buffer；如果是 Stage 20 的 custom-pbuf zero-copy，原 buffer 可能被 lwIP/应用继续持有，Driver 必须从额外 buffer pool 取另一块 memory 来 refill descriptor。[S3](#source-s3)
+
+这就是 RX starvation（接收资源饥饿）：不是“网络没有数据”，而是 **DMA 没有空 buffer 可以继续接收新 frame**。
+
+## 9. Zero-copy 把 RX descriptor pressure 与 pbuf lifetime 连起来
+
+RX zero-copy 的优势是减少 copy，但代价是上层持有 pbuf 的时间会直接影响 Driver buffer pool。
+
+```mermaid
+flowchart LR
+    A["DMA receives into buffer A"] --> B["custom pbuf wraps A"]
+    B --> C["lwIP / app holds pbuf"]
+    C --> D["buffer A temporarily unavailable to RX ring"]
+    D --> E["Driver must refill descriptor with buffer B/C/..."]
+    C --> F["last pbuf_free()"]
+    F --> G["buffer A returns to pool"]
+```
+
+因此 RX ring size、RX buffer pool size 和上层最大持有时间必须一起考虑。只增加 descriptor 数而不增加可回填 buffer，不一定能解决 zero-copy RX starvation。
+
+## 10. TX backpressure 与 RX backpressure 的传播方向不同
+
+TX 压力从硬件向发送者反向传播：
+
+```text
+DMA completion 变慢
+  → TX descriptors 长时间占用
+  → ring full
+  → Driver wait/queue/error/drop
+  → lwIP output path 感知
+```
+
+RX 压力则从上层持有资源向网卡接收能力传播：
+
+```text
+lwIP / application 长时间持有 RX pbuf
+  → RX buffer pool 变少
+  → descriptor 无法 refill
+  → DMA 接收能力下降
+  → 新 frame 在 MAC/DMA 处丢失
+```
+
+两者都叫 backpressure，但不能用同一个“queue full”心智模型解释。
+
+## 11. TCP 会重传，不代表 Driver 可以把 ring full 当正常丢包策略
+
+TCP 的端到端可靠性可以在之后重传部分丢失数据，但这不意味着 Driver 丢包没有代价：
+
+- RTO/fast retransmit 会增加延迟；
+- congestion control 可能把本地 Driver 丢包解释成网络拥塞；
+- 重传增加带宽和 CPU；
+- ARP、ICMP、UDP 等流量并没有 TCP 的同一套端到端恢复。
+
+因此 Driver backpressure 应该从资源和实时性角度设计，而不是把“TCP 会重传”当作 DMA ring overflow 的恢复机制。[S1](#source-s1)
+
+## 12. Interrupt、Polling 与 Worker Thread 解决的是“什么时候 service ring”
+
+Descriptor ring 必须被及时 service。结合 upstream 文档与常见 Driver 结构，可以把 service ring 的执行方式概括为以下几类；前三类有当前来源支撑，具体平台如何组合属于 Driver policy：
+
+- **Polling**：周期检查 completion/received descriptor；
+- **Interrupt**：DMA/MAC 完成后触发 ISR；
+- **ISR + worker**：ISR 只记录事件/唤醒任务，真正 dequeue/refill/reclaim 在 Driver task 中完成；
+
+lwIP Optimization hints 指出，如果网卡没有被及时 service，RX buffer 可能 overflow；在 RTOS 环境中可以由中断唤醒高优先级任务及时处理 Driver。[S4](#source-s4)
+
+因此问题不是“中断一定比 polling 好”，而是：
+
+```text
+最坏输入速率
+vs
+Driver service latency
+vs
+ring/buffer 容量
+```
+
+三者是否形成稳定余量。
+
+## 13. Completion 不只表示成功，还要闭合 error path
+
+DMA completion 可能携带成功、underflow、bus error、descriptor error 等状态；具体错误位由硬件定义。通用 Driver contract 要求无论成功还是失败，都必须最终回答：[S2](#source-s2)
+
+- 这次提交关联的 descriptor 是否可 reclaim？
+- 关联 pbuf/reference 是否应该释放？
+- buffer 是否还能复用？
+- wait queue/semaphore 是否需要唤醒？
+- 错误是否要求 reset DMA/ring 或重新初始化？
+
+如果 error path 只记录日志，却没有归还 descriptor 或引用，系统会表现成“偶发一次错误后 ring 永久越来越满”。
+
+## 14. 一个可审查的 Driver 应该能画出两条独立生命周期
+
+TX：
+
+```text
+pbuf ready
+→ descriptor available
+→ map/copy buffer
+→ submit to DMA
+→ completion/error
+→ reclaim descriptor
+→ release pbuf/buffer ownership
+```
+
+RX：
+
+```text
+empty buffer available
+→ descriptor armed
+→ DMA receives frame
+→ CPU/Driver obtains completion
+→ wrap/copy into pbuf
+→ netif->input()
+→ refill descriptor
+→ old zero-copy buffer eventually returns through pbuf_free()
+```
+
+任何一条链中出现“资源交出去，但不知道在哪里回来”，都意味着 ownership/backpressure 还没有闭环。
+
+## 15. Host TAP 能验证调度边界，但不存在真实 descriptor ring
+
+Unix TAP/pcap Port 可以帮助验证：
+
+- RX 是否由独立线程/polling 读取；
+- packet 什么时候交给 `netif->input()`；
+- lwIP Core 与 Port/Driver 的线程边界。
+
+但 Host fd/pcap 没有 MCU MAC DMA descriptor，因此无法用 Stage 02 的 TAP 实验测出：
+
+- descriptor OWN bit 生命周期；
+- ring depth 是否足够；
+- TX completion reclaim 是否正确；
+- RX zero-copy buffer starvation；
+- DMA error recovery。
+
+Stage 43 会在具体 STM32H7/RT-Thread Driver 上追真实 descriptor、HAL ETH 与 completion；本篇只建立跨平台可复用的 ring/backpressure 心智模型。[S2](#source-s2)[S3](#source-s3)
+
+## 16. Stage 20 → 21 的核心变化：从“谁拥有 buffer”升级到“有限资源怎样流动”
+
+Stage 20 解决的是 ownership：某一时刻谁可以使用/释放 buffer。Stage 21 再加上 ring capacity 与 completion timing 后，系统变成一个生产者—消费者问题。
+
+最终需要同时回答：
+
+1. descriptor 什么时候从 CPU 交给 DMA，又什么时候回来？
+2. pbuf/buffer 的生命周期是否比 descriptor 更长？
+3. ring full / RX starvation 时压力向哪里传播？
+4. completion 在什么上下文完成，等待是否可能阻塞 completion 本身？
+5. error path 是否同样释放 descriptor、buffer 和引用？
+
+Stage 22 将继续向下一层走：即使 ring 设计正确，MAC/DMA 能否真正工作还取决于 PHY link 是否建立、auto-negotiation 结果是否被 Driver 正确读取，以及 MAC speed/duplex 是否与 PHY resolved state 一致。
 
 ## 资料来源
 
@@ -388,25 +323,33 @@ Stage 22 将继续处理另一个会让整个 ring 突然失效的外部事件�
 ### [S1] lwIP Ethernet Driver Skeleton 与 DMA 相关配置
 - 类型：目标版本上游源码
 - 版本：commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`
-- 定位：`contrib/examples/ethernetif/ethernetif.c`：`low_level_output()`、`low_level_input()`、`ethernetif_input()`；`src/include/lwip/opt.h`：`LWIP_NETIF_TX_SINGLE_PBUF`、`MEMP_NUM_FRAG_PBUF`；`src/include/lwip/pbuf.h`
+- 定位：`contrib/examples/ethernetif/ethernetif.c`：`low_level_output()`、`low_level_input()`、`ethernetif_input()`；`src/include/lwip/opt.h`：`LWIP_NETIF_TX_SINGLE_PBUF`、`MEMP_NUM_FRAG_PBUF`
 - URL/文档：[lwIP upstream commit](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9)
-- 使用位置：“DMA queue full”“TX pbuf fragments”“RX buffer 生命周期”“Core/Driver 边界”
+- 使用位置：“ring full policy”“TX pbuf fragments”“RX buffer 生命周期”“Core/Driver 边界”
 - 支撑内容：证明 upstream 对 DMA queue full 的显式警告、pbuf chain contract、单 pbuf 选项边界以及 Driver 向 `netif->input()` 交包的通用模型
 
 <a id="source-s2"></a>
 ### [S2] ST STM32H7 Ethernet HAL Driver
-- 类型：厂商官方 Driver 源码
-- 版本：GitHub master，访问日期 2026-10-02
-- 定位：`stm32h7xx_hal_eth.c`：`HAL_ETH_Init()`、`HAL_ETH_Transmit()`、`HAL_ETH_Transmit_IT()`、`HAL_ETH_ReadData()`、`HAL_ETH_IRQHandler()`、`ETH_DMATxDescListInit()`、`ETH_DMARxDescListInit()`、`ETH_Prepare_Tx_Descriptors()`
-- URL/文档：[STM32H7 HAL ETH driver](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/master/Src/stm32h7xx_hal_eth.c)
-- 使用位置：“descriptor ring”“OWN/busy”“polling vs interrupt”“IRQ completion”“DMA error”
-- 支撑内容：提供一个具体 MAC/DMA Driver 如何管理循环 descriptor index、ownership、tail pointer、RX/TX completion interrupt 和 error path 的实现样本
+- 类型：厂商官方 Driver 实现样本
+- 版本：commit `7e541d92019e18f98d211fc4ab9197ec8e8105f6`
+- 定位：`stm32h7xx_hal_eth.c`：`HAL_ETH_Transmit()`、`HAL_ETH_Transmit_IT()`、`HAL_ETH_ReadData()`、`HAL_ETH_IRQHandler()`、descriptor list init 与 TX descriptor prepare 路径
+- URL/文档：[STM32H7 HAL ETH driver at pinned commit](https://github.com/STMicroelectronics/stm32h7xx-hal-driver/blob/7e541d92019e18f98d211fc4ab9197ec8e8105f6/Src/stm32h7xx_hal_eth.c)
+- 使用位置：“descriptor ownership”“polling vs async”“completion/error”“Stage 43 承接”
+- 支撑内容：作为具体 MAC/DMA Driver 样本，展示循环 descriptor index、ownership、tail pointer、RX/TX completion interrupt 与 error path；本文不展开平台调用链
 
 <a id="source-s3"></a>
 ### [S3] ST STM32CubeH7 lwIP Ethernet 示例
 - 类型：厂商官方 lwIP Port 示例
-- 版本：STM32CubeH7 GitHub master，访问日期 2026-10-02
-- 定位：`Projects/STM32H743I-EVAL/Applications/LwIP/LwIP_TFTP_Server/Src/ethernetif.c`：`low_level_output()`、`low_level_input()`、`ethernetif_input()`、`HAL_ETH_RxAllocateCallback()`、`HAL_ETH_RxLinkCallback()`、`pbuf_free_custom()`
+- 版本：STM32CubeH7 GitHub master，访问日期 2026-10-03
+- 定位：`Projects/STM32H743I-EVAL/Applications/LwIP/LwIP_TFTP_Server/Src/ethernetif.c`
 - URL/文档：[STM32CubeH7 ethernetif.c](https://github.com/STMicroelectronics/STM32CubeH7/blob/master/Projects/STM32H743I-EVAL/Applications/LwIP/LwIP_TFTP_Server/Src/ethernetif.c)
-- 使用位置：“RX starvation”“custom RX pool”“descriptor refill”“pbuf lifetime”
-- 支撑内容：证明一个具体 lwIP+STM32H7 Port 如何用 custom pbuf pool 向 HAL 提供 RX buffer，并通过最后 free 缓解 RX resource pressure
+- 使用位置：“RX zero-copy buffer pool”“descriptor refill 与 pbuf lifetime 关系”
+- 支撑内容：提供一个 custom pbuf RX pool 的实际样本，说明 stack 持有 buffer 时 Driver 仍需要其他 buffer 继续 refill ring
+
+<a id="source-s4"></a>
+### [S4] lwIP 官方 Optimization hints
+- 类型：lwIP 官方性能/Porting 文档
+- 版本：lwIP 2.1.x 文档，访问日期 2026-10-03
+- URL/文档：[Optimization hints](https://www.nongnu.org/lwip/2_1_x/optimization.html)
+- 使用位置：“Driver service latency”“Interrupt/worker”“RX overflow”
+- 支撑内容：官方指出网卡若没有被及时 service 可能发生 buffer overflow，并建议 RTOS 环境使用中断唤醒高优先级任务及时处理 Driver

@@ -6,7 +6,66 @@
 
 [TOC]
 
-Stage 29 的终点是 IPCP/IPv6CP 进入 `OPENED`，随后 `np_up()` 把 PPP session 推到 `PPP_PHASE_RUNNING`。Stage 30 继续回答更接近产品代码的问题：IP 地址到底写到哪里、peer DNS 何时生效、PPP 会不会自动成为默认路由、断线时地址/DNS 如何清理，以及谁负责重新连接。[S1](#source-s1)
+Stage 29 的终点是 IPCP/IPv6CP 进入 `OPENED`，随后 `np_up()` 把 PPP session 推到 `PPP_PHASE_RUNNING`。Stage 30 继续回答更接近产品代码的问题：协商得到的 IP 地址写到哪里、peer DNS（Domain Name System，域名系统；这里指对端通过 IPCP 提供的 DNS server 地址）何时生效、default route（无更具体路由时的默认出口）是否自动切到 PPP、link down（链路不可用）时地址/DNS 如何清理，以及 reconnect（重新建立一个 PPP session）由谁负责。[S1](#source-s1)
+
+## 阅读源码前：建议先把“协商结果”和“应用路由策略”分开
+
+Stage 30 不再重新教学 LCP/FSM，而是接住 Stage 29 已经 OPENED 的 IPCP/IPv6CP，观察协商结果怎样真正写入 lwIP `netif`，以及链路结束后哪些状态必须撤销。[S1](#source-s1)
+
+1. [RFC 1332 — The PPP Internet Protocol Control Protocol (IPCP)](https://www.rfc-editor.org/rfc/rfc1332.html)
+   - 用途：确认 PPP IPv4 地址参数属于 IPCP 协商结果，而不是串口/Driver 自己配置出来的地址。
+2. [RFC 1877 — PPP Internet Protocol Control Protocol Extensions for Name Server Addresses](https://www.rfc-editor.org/rfc/rfc1877.html)
+   - 用途：理解 peer DNS 地址为什么可以作为 IPCP option 返回，以及 lwIP 的 `usepeerdns`/`sdns()` 在哪里接住它。
+3. [RFC 5072 — IP Version 6 over PPP](https://www.rfc-editor.org/rfc/rfc5072.html)
+   - 用途：区分 IPv6CP Interface-Identifier（接口标识符）、PPP link-local（链路本地）地址与一般 LAN 上 SLAAC（Stateless Address Autoconfiguration，无状态地址自动配置）/DHCPv6（IPv6 Dynamic Host Configuration Protocol）的职责。
+4. [lwIP PPP source](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/netif/ppp)
+   - 用途：对照 `ipcp_up()`、`ipv6cp_up()`、`sifaddr()`、`sifup()`、`ppp_close()` 与 link status callback（PPP 状态通知回调）的生命周期实现。
+
+## Stage 30 的核心问题：协议已经谈妥以后，谁把结果变成“可用网络接口”
+
+Stage 29 的 `np_up()` 说明某个 Network Protocol 已经协商成功，但应用真正能使用 PPP `netif`，还需要把 negotiated parameters 写进网络栈对象，并建立清晰的 up/down 生命周期。[S1](#source-s1)
+
+几个后文会直接影响控制流的名称先定义清楚：
+
+- **local address**：当前 lwIP PPP endpoint 自己的 IPv4 地址；IPCP 中对应 `ouraddr` 一类 negotiated value。
+- **peer address**：点对点链路另一端的 IPv4 地址。lwIP 的 `sifaddr()` 把它写进 `netif->gw`，这里的 `gw` 表示“这条 point-to-point link 的下一跳 peer”，不能机械套成 Ethernet LAN 中的网关设备。[S1](#source-s1)
+- **peer DNS**：通过 IPCP 扩展 option 获得的 DNS server 地址；只有应用启用 `usepeerdns` 且 peer 真正提供地址时，lwIP 才调用 `sdns()` 更新 DNS server slot。[S1](#source-s1)[S6](#source-s6)
+- **default netif / default route policy**：lwIP 在没有更具体路由匹配时选择的默认接口。当前 PPP Core 不会因为 IPCP OPENED 就自动调用 `ppp_set_default()`；这是应用侧路由策略，而不是 IPCP 的协议结果。[S1](#source-s1)
+- **link status callback**：应用收到 PPP 成功或失败原因的回调；它和 `netif_set_link_up/down()` 的 link-state 通知相关，但不是同一个抽象。[S1](#source-s1)[S2](#source-s2)
+- **reconnect**：一次 PPP session 结束后重新启动新的连接尝试。当前 Core 会报告终止原因，但不会替应用无限自动重拨；退避、重试上限和默认路由恢复属于应用策略。[S1](#source-s1)
+
+## Stage 30 生命周期总图：IPCP/IPv6CP OPENED 只是中点，不是终点
+
+```mermaid
+flowchart TD
+    A["Stage 29: IPCP / IPv6CP reaches OPENED"] --> B["Apply negotiated parameters"]
+    B --> C["sifaddr() / sdns() / IPv6 link-local state"]
+    C --> D["sifup() / sif6up()"]
+    D --> E["netif link state + ppp_link_status_cb(PPPERR_NONE)"]
+    E --> F["Application may select PPP as default netif"]
+    F --> G["RUNNING data plane"]
+    G --> H["ppp_close() / carrier loss / protocol failure"]
+    H --> I["IPCP/IPv6CP down: remove protocol-specific state"]
+    I --> J["ppp_link_terminated() / link adapter disconnect"]
+    J --> K["ppp_link_status_cb(error)"]
+    K --> L["Application decides whether/when to reconnect"]
+```
+
+这张图刻意把“协议结果”和“应用策略”分开：`sifaddr()`/`sdns()` 属于 negotiated state 的落地；`ppp_set_default()` 和重连调度属于应用选择。
+
+## 协议结果与 lwIP 对象的映射
+
+| 协议/生命周期结果 | lwIP 落点 | 主要函数 | down/结束时谁撤销 |
+| --- | --- | --- | --- |
+| IPCP local/peer IPv4 | `netif` IPv4 addr/netmask/`gw` | `ipcp_up()` → `sifaddr()` | `ipcp_down()` → `cifaddr()` |
+| IPCP peer DNS | global DNS server slots | `sdns()` | `cdns()` 只清理匹配的地址 |
+| IPv4 protocol available | `pcb->if4_up` + netif link state | `sifup()` | `sifdown()` |
+| IPv6 protocol available | `pcb->if6_up` + IPv6 link-local | `ipv6cp_up()` / `sif6up()` | `ipv6cp_down()` / `sif6down()` |
+| Application success/error observation | PPP status callback | `ppp_link_status_cb()` | session end 再次 callback |
+| Default interface policy | `netif_default` | `ppp_set_default()` / `pppapi_set_default()` | 应用按生命周期调整 |
+| Session termination | PPP phase / link adapter state | `ppp_close()` → `ppp_link_terminated()` | callback 后由应用决定 reconnect/free |
+
+下面从 `ipcp_up()` 开始逐层追踪这些映射。
 
 ## 1. `ipcp_up()` 先确认 negotiated IPv4 参数，再配置 `netif`
 
@@ -109,7 +168,9 @@ break;
 
 这说明应用不应该在 `ppp_connect()` 返回 `ERR_OK` 后立刻假设地址已经可用。`ppp_connect()` 只表示 negotiation 已成功启动；真正 up 的异步证据是 status callback。
 
-## 6. peer DNS 不是默认自动采用，取决于 `usepeerdns`
+## 6. RFC 1877 的 DNS option 在 lwIP 中由 `usepeerdns` 控制
+
+RFC 1877 已经定义了 IPCP 的 Primary/Secondary DNS Server Address options；这里不再解释 option negotiation，只看 lwIP 怎样采用它们。[S6](#source-s6) 当前 `ipcp.h` 中 `CI_MS_DNS1=129`、`CI_MS_DNS2=131`，与 RFC 1877 的 Primary/Secondary DNS option type 对应；是否主动请求这些 option 由 `usepeerdns` 控制。[S1](#source-s1)[S6](#source-s6)
 
 公共 API 宏：[S1](#source-s1)
 
@@ -117,7 +178,7 @@ break;
 #define ppp_set_usepeerdns(ppp, boolval) (ppp->settings.usepeerdns = boolval)
 ```
 
-IPCP option 初始化会根据这个 setting 请求 DNS address。`ipcp_up()` 在 negotiation 完成后只有满足：[S1](#source-s1)
+`ipcp_resetci()` 根据这个 setting 设置 `req_dns1/req_dns2`，随后 IPCP Configure negotiation 使用 `CI_MS_DNS1/CI_MS_DNS2`。`ipcp_up()` 在 negotiation 完成后只有满足：[S1](#source-s1)[S6](#source-s6)
 
 ```c
 if (pcb->settings.usepeerdns && (go->dnsaddr[0] || go->dnsaddr[1])) {
@@ -542,3 +603,12 @@ flowchart TD
 - URL/文档：[RFC 5072](https://www.rfc-editor.org/rfc/rfc5072.html)
 - 使用位置：“IPv6CP Interface-Identifier”“PPP IPv6 link-local”
 - 支撑内容：提供 IPv6 over PPP 与 IPv6CP 的标准边界，避免与 SLAAC/DHCPv6 混淆
+
+<a id="source-s6"></a>
+### [S6] RFC 1877：PPP IPCP Extensions for Name Server Addresses
+- 类型：IETF Informational RFC
+- 版本：RFC 1877，1995
+- URL/文档：[RFC 1877](https://www.rfc-editor.org/rfc/rfc1877.html)
+- 使用位置：“建议提前阅读”“peer DNS / `usepeerdns`”“`CI_MS_DNS1/CI_MS_DNS2`”
+- 支撑内容：定义 IPCP Primary/Secondary DNS Server Address options（Type 129/131），用于把 lwIP 的 DNS option 常量与标准扩展对应起来
+

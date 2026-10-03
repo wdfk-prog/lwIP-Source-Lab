@@ -1,14 +1,90 @@
 <meta name="referrer" content="no-referrer" />
 
-# 教程 28：从 `pppos_create()` 到 `ppp_input()`——PPP Core、PPPoS 串口字节流、异步 HDLC Framing 与 FCS
+# 教程 28：从 `pppos_create()` 到 `ppp_input()`——PPP Core、PPPoS 串口字节流与 HDLC-like Framing
 
-> 摘要：从 upstream PPPoS example 追踪 PPP netif 创建、LCP 启动、串口 RX 跨线程输入、异步 HDLC 解帧、Protocol 分发，以及 TX 的 ACCM escaping、PFC/ACFC 与 FCS。
+> 摘要：从 upstream PPPoS example 追踪 PPP netif 创建、串口 RX 跨线程输入、HDLC-like frame 解码、Protocol 分发，以及 TX 的 ACCM、PFC/ACFC 与 FCS 实现。
 
 [TOC]
+
+PPP（Point-to-Point Protocol，点对点协议）是用于两端点直接链路的数据链路协议，它不仅给网络层报文提供封装，还定义链路建立、协议类型标识以及后续的链路/网络层配置协商。PPPoS（PPP over Serial）是 lwIP 把 PPP 放到 UART/串行字节流上的适配方式：串口只负责收发字节，PPPoS 负责按 RFC 1662 定义的 HDLC-like framing（类似 HDLC 的帧定界、转义与校验格式）在异步串行字节流中还原/生成 PPP frame，并用 FCS（Frame Check Sequence，帧校验序列）检测串行 frame 传输错误，再把 IPv4/IPv6 或控制协议交给 PPP Core。嵌入式设备常在 MCU 通过串口连接蜂窝 modem 或其他点对点通信模块时使用这种结构。[S1](#source-s1)[S3](#source-s3)[S4](#source-s4)
 
 Stage 27 完成了 Ethernet 路径上的性能闭环。Stage 28 切换到另一种常见嵌入式链路：没有 Ethernet MAC/PHY、只有 UART/串行字节流时，lwIP 如何通过 PPPoS 建立一个能承载 IPv4/IPv6 的 `netif`。[S1](#source-s1)[S2](#source-s2)
 
 本篇只回答“PPP Core 怎样挂到 serial link、byte stream 怎样变成 PPP frame、frame 怎样进入 IP”的问题。LCP option negotiation、PAP/CHAP、IPCP、IPv6CP 放到 Stage 29；地址/DNS/default route/断线重连放到 Stage 30。
+
+## 阅读源码前：建议先看这三份资料
+
+Stage 28 第一次系统进入 PPP/PPPoS。下面三份资料适合提前建立背景，但都不是继续阅读正文的强制前置条件：正文会重新解释后续源码真正依赖的协议对象。[S1](#source-s1)[S3](#source-s3)[S4](#source-s4)
+
+1. [RFC 1661 — The Point-to-Point Protocol (PPP)](https://www.rfc-editor.org/rfc/rfc1661.html)
+   - 用途：理解 PPP 为什么不仅是“串口封装”，还包含链路建立、协议类型标识和网络层协议协商。
+   - 建议重点：§1～§3 的 PPP 组成、Encapsulation，以及 Link Control Protocol 与 Network Control Protocol 的关系。
+2. [RFC 1662 — PPP in HDLC-like Framing](https://www.rfc-editor.org/rfc/rfc1662.html)
+   - 用途：理解 PPP 放到异步串行字节流以后，Flag（帧边界标记）、Control Escape（转义前缀）、FCS（帧校验序列）和字节透明传输如何工作。
+   - 建议重点：§3～§4 的 frame format、octet stuffing、transparency 与 FCS。
+3. [lwIP PPP/PPPoS source](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/netif/ppp)
+   - 用途：对照本文中的 `ppp.c`、`pppos.c`、`lcp.c` 等真实实现文件，确认“PPP Core”和“串口 link adapter”分别位于哪里。
+
+## 先建立 PPP/PPPoS 的初学者模型：串口只是字节通道，PPP 才定义链路语义
+
+PPP（Point-to-Point Protocol，点对点协议）工作的对象是**两个直接相连的端点**。在 MCU + 蜂窝 modem 这类场景中，一端通常是运行 lwIP 的设备，另一端是 modem/peer；UART 或其他 serial device 只负责搬运字节，本身不知道这些字节属于 IPv4、IPv6 还是控制协议。[S3](#source-s3)
+
+PPPoS（PPP over Serial）是 lwIP 在串行字节流上承载 PPP 的 link adapter。它做两类工作：RX 时把连续 serial bytes 重新拼成完整 PPP frame；TX 时把 PPP packet 编码成适合异步串行传输的 HDLC-like frame。完成 framing 后，真正决定“这个 packet 是 IPv4、IPv6、LCP 还是其他协议”的是 PPP Core。[S1](#source-s1)[S4](#source-s4)
+
+下面这些名称会在源码中反复出现，先建立最小闭环：
+
+| 名称 | 它是什么 | 当前路径为什么需要它 |
+| --- | --- | --- |
+| PPP frame / packet | PPP 在链路上传递的一次完整数据单元 | `pppos_input()` 必须先知道一帧何时结束，才能交给 PPP Core |
+| `Protocol` field | PPP header 中标识 payload 属于哪种上层协议的字段 | `ppp_input()` 读取它后，才能把 packet 分给 IPv4、IPv6、LCP 等 handler |
+| Flag Sequence `0x7E` | HDLC-like framing 的帧边界标记 | RX parser 用它判断一帧结束；TX encoder 在边界写出它 [S4](#source-s4) |
+| Control Escape `0x7D` | 表示下一个字节经过异或恢复的 escape 字节 | 让数据本身即使含有 `0x7E`/`0x7D` 也不会被误判为帧边界 [S4](#source-s4) |
+| FCS（Frame Check Sequence，帧校验序列） | HDLC-like frame 的错误检测值 | RX 只有在 FCS 正确时才把完整 frame 继续交给 PPP Core [S4](#source-s4) |
+| ACCM（Async-Control-Character-Map，异步控制字符映射） | 指定哪些控制字符在异步链路上需要 escape 的位图 | LCP 协商结果最终会改变 `pppos.c` 的 TX/RX escaping 行为 |
+| PFC（Protocol-Field-Compression） | 允许部分 PPP Protocol field 从 2 字节压成 1 字节的协商能力 | `pppos.c` 的 encoder/parser 会根据协商结果改变线上格式 |
+| ACFC（Address-and-Control-Field-Compression） | 允许省略 HDLC-like Address/Control 字节的协商能力 | 同样由 LCP 结果反向改变 framing；具体协商在 Stage 29 展开 |
+
+PFC、ACFC、ACCM 都是**PPP/LCP 协商影响 framing 的结果**，不是 UART 配置参数。Stage 28 只解释它们如何改变 `pppos.c` 的字节布局；为什么以及如何协商这些选项留到 Stage 29。[S1](#source-s1)[S3](#source-s3)[S4](#source-s4)
+
+## Stage 28 总流程：serial byte stream 怎样变成 PPP packet，再进入协议分发
+
+先从协议/数据流角度看完整闭环。这里不展开 LCP/PAP/IPCP 的内部状态机，只把 Stage 28 真正要追踪的边界画出来：
+
+```mermaid
+flowchart TD
+    A["UART / serial RX bytes"] --> B["pppos_input_tcpip(): 跨入 tcpip_thread"]
+    B --> C["pppos_input(): HDLC-like byte parser"]
+    C --> D["识别 Flag / Escape，并累计 FCS"]
+    D --> E["完整且 FCS 正确的 PPP frame"]
+    E --> F["ppp_input(): 读取 Protocol field"]
+    F --> G["IPv4 / IPv6 / LCP / 其他 PPP protocol handler"]
+
+    H["IPv4/IPv6 或 PPP control packet"] --> I["PPP Core 选择 protocol"]
+    I --> J["pppos_netif_output() / pppos_write()"]
+    J --> K["加入 Flag / FCS，并按 ACCM escape"]
+    K --> L["ppp_output_cb(): serial TX bytes"]
+```
+
+这张图里有两个不同层次：
+
+- `pppos_*` 负责**字节流 ↔ PPP frame**；
+- `ppp_*` 负责**PPP frame ↔ 上层协议/控制协议**。
+
+把二者混成一个“PPP 串口驱动”会导致后面最容易出现的误解：例如把 FCS 当成 IP checksum、把 `Protocol` field 当成 UART packet type，或者认为 `pppos_create()` 已经完成 LCP 协商。
+
+## 协议动作与 lwIP 源码的第一张映射表
+
+| 数据/协议阶段 | 当前发生什么 | lwIP 主要入口 | 关键对象/状态 | 下一步 |
+| --- | --- | --- | --- | --- |
+| 创建 PPPoS adapter | 把 serial output callback 与 PPP Core 连接 | `pppos_create()` | `pppos_pcb`、`ppp_pcb` | 创建 PPP `netif` |
+| 启动 session | link adapter 准备好，PPP phase 进入 Establish | `ppp_connect()` → `pppos_connect()` → `ppp_start()` | `pcb->phase` | Stage 29 的 LCP 协商 |
+| Serial RX | 收到一串尚未分帧的 bytes | `pppos_input_tcpip()` | serial buffer | 切入 Core thread |
+| HDLC-like 解帧 | 处理 Flag、Escape、FCS、压缩字段 | `pppos_input()` | parser state、FCS、ACCM | 得到完整 PPP packet |
+| PPP 协议分发 | 读取 `Protocol` field | `ppp_input()` | `protocol`、PPP phase | 交给 IPv4/IPv6/LCP 等 |
+| PPP TX | Core 已经知道要发送哪种 protocol | `ppp_netif_output()` / `ppp_write()` | `protocol` + `pbuf` | 进入 PPPoS encoder |
+| Serial TX | 构造 framing 并输出 bytes | `pppos_netif_output()` / `pppos_output_last()` | FCS、ACCM、PFC/ACFC | `ppp_output_cb()` 写串口 |
+
+后面的源码按这张表的真实执行顺序展开。每次切换层次，都需要分清当前是在处理 serial byte、PPP frame，还是已经进入某个 PPP Protocol。
 
 ## 1. 当前 example 编译 PPP/PPPoS，但运行时 `USE_PPP=0`
 
@@ -344,29 +420,20 @@ flowchart LR
     G --> H["pppos_input()"]
 ```
 
-## 10. PPPoS framing 不是 Ethernet frame
+## 10. RFC 1662 的 frame 元素在 `pppos.c` 中落到哪里
 
-PPP over asynchronous serial 使用 HDLC-like framing。当前 implementation 中最关键的特殊字符是：[S1](#source-s1)[S4](#source-s4)
+RFC 1662 已经给出 HDLC-like Frame Format、Flag Sequence 与 octet stuffing，本节不重复协议格式，只把标准元素映射到当前 lwIP 实现。[S1](#source-s1)[S4](#source-s4)
 
-```text
-PPP_FLAG    = 0x7E
-PPP_ESCAPE  = 0x7D
-PPP_TRANS   = 0x20
-```
+| RFC 1662 元素 | lwIP `pppos.c` 中的实现 | 当前源码作用 |
+| --- | --- | --- |
+| Flag Sequence `0x7E` | `PPP_FLAG` | parser 的 frame boundary；TX frame 的结束标记 |
+| Control Escape `0x7D` | `PPP_ESCAPE` | 标记下一 octet 需要反转义 |
+| Transparency XOR `0x20` | `PPP_TRANS` | RX 恢复原字节、TX 生成 escaped byte |
+| Protocol field | `pppos_input()` 恢复后交给 `ppp_input()` | 区分 LCP/PAP/CHAP/IPCP/IPv4/IPv6 等 |
+| 16-bit FCS | `PPP_INITFCS`、`PPP_GOODFCS`、`PPP_FCS()` | RX 验证 frame、TX 生成尾部 FCS |
+| ACCM | `in_accm[]` / `out_accm[]` | 控制异步链路上哪些字符过滤或转义 |
 
-典型未压缩 frame 逻辑结构：
-
-```text
-Flag
-Address = 0xFF
-Control = 0x03
-Protocol
-Information
-FCS
-Flag
-```
-
-PPP 本身的 Protocol field 决定 payload 是 LCP、PAP、CHAP、IPCP、IPv4、IPv6 等；这和 Ethernet EtherType 起到相似的“上层 protocol demux”作用，但 frame format 与链路语义完全不同。[S3](#source-s3)[S4](#source-s4)
+这个映射才是后续源码阅读需要保留的部分：标准负责说明线上格式，`pppos.c` 负责把连续 serial bytes 实现成该格式。
 
 ## 11. `pppos_input()` 是 byte-stream 状态机
 
@@ -391,28 +458,24 @@ while (l-- > 0) {
 
 当收到 `PPP_ESCAPE`，下一个 escaped byte 需要恢复原值；当收到 `PPP_FLAG`，则意味着当前 frame 到边界，需要检查 header 完整性与 FCS。
 
-## 12. FCS 是 PPPoS frame 的链路校验，不是 TCP checksum
+## 12. `pppos_input()` 怎样落实 RFC 1662 的 FCS 校验
 
-PPPoS 使用 16-bit Frame Check Sequence。当前实现初始化：[S1](#source-s1)[S4](#source-s4)
+RFC 1662 已经定义 PPP HDLC-like framing 的 FCS 语义；这里只看 lwIP 如何实现它。[S1](#source-s1)[S4](#source-s4)
+
+当前实现初始化：
 
 ```c
 #define PPP_INITFCS     0xffff
 #define PPP_GOODFCS     0xf0b8
 ```
 
-每接收一个 frame byte 都推进 FCS。遇到结束 Flag 后，如果最终值不是 `PPP_GOODFCS`，当前 packet 被丢弃并增加 link/drop counters。[S1](#source-s1)
+`pppos_input()` 对接收到的 frame byte 持续推进 FCS。遇到结束 `PPP_FLAG` 后，如果累计结果不是 `PPP_GOODFCS`，当前 packet 被丢弃并增加 link/drop counters。[S1](#source-s1)
 
-这与 Stage 19 的 checksum 必须分开：
+这里的工程边界需要保留：PPP FCS 属于串口 link framing；IPv4 header checksum 与 TCP/UDP checksum 仍由各自上层处理。lwIP 因而可能在同一 IPv4/TCP 数据上依次处理 PPP FCS、IPv4 checksum 与 TCP checksum，但三者不是同一套校验状态。
 
-| 校验 | 覆盖范围 | 所属层次 |
-| --- | --- | --- |
-| PPP FCS | PPP serial frame | link framing |
-| IPv4 header checksum | IPv4 header | network layer |
-| TCP/UDP checksum | pseudo header + transport data | transport layer |
+## 13. LCP 协商结果怎样改变 `pppos_netif_output()` 的字节布局
 
-同一个 IPv4/TCP packet 经过 PPPoS 时，可以同时存在 PPP FCS、IPv4 checksum、TCP checksum。
-
-## 13. Address/Control 与 Protocol 字段都可能压缩
+PFC/ACFC 的协议语义由 RFC 1661/1662 定义；当前文章只追踪协商结果如何进入 PPPoS encoder。[S1](#source-s1)[S3](#source-s3)[S4](#source-s4)
 
 PPPoS state 中保存：
 
@@ -421,9 +484,9 @@ accomp = Address-and-Control-Field-Compression
 pcomp  = Protocol-Field-Compression
 ```
 
-这些值由 LCP negotiation 之后的 `ppp_send_config()`/`ppp_recv_config()` 下发到 `pppos_send_config()`/`pppos_recv_config()`。[S1](#source-s1)[S3](#source-s3)
+这些值由 LCP negotiation 后的 `ppp_send_config()` / `ppp_recv_config()` 下发到 `pppos_send_config()` / `pppos_recv_config()`。[S1](#source-s1)
 
-TX 时，`pppos_netif_output()` 只有在 `!accomp` 时才发送 `0xFF 0x03`：[S1](#source-s1)
+TX 时，`pppos_netif_output()` 只有在 `!accomp` 时才输出 Address/Control：[S1](#source-s1)
 
 ```c
 if (!pppos->accomp) {
@@ -432,7 +495,7 @@ if (!pppos->accomp) {
 }
 ```
 
-继续阅读 `pppos_netif_output()`，Protocol field 同样支持 PFC：
+继续阅读 `pppos_netif_output()`，Protocol field 同样直接读取 `pcomp`：[S1](#source-s1)
 
 ```c
 if (!pppos->pcomp || protocol > 0xFF) {
@@ -442,11 +505,11 @@ if (!pppos->pcomp || protocol > 0xFF) {
 err = pppos_output_append(pppos, err, nb, protocol & 0xFF, 1, &fcs_out);
 ```
 
-所以抓串口 raw bytes 时，不能假设每个 PPP frame 永远固定以 `7E FF 03 xx xx` 开头。
+所以抓取 raw serial bytes 时不能把固定前缀写死；线上布局取决于 LCP 已经写入 `pppos_pcb` 的 negotiated flags。Stage 29 会继续追 `lcp_up()` 怎样设置这些值。
 
-## 14. ACCM 决定哪些控制字符必须 escaping
+## 14. RFC 1662 的 ACCM 怎样落到 `out_accm[]`
 
-Asynchronous Control Character Map 用 bit map 决定特定字符是否需要 escape。[S1](#source-s1)[S4](#source-s4)
+ACCM 的定义与字符透明传输规则直接见 RFC 1662 §4.2 与 §7.1；本节只保留 encoder mapping。[S1](#source-s1)[S4](#source-s4)
 
 `pppos_output_append()` 的关键逻辑：[S1](#source-s1)
 
@@ -463,7 +526,7 @@ if (accm && ESCAPE_P(pppos->out_accm, c)) {
 }
 ```
 
-注意顺序：FCS 对原始逻辑 byte 计算，然后才做 serial escaping。escape 是传输编码，不改变上层 frame 内容。
+源码中最值得注意的是执行顺序：FCS 先对逻辑 octet 计算，随后才根据 `out_accm[]` 做 serial escaping。也就是说 ACCM 改变线上编码，不改变 PPP 上层看到的 protocol payload。
 
 ## 15. 完整 RX frame 最终怎样进入 `ppp_input()`
 
@@ -706,7 +769,7 @@ flowchart TD
 - 类型：IETF 标准规范
 - 版本：RFC 1661，1994
 - URL/文档：[RFC 1661](https://www.rfc-editor.org/rfc/rfc1661.html)
-- 使用位置：“PPP Protocol field”“LCP/NCP 分层”“phase 与 configuration negotiation”
+- 使用位置：“建议提前阅读”“PPP/PPPoS 初学者模型”“Protocol field”“LCP/NCP 分层”“phase 与 configuration negotiation”
 - 支撑内容：提供 PPP link、LCP、Network-Layer Protocol 与 frame protocol demultiplex 的规范语义
 
 <a id="source-s4"></a>
@@ -714,5 +777,5 @@ flowchart TD
 - 类型：IETF 标准规范
 - 版本：RFC 1662，1994
 - URL/文档：[RFC 1662](https://www.rfc-editor.org/rfc/rfc1662.html)
-- 使用位置：“0x7E Flag”“0x7D escaping”“ACCM”“Address/Control compression”“Protocol compression”“16-bit FCS”
+- 使用位置：“建议提前阅读”“PPPoS framing 初学者模型”“0x7E Flag”“0x7D escaping”“ACCM”“Address/Control compression”“Protocol compression”“16-bit FCS”
 - 支撑内容：提供异步串行 PPP framing 与 transparency/FCS 的标准定义，用于对照 `pppos.c` 实现

@@ -6,31 +6,68 @@
 
 [TOC]
 
-Stage 4 已经建立 IPv4 的基本收发路径，Stage 12 又补齐了 `pbuf` / `memp` 的资源模型。现在进入协议栈的边界行为：一个原本完整的 IPv4 datagram 在 **输出接口 MTU 装不下** 时怎样被拆开，另一端又怎样把 fragments 恢复成完整 packet。
+IPv4 fragmentation（IPv4 分片）解决的是“一个 IPv4 datagram 比当前可发送路径允许的 packet 更大时，怎样把它拆成多个 fragment”；reassembly（重组）则在最终目的主机把这些 fragment 恢复成原始 datagram。Fragment 不是新的传输层或 ICMP message，每一片仍然携带自己的 IPv4 Header，并通过 Identification、MF（More Fragments）和 Fragment Offset 表明自己属于哪个原始 datagram、位于什么位置、后面是否还有片段。[S4](#source-s4)[S12](#source-s12)
 
-本篇只保留这一条主线：
+MTU（Maximum Transmission Unit，最大传输单元）表示某个接口一次能够承载的最大网络层 packet 大小；PMTU（Path MTU，路径 MTU）是端到端路径上可无分片通过的最小 MTU；TCP MSS（Maximum Segment Size，最大报文段数据长度）属于 TCP 层，限制的是单个 TCP segment 中的 payload，不等于 IPv4 MTU。IPv4 Header 的 Total Length 则描述当前完整 IPv4 packet 的实际字节数。[S6](#source-s6)[S10](#source-s10)[S11](#source-s11)
 
-```text
-IPv4 packet > netif->mtu
-    ↓
-ip4_frag()
-    ↓
-多个 fragment
-    ↓
-Ethernet / Driver / wire
-    ↓
-ip4_input()
-    ↓
-ip4_reass()
-    ↓
-完整 IPv4 pbuf chain
-    ↓
-ICMP / UDP / TCP
+DF（Don't Fragment）表示不允许中间 IPv4 router 对该 datagram 分片。DF 为 0 且 packet 超过出口 MTU 时可以进入 fragmentation；DF 为 1 时，转发节点不能直接拆片，而应丢弃超 MTU packet 并通过 ICMP “Fragmentation Needed” 类错误把限制反馈给发送端，供 IPv4 Path MTU Discovery 调整后续 packet 大小。[S4](#source-s4)[S6](#source-s6)
+
+## 0. 阅读源码前：先把 fragmentation / reassembly 协议模型建立起来
+
+### 0.1 建议提前阅读
+
+1. [Cisco — IPv4 Fragmentation, MTU, MSS and PMTUD](https://www.cisco.com/c/en/us/support/docs/ip/generic-routing-encapsulation-gre/25885-pmtud-ipfrag.html)
+   - 用途：快速区分 MTU、PMTU、MSS、DF 与 PMTUD（Path MTU Discovery，路径 MTU 发现）的工程关系。[S11](#source-s11)
+2. [RFC 791 — Internet Protocol](https://www.rfc-editor.org/rfc/rfc791.html)
+   - 用途：核对 Identification、MF、Fragment Offset、DF 与重组的基础语义。[S4](#source-s4)
+3. [RFC 1191 — Path MTU Discovery](https://www.rfc-editor.org/rfc/rfc1191.html)
+   - 用途：理解 DF、ICMP Fragmentation Needed 与 IPv4 PMTUD 怎样协作。[S6](#source-s6)
+4. [RFC 8900 — IP Fragmentation Considered Fragile](https://www.rfc-editor.org/rfc/rfc8900.html)
+   - 用途：理解 fragmentation 在真实网络中为什么会带来可靠性、安全与中间设备兼容风险。[S10](#source-s10)
+
+### 0.2 Fragment Header 字段怎样共同描述一个原始 datagram
+
+| 字段/概念 | 当前语义 | 对重组的作用 |
+| --- | --- | --- |
+| Identification | 标记原始 IPv4 datagram 的 ID | 接收端用它与地址等信息关联属于同一 datagram 的 fragments |
+| Fragment Offset | 当前 fragment payload 在原始 IP payload 中的起始位置，单位为 8 bytes | 决定片段应该放回哪里 |
+| MF | More Fragments | `1` 表示后面还有 fragment，最后一片为 `0` |
+| DF | Don't Fragment | `1` 禁止 router fragmentation |
+| Total Length | 当前 fragment 自己的 IPv4 Header + payload 长度 | 决定这一片实际携带多少字节 |
+
+除最后一个 fragment 外，fragment payload 长度通常必须能够按 8-byte block 对齐，这样 Fragment Offset 才能精确表达下一片的位置。[S4](#source-s4)
+
+### 0.3 一次 fragmentation → reassembly 的总流程
+
+```mermaid
+flowchart TD
+    A["Original IPv4 datagram"] --> B{"Total Length exceeds egress MTU?"}
+    B -->|No| C["Send one IPv4 packet"]
+    B -->|Yes and DF is 0| D["Split payload into fragments"]
+    B -->|Yes and DF is 1| E["Drop on forwarding path and report Fragmentation Needed"]
+    D --> F["Fragments share Identification and carry Offset/MF"]
+    F --> G["Receiver queues fragments, including out-of-order arrival"]
+    G --> H{"All byte ranges complete and last fragment seen?"}
+    H -->|No| I["Keep waiting until timeout or resource eviction"]
+    H -->|Yes| J["Restore one IPv4 datagram"]
+    J --> K["Continue ICMP / UDP / TCP input"]
 ```
 
-同时追踪两个不能忽略的工程问题：**fragment queue 的 timer** 和 **pbuf/memp 资源预算**。当前源码基线仍为 `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
+本文的真实 Host/TAP 实验同时覆盖两个方向：Linux 先把大 ICMP Echo Request 分片，lwIP 的 `ip4_reass()` 收齐后恢复完整 request；lwIP 生成同样很大的 Echo Reply 后，`ip4_frag()` 再按 `netif->mtu` 拆成 fragments 发回 Linux。[S7](#source-s7)
 
-本文源码块采用统一约定：除非明确写“上游连续源码片段”，其余 C 代码块均视为按当前 revision 截取的执行路径阅读版；函数切换会明确给出 call site 和当前函数，不使用省略号充当缺失源码。
+### 0.4 协议动作与 lwIP 源码的双轨映射
+
+| 协议阶段 | lwIP 入口 | 关键字段/对象 | 完成后的下一步 |
+| --- | --- | --- | --- |
+| TX 判断是否超 MTU | `ip4_output_if_opt_src()` | `p->tot_len`、`netif->mtu` | 直接发送或进入 `ip4_frag()` |
+| 构造 fragments | `ip4_frag()` | Identification、Offset、MF、Total Length | 每片调用 `netif->output()` |
+| RX 识别 fragment | `ip4_input()` | MF / Fragment Offset | fragment 进入 `ip4_reass()` |
+| 建立/查找重组项 | `ip4_reass()` | `ip_reassdata`、fragment byte range | 排序并等待缺失片段 |
+| 完成重组 | `ip4_reass()` | 完整连续 byte range | 返回完整 `pbuf` 给 `ip4_input()` |
+| 超时/资源回收 | `ip_reass_tmr()` / eviction path | timer、`IP_REASS_MAX_PBUFS` | 丢弃不完整 datagram |
+| DF/PMTU 边界 | `ip4_forward()` | DF、egress MTU | fragment 或 ICMP error |
+
+下面进入源码后，只沿这条真实执行路径下钻；RFC 与厂商资料负责权威定义，但正文会在字段第一次影响当前函数分支时继续解释其行为。
 
 ## 1. 真实发送入口：`ip4_output_if()` 为什么进入 `ip4_frag()`
 
@@ -85,39 +122,25 @@ flowchart TD
 
 因此分片不是 Driver 临时决定的行为。**触发点就在 IPv4 output 层，判断依据是所选 `netif` 的 MTU。**
 
-## 2. MTU、IPv4 Total Length、TCP MSS 与 `pbuf` 长度不能混在一起
+## 2. 协议字段回到 lwIP 时，对应哪些变量与对象
 
-| 对象 | 层次 | 当前作用 |
+上面的协议基线已经说明 MTU、PMTU、MSS 与 fragment fields 的职责。进入源码后，需要继续把这些协议对象落到具体变量和分支，而不是把它们当作已知黑盒：[S1](#source-s1)[S10](#source-s10)[S11](#source-s11)
+
+| 协议/工程概念 | lwIP 中当前对应对象 | 本篇为什么关心 |
 | --- | --- | --- |
-| `netif->mtu` | L3/L2 边界 | 一个 IPv4 packet 在该接口上无需 IPv4 fragmentation 时允许的最大 IP 长度 |
-| IPv4 `Total Length` | IPv4 | 当前 packet 从 IP Header 开始的总长度 |
-| TCP MSS | TCP | 单个 TCP segment 的 TCP payload 上限策略，通常用于避免产生过大的 IP packet |
-| `p->len` | pbuf | 当前一个 pbuf node 的可见长度 |
-| `p->tot_len` | pbuf chain | 从当前 pbuf 开始的整条 chain 长度 |
+| 输出接口 MTU | `netif->mtu` | `ip4_output_if_opt_src()` 判断是否进入 `ip4_frag()` |
+| 当前 IPv4 packet 总长度 | IPv4 `Total Length`、`p->tot_len` | 与 `netif->mtu` 比较并决定分片 |
+| TCP MSS | TCP PCB / option 相关状态 | 属于 TCP segmentation 边界，不等于 IPv4 fragmentation |
+| 当前 pbuf node 长度 | `p->len` | 只描述当前 node |
+| 整条 pbuf chain 长度 | `p->tot_len` | IPv4 output 看到的完整 packet 长度 |
+| Fragment Identification | IPv4 Header `id` | reassembly 用来区分不同原始 datagram |
+| MF / Fragment Offset | IPv4 Header offset/flag | 表示当前 fragment 的位置及后续是否还有 fragment |
 
-TCP segmentation 与 IPv4 fragmentation 都可能让大数据在线上变成多个 packet，但不是同一机制：
+“线上出现多个 packet”不能直接等价为 IPv4 fragmentation；本文以 IPv4 fragment 字段和 `ip4_frag()` / `ip4_reass()` 调用链为准。
 
-```text
-TCP byte stream
-   ↓ TCP segmentation
-TCP segment
-   ↓ IPv4 encapsulation
-IPv4 packet
-   ↓ 若仍然 > MTU
-IPv4 fragmentation
-```
+## 3. RFC 字段在 lwIP 中落到哪些宏
 
-只有 IPv4 Header 中的 MF / Fragment Offset 才说明发生了 IPv4 fragmentation。
-
-## 3. Fragmentation 真正依赖的 Header 字段：ID、MF、Offset
-
-RFC 791 定义 IPv4 fragmentation / reassembly 的基础字段：[S4](#source-s4)
-
-- **Identification**：同一个原始 datagram 的 fragments 使用同一个 ID；
-- **MF（More Fragments）**：后面还有 fragment 时为 1，最后一片为 0；
-- **Fragment Offset**：当前 fragment payload 在原始 payload 中的位置，单位是 **8 字节**。
-
-lwIP 的定义：[S1](#source-s1)
+RFC 791/6864 已定义这些字段；这里仅映射到 lwIP 宏。[S4](#source-s4)[S12](#source-s12)[S1](#source-s1)
 
 ```c
 #define IP_DF      0x4000U
@@ -128,13 +151,7 @@ lwIP 的定义：[S1](#source-s1)
   ((u16_t)((lwip_ntohs(IPH_OFFSET(hdr)) & IP_OFFMASK) * IP_MIN_FRAG_LENGTH))
 ```
 
-例如 Offset field 为 185：
-
-```text
-185 × 8 = 1480 bytes
-```
-
-意味着这片 payload 从原始 payload 的 byte 1480 开始。除最后一片外，fragment payload 因而需要保持 8-byte 对齐。
+实现映射只有一个关键点：Header 保存 8-byte block offset，`ip4_reass()` 会恢复为 byte range；例如 raw offset `185` 对应 byte offset `1480`。
 
 ## 4. 进入 `ip4_frag()`：先把 MTU 换算成 8-byte block
 
@@ -1051,35 +1068,11 @@ lwIP ip4_frag()
 Linux reassembly
 ```
 
-## 23. DF 与 PMTU 属于下一层问题：当前只建立边界
+## 23. DF 与 PMTU 只保留实现边界
 
-RFC 791 规定 DF（Don't Fragment）置位的 datagram 不允许进行 IPv4 fragmentation。[S4](#source-s4) 当前 lwIP `ip4_forward()` 在转发路径遇到超 MTU packet 时先检查 DF：[S1](#source-s1)
+DF=1 的核心语义是要求转发路径不要把当前 IPv4 datagram 拆成 fragments。若 router 发现 packet 大于下一跳接口 MTU，不能直接调用 fragmentation，而是丢弃该 packet，并返回 ICMP Destination Unreachable / Fragmentation Needed；IPv4 PMTUD 再利用这个反馈降低后续发送尺寸。[S6](#source-s6)[S10](#source-s10)[S11](#source-s11) 在当前 lwIP 实现中，`ip4_forward()` 正是先比较 `p->tot_len` 与 egress `netif->mtu`，再检查 DF：DF=0 且启用 `IP_FRAG` 时进入 `ip4_frag()`；DF=1 时调用 `icmp_dest_unreach(p, ICMP_DUR_FRAG)`。[S1](#source-s1)
 
-```c
-if (netif->mtu && (p->tot_len > netif->mtu)) {
-  if ((IPH_OFFSET(iphdr) & PP_NTOHS(IP_DF)) == 0) {
-#if IP_FRAG
-    ip4_frag(p, netif, ip4_current_dest_addr());
-#endif
-  } else {
-#if LWIP_ICMP
-    icmp_dest_unreach(p, ICMP_DUR_FRAG);
-#endif
-  }
-  return;
-}
-```
-
-这已经触及 Path MTU Discovery：设置 DF 后根据 ICMP Fragmentation Needed 调整 packet size。RFC 1191 系统定义了 IPv4 PMTUD。[S6](#source-s6) 但本篇只解释“fragmentation 已发生后 lwIP 怎样拆和重组”，不继续扩成第二条 PMTU 主线。
-
-另外，`IP_FRAG` 与 `IP_REASSEMBLY` 是正交开关：[S2](#source-s2)
-
-| 配置 | 方向 | 作用 |
-| --- | --- | --- |
-| `IP_FRAG` | TX | 超 MTU 时提供 IPv4 fragmentation 实现 |
-| `IP_REASSEMBLY` | RX | 收到 fragments 时建立 reassembly queue |
-
-当前 `example_app` 两者都启用。
+`IP_FRAG` 与 `IP_REASSEMBLY` 仍是两个独立配置开关：前者控制 TX fragmentation，后者控制 RX reassembly。[S2](#source-s2) 当前 `example_app` 两者都启用。
 
 ## 24. 最终回看：一个大 Echo packet 怎样穿过完整 lwIP Core
 
@@ -1177,4 +1170,25 @@ flowchart TD
 - URL/文档：[ping(8) — Linux manual page](https://man7.org/linux/man-pages/man8/ping.8.html)
 - 使用位置：“产生 4000-byte ICMP payload”
 - 支撑内容：`-s` 指定 data bytes；`-M dont` 不设置 DF，从而允许本实验在 MTU 1500 路径上产生 IPv4 fragmentation
+
+<a id="source-s10"></a>
+### [S10] RFC 8900 — IP Fragmentation Considered Fragile
+- 类型：IETF BCP 230；版本：2020-09
+- URL/文档：[RFC 8900](https://www.rfc-editor.org/rfc/rfc8900.html)
+- 使用位置：协议前置阅读、MTU/PMTU 边界
+- 支撑内容：MTU/PMTU、fragmentation procedure 与 fragility
+
+<a id="source-s11"></a>
+### [S11] Cisco — IPv4 Fragmentation, MTU, MSS and PMTUD
+- 类型：厂商工程文档；更新：2023-05-17
+- URL/文档：[Cisco IPv4 Fragmentation / PMTUD](https://www.cisco.com/c/en/us/support/docs/ip/generic-routing-encapsulation-gre/25885-pmtud-ipfrag.html)
+- 使用位置：协议前置阅读
+- 支撑内容：fragmentation/reassembly、MTU、MSS 与 PMTUD 的工程关系
+
+<a id="source-s12"></a>
+### [S12] RFC 6864 — Updated Specification of the IPv4 ID Field
+- 类型：IETF Standards Track；版本：2013-02
+- URL/文档：[RFC 6864](https://www.rfc-editor.org/rfc/rfc6864.html)
+- 使用位置：IPv4 ID/fragment 字段映射
+- 支撑内容：IPv4 Identification 的更新语义
 

@@ -8,7 +8,7 @@
 - 概念在第一次真正需要时解释，并完成足够的边界与数据方向说明；
 - example / Unix Port 的实现细节与 lwIP Core contract 分开描述；
 - 抓包、调试等工具由当前证据需求引出，不提前做工具百科；
-- Stage 0/15 这类 Theory-of-Operation 总览先建立系统位置和完整数据流，再逐层下钻；
+- Stage 0/15/31/38/45 这类 Theory-of-Operation 文章先建立系统位置和完整数据流，再逐层下钻；
 - 复杂调用链、状态迁移和数据流优先用 Mermaid 或技术图建立运行时模型；
 - 关键源码结论使用可追溯 Source Map，并链接到固定 upstream commit。
 
@@ -20,3 +20,5 @@
 
 - [《以太网工作原理》](other/以太网工作原理.pdf)
 - [《支持 RGMII 和 IEEE 1588v2 的千兆以太网收发器》](other/支持%20RGMII%20和IEEE%201588v2%20的千兆以太网收发器.pdf)
+- [《IEEE 局域网和城域网标准》](other/IEEE%20局域网和城域网标准：.pdf)
+- [《TI 设计：TIDA-00204 EMI/EMC 合规工业温度双口千兆》](other/TI%20设计：TIDA‑00204%20EMIEMC%20合规工业温度双口千兆.pdf)

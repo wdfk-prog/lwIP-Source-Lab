@@ -2,15 +2,71 @@
 
 # 教程 08：从 `tcp_write()` 到 ACK 清队列——TCP 数据发送、窗口与回调
 
-> 摘要：沿 Raw TCP Echo 的真实数据路径，理解 TCP 写入如何形成待发送队列、输出如何进入待确认队列，以及 ACK 如何释放 segment、恢复发送额度并触发 callback。
+> 摘要：从 TCP 字节流、序列号/确认号与窗口模型出发，沿 Raw TCP Echo 数据路径追踪接收回调、发送排队、待确认队列、ACK 清理和接收窗口归还。
 
 [TOC]
 
-本文源码块采用统一约定：除非代码块前明确标注为“上游连续源码片段”，其余 C 代码块一律视为按当前 revision 裁剪的“执行路径阅读版”。阅读版只删除与当前主线无关的注释、条件编译或旁支，不重排保留语句，也不使用省略号伪装缺失源码；示意代码会另行标注。
+Stage 7 已经完成 passive open，并得到一个 `ESTABLISHED` connection PCB。本篇从第一块 application data 到达开始继续追：TCP 怎样把收到的 bytes 交给 Raw recv callback，Echo 怎样通过 `tcp_write()` 把 bytes 排入发送队列，以及远端 ACK 怎样释放 `unacked` segment、恢复发送额度并触发 `sent` callback。[S1](#source-s1)[S2](#source-s2)
 
-Stage 7 已经得到一个 `ESTABLISHED` connection PCB，并在 `tcpecho_raw_accept()` 中注册了 `recv` 与 `sent` callbacks。现在从第一块 application data 到达开始继续追。[S1](#source-s1)
+本篇只建立正常数据面的主干；重传超时（RTO）和快速重传（Fast Retransmit）留到 Stage 9，乱序接收与选择性确认（SACK）留到 Stage 10。为了让第一次接触 TCP 数据面的读者能直接进入源码，先把这一主干依赖的协议概念建立起来。
 
-这一篇只建立正常数据面的主干。RTO、Fast Retransmit 放到 Stage 9，乱序与 SACK 放到 Stage 10。
+## 阅读源码前：建议提前阅读
+
+1. [RFC 9293 — Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293.html)：重点看数据 bytes 如何编号、接收端如何确认，以及接收方怎样通告当前可接收空间。[S6](#source-s6)
+2. [RFC 5681 — TCP Congestion Control](https://www.rfc-editor.org/rfc/rfc5681.html)：本篇只用它理解“网络拥塞也会限制发送量”这一事实；具体拥塞窗口及 Slow Start/Fast Retransmit 算法在正文首次需要和 Stage 9 再展开。[S7](#source-s7)
+3. [lwIP 2.1.x — TCP Raw API](https://www.nongnu.org/lwip/2_1_x/group__tcp__raw.html)：用于先认识 `tcp_write()`、`tcp_output()`、`tcp_recved()`、`tcp_sndbuf()` 等公开接口/宏；具体执行行为以固定 commit 为准。[S9](#source-s9)
+4. [Cisco — Troubleshooting TCP/IP](https://www.cisco.com/en/US/docs/internetworking/troubleshooting/guide/tr1907.html)：可作为 TCP Header、数据编号/确认与窗口机制的补充图解资料。[S8](#source-s8)
+
+## 进入源码前先建立 TCP 正常数据面的协议模型
+
+### TCP 传的是 byte stream，不是 datagram
+
+TCP 对应用提供 **byte stream（字节流）**：应用写入的是连续 bytes，TCP 可以根据 MSS、窗口和实现策略把这些 bytes 切成一个或多个 segment；接收应用不能依赖“发送端一次 `write` 就对应接收端一次 callback”。[S6](#source-s6)
+
+几个后文会反复出现的术语先统一：
+
+- **Sequence Number（序列号）**：标识当前 TCP segment 中第一个数据 byte 在发送方向 sequence space 中的位置。
+- **ACK / Acknowledgment Number（确认号）**：表示接收端下一次期望的 sequence number。正常 TCP ACK 是累计确认：ACK 前的连续 bytes 都被确认收到。[S6](#source-s6)
+- **Receive Window（接收窗口）**：接收端通告自己当前还能接受多少数据，用于 flow control（流量控制）。在本地接收方向，lwIP 用 `rcv_wnd` 管理可接收额度；在发送方向，`snd_wnd` 保存对端通告给本端的窗口。[S2](#source-s2)[S3](#source-s3)
+- **Congestion Window，`cwnd`（拥塞窗口）**：发送端根据网络拥塞控制算法维护的发送限制。它和对端通告的 `snd_wnd` 不是同一个窗口。[S7](#source-s7)
+- **MSS（Maximum Segment Size，最大报文段数据长度）**：约束单个 TCP segment 通常承载多少 TCP payload；它不是 Ethernet MTU，也不是 `PBUF_POOL_BUFSIZE`。[S3](#source-s3)[S5](#source-s5)
+- **`snd_buf`**：lwIP PCB 对“还允许应用通过 `tcp_write()` 排入多少 bytes”的本地记账额度；它也不是 `snd_wnd` 或 `cwnd`。[S3](#source-s3)
+
+lwIP 发送队列中的两个名字也必须先分开：
+
+- **`unsent`**：已经由 `tcp_write()` 组织成 TCP segment，但尚未进入“已发送等待确认”状态的队列。
+- **`unacked`**：已经由 `tcp_output()` 发出、正在等待累计 ACK 确认的 segment 队列。[S3](#source-s3)[S4](#source-s4)
+
+### 一次正常 Echo 数据交换在协议上发生什么
+
+假设 Host 已和 lwIP 建立连接，Host 发送 `n` bytes，第一字节 sequence number 为 `x`。lwIP 接受这段连续数据后，下一次期望 sequence number 变成 `x+n`；确认可以单独发送，也可以和反向 Echo data 一起携带。Echo data 被 Host 接收后，Host 再用 ACK 确认服务器方向的 bytes。[S6](#source-s6)
+
+```mermaid
+sequenceDiagram
+    participant H as Host
+    participant S as lwIP TCP Echo Server
+
+    H->>S: TCP data, SEQ=x, LEN=n
+    Note over S: 接受连续 bytes, next expected SEQ = x+n
+    S->>H: Echo TCP data, SEQ=y, ACK=x+n, LEN=n
+    Note over S: ACK 可与反向数据捎带，也可能按时机独立发送
+    H-->>S: ACK=y+n
+```
+
+这里最重要的因果关系是：**应用把 bytes 交给 `tcp_write()`，不等于对端已经收到；只有对应 ACK 推进后，相关 segment 才能从 `unacked` 释放。**
+
+### 协议动作怎样映射到本篇源码
+
+| 协议阶段 | TCP 语义 | lwIP 源码位置 | 关键对象/字段 | 下一步 |
+| --- | --- | --- | --- | --- |
+| RX data 到达 | 校验 sequence/window，接受连续 bytes | `tcp_input()` → `tcp_process()` → `tcp_receive()` | `rcv_nxt`、`rcv_wnd`、`recv_data` | `TCP_EVENT_RECV()` |
+| 应用消费 RX | Echo callback 取得 payload | `tcpecho_raw_recv()` → `tcpecho_raw_send()` | RX `pbuf` | `tcp_write()` |
+| 应用排队 TX | bytes 进入 TCP send queue | `tcp_write()` | `snd_buf`、`unsent` | 等待/触发 `tcp_output()` |
+| TCP 真正输出 | segment 受 `snd_wnd`/`cwnd` 等限制发送 | `tcp_output()` | `unsent` → `unacked` | 等待远端 ACK |
+| RX ACK | 累计确认已发送 bytes | `tcp_receive()` / ACK 清理逻辑 | ACK 推进位置、`unacked`、`snd_buf` | `TCP_EVENT_SENT()` |
+| 应用归还 RX credit | 表示应用已经消费 bytes | `tcp_recved()` | `rcv_wnd` | 必要时产生 window update |
+
+下面从 Stage 7 的直接 continuation——`tcp_input()` 处理 `ESTABLISHED` connection 的数据 segment——继续源码主线。
 
 ## 1. 第一块数据怎样从 `tcp_input()` 到达 `tcpecho_raw_recv()`
 
@@ -188,6 +244,8 @@ flowchart LR
 
 ## 3. `tcp_write()` 的职责是怎样把 application bytes 变成 `unsent`
 
+协议/源码映射现在从“应用收到 RX bytes”切到“应用提交反向 Echo bytes”。这一阶段还没有证明数据已经上网线；先看 `tcp_write()` 怎样把 application bytes 变成 TCP 自己管理的待发送 segment。
+
 只说“`tcp_write()` 负责排队”仍然不够，需要看到它在源码里先检查什么、再怎样为数据建立 segment/pbuf。[S4](#source-s4)
 
 函数入口首先拒绝 LISTEN PCB、空指针、超出 `snd_buf` 的写入，以及会让 queue length 超限的请求：[S4](#source-s4)
@@ -318,6 +376,8 @@ MSS 是 TCP 层对 segment payload 的约束；`PBUF_POOL_BUFSIZE` 是内存池�
 
 ## 5. `tcp_output()`：源码里怎样从 `unsent` 推进到 `unacked`
 
+到这里 `tcp_write()` 已完成 queueing。协议总流程接下来才进入真正的 TX：满足发送窗口和拥塞限制的 segment 从 `unsent` 取出，发出后进入 `unacked` 等待远端累计 ACK。
+
 `tcp_output()` 不只是“扫描队列然后发送”。它先算真正允许发送的窗口：
 
 ```c
@@ -383,7 +443,7 @@ MSS 是 TCP 层对 segment payload 的约束；`PBUF_POOL_BUFSIZE` 是内存池�
 `tcp_output_segment()` 继续补当前 ACK number、advertised receive window、TCP options/checksum，然后进入 IP output。到这里才从 TCP queueing 进入实际 L3/L2 TX 路径。[S4](#source-s4)
 ## 6. `snd_buf`、`snd_wnd`、`cwnd` 三者必须分开
 
-走到 `tcp_output()` 时三个数同时开始影响发送，最好在这里一次消歧：[S3](#source-s3)[S4](#source-s4)
+走到 `tcp_output()` 时三个数同时开始影响发送，最好在这里一次消歧。`snd_wnd` 的 flow-control 语义来自 TCP，`cwnd` 的 sender-side congestion-control 语义由 RFC 5681 定义；下面只说明它们在 lwIP PCB 中怎样与本地 `snd_buf` 同时限制发送。[S3](#source-s3)[S4](#source-s4)[S7](#source-s7)
 
 | 名称 | 谁控制 | 表示什么 | 主要限制什么 |
 | --- | --- | --- | --- |
@@ -427,6 +487,8 @@ TCP 不是按“第几个 pbuf”确认，而是按 byte sequence space 累计�
 这只是帮助建立相对位置的模型，实际 list segment 边界、控制 flag 与重传状态还会影响它们；不要把上图当作所有状态下严格连续的内存布局。
 
 ## 8. ACK 回来以后：代码怎样释放 `unacked` 并恢复 `snd_buf`
+
+协议总流程现在进入最后一个关键阶段：Host 对 Echo data 返回累计 ACK。下面继续沿 RX 链验证 ACK 怎样推进发送状态，而不是把“网卡发送完成”误当成“TCP 数据已经被对端确认”。
 
 ACK 也沿 Stage 7 的完整 RX 链重新进入 `tcp_input()`。四元组命中同一个 PCB 后，`tcp_process()` 在 `ESTABLISHED` 分支再次进入 `tcp_receive()`。这一次即使没有 application payload，只要 `TCP_ACK` flag 存在，ACK 状态机也会运行。[S2](#source-s2)
 
@@ -702,3 +764,24 @@ sequenceDiagram
 - URL/文档：[RFC 9293 — Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293.html)
 - 使用位置：sequence/ACK 累计确认与 receive window 语义
 - 支撑内容：TCP byte sequence space、ACK 与 flow-control 基本协议语义
+
+<a id="source-s7"></a>
+### [S7] RFC 5681 — TCP Congestion Control
+- URL/文档：[RFC 5681 — TCP Congestion Control](https://www.rfc-editor.org/rfc/rfc5681.html)
+- 使用位置：“阅读源码前”、`snd_wnd`/`cwnd` 消歧
+- 支撑内容：区分 receiver advertised window 与 sender congestion window，并作为 Stage 9 后续拥塞控制/快速重传的规范入口
+
+<a id="source-s8"></a>
+### [S8] Cisco — Troubleshooting TCP/IP
+- URL/文档：[Troubleshooting TCP/IP](https://www.cisco.com/en/US/docs/internetworking/troubleshooting/guide/tr1907.html)
+- 使用位置：“阅读源码前”、TCP 数据面补充说明
+- 支撑内容：提供 TCP Header、continuous byte stream、Sequence/Acknowledgment 与 Window 的补充图解；正文仍独立建立当前源码需要的正常数据面模型
+
+
+<a id="source-s9"></a>
+### [S9] lwIP 官方 TCP Raw API 文档
+- 类型：lwIP 官方 Doxygen 文档
+- 版本：2.1.x 文档；正文源码事实以固定 commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 为准
+- URL/文档：[lwIP — TCP Raw API](https://www.nongnu.org/lwip/2_1_x/group__tcp__raw.html)
+- 使用位置：“阅读源码前”、TCP Raw API 导航
+- 支撑内容：说明 `tcp_write()`、`tcp_output()`、`tcp_recved()`、`tcp_sndbuf()` 等接口/宏在 Raw TCP API 中的位置；发送队列和 ACK 处理的具体行为由 [S1]～[S4] 目标源码证明

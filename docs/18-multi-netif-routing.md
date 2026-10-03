@@ -6,22 +6,45 @@
 
 [TOC]
 
-Stage 2 已建立 `netif`，Stage 4 已走通 IPv4/ARP，Stage 5 已从 `udp_sendto()` 进入 UDP Raw API。此前 Unix Host 实验基本只有一个 TAP，因此“一个 IPv4 packet 到底从哪张网卡出去”一直没有真正暴露出来。
+Multi-netif 表示同一个 lwIP 实例同时存在多个 `struct netif` 网络接口。本文标题中的 **Default Netif（默认接口）** 是没有更具体匹配时的 fallback outgoing interface；**Gateway（网关）** 是已经选定某张接口以后，在当前二层链路上需要直接发送给的下一跳 IP。两者不是同一个对象，也不等价于“默认路由 = 网关地址”。
 
-Stage 18 把问题收敛到一条 IPv4 主线：**应用没有显式固定接口时，lwIP 怎样选择 outgoing `netif`；选定接口以后，又怎样判断这一跳应该直接 ARP destination，还是 ARP 该接口的 gateway。** 当前源码基线仍为 upstream `master` commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。[S1](#source-s1)
+Stage 18 只回答 IPv4 发送方向上的一个问题：应用没有显式固定接口时，lwIP 怎样先选择 outgoing `netif`，然后怎样决定 Ethernet 下一跳是 destination 本身还是该接口的 gateway。前者是 **route selection（出口接口选择）**，后者是 **next-hop selection（二层下一跳选择）**。[S1](#source-s1)
 
-这里必须从一开始就把两个动作分开：
+## 0. 进入源码前先建立 route / next-hop 模型
 
-```text
-route selection
-    = 选哪一个 outgoing netif
+推荐先浏览两份 lwIP 官方资料，它们用于确认 API/hook 契约，不是理解正文的前置条件：
 
-next-hop selection
-    = 已经选定 netif 后，
-      当前 Ethernet 链路上的下一跳是谁
+1. [lwIP IPv4 API — `ip4_route()` / `ip4_route_src()`](https://www.nongnu.org/lwip/2_1_x/ip4_8h.html)：确认默认实现如何扫描接口，以及 source-based routing（源 IPv4 地址也参与出口接口选择）的扩展边界。[S3](#source-s3)
+2. [lwIP Hooks](https://www.nongnu.org/lwip/2_1_x/group__lwip__opts__hooks.html)：重点看 `LWIP_HOOK_IP4_ROUTE[_SRC]` 与 `LWIP_HOOK_ETHARP_GET_GW`，它们分别位于“选接口”和“选下一跳”两个阶段。[S4](#source-s4)
+
+先区分五个概念：
+
+| 概念 | 当前文章中的含义 |
+| --- | --- |
+| `netif_list` | lwIP 当前所有候选接口的链表 |
+| `netif_default` | 没有更具体 route match 时的 fallback interface |
+| directly connected subnet | destination 与某接口 IPv4/netmask 匹配，可在该接口链路上直接到达 |
+| route selection | 根据 destination、可选 source、protocol control block（PCB，协议控制块）的接口绑定等条件选择 outgoing `netif` |
+| next hop | 已选定接口后，Ethernet/ARP 这一跳真正要解析 MAC 的 IPv4 地址 |
+
+lwIP 默认 `ip4_route()` 不是 Linux 那种带 prefix/metric/policy 的完整 FIB（Forwarding Information Base，转发表）。默认实现主要线性扫描 `netif_list`，寻找与 destination 同 subnet 的接口；没有直连匹配时再退到 `netif_default`。如果项目需要 source policy、复杂前缀或 destination-specific gateway，可以通过 hook 扩展。[S3](#source-s3)[S4](#source-s4)
+
+ARP（Address Resolution Protocol，地址解析协议）在 Ethernet IPv4 路径中负责把“本链路下一跳 IPv4 地址”解析成目标 MAC 地址。因而 route selection 只选接口，真正决定 ARP destination 还是 gateway 要等到 next-hop selection。
+
+完整发送模型可以先压成四步：
+
+```mermaid
+flowchart LR
+    A["UDP/TCP destination"] --> B["route selection: choose netif"]
+    B --> C["choose source address"]
+    C --> D["next-hop selection on chosen netif"]
+    D --> E["ARP destination or gateway"]
+    E --> F["Ethernet frame"]
 ```
 
-对于本文的 Ethernet/IPv4 路径，前者主要由 `ip4_route()` 决定，后者主要在 `etharp_output()` 中决定。[S1](#source-s1)
+关键点是：**route 返回的是接口，不是最终二层 MAC，也不会把 IPv4 header 的 destination 改成 gateway。** `etharp_output()` 只是在 off-link 情况下把 ARP 对象改成 gateway；线上 IPv4 destination 仍是原始远端地址。[S1](#source-s1)
+
+下面从真实 `udp_sendto()` 入口验证这四步怎样落到代码。
 
 ## 1. 从 `udp_sendto()` 开始：发包前先要得到一个 outgoing `netif`
 
@@ -294,7 +317,7 @@ destination = 192.0.2.80
 
 ### 5.1 默认实现不是一个完整的 longest-prefix route table
 
-当前默认代码的行为是：
+lwIP 官方 API 对 `ip4_route()` 的描述同样是“线性搜索 network interface list”。[S3](#source-s3) 当前目标源码进一步显示其具体早退行为：
 
 ```text
 NETIF_FOREACH
@@ -642,7 +665,7 @@ Ethernet next hop = 198.51.100.80 自己
 
 ## 12. 一个真正的 IPv4 route entry 往往需要同时回答“接口”和“下一跳”
 
-lwIP 给 advanced routing 留了两个不同 hook：[S1](#source-s1)
+lwIP 给 advanced routing 留了两个不同 hook；这两个 hook 的职责也由官方 Hooks 文档分别定义。[S1](#source-s1)[S4](#source-s4)
 
 ```text
 LWIP_HOOK_IP4_ROUTE / LWIP_HOOK_IP4_ROUTE_SRC
@@ -909,3 +932,20 @@ MAC/DMA 硬件 offload 在哪一层接管
 - URL/文档：[Unix example_app](https://github.com/lwip-tcpip/lwip/tree/d08f4773edd0182b7910fc8f046eed82ffcd67c9/contrib/ports/unix/example_app)
 - 使用位置：“当前 Unix example”“netif_list/netif_default”“双接口阅读模型边界”
 - 支撑内容：证明当前 Unix example 只创建一个默认 netif，而 lwIP Core 仍保留 multi-netif 数据结构与默认接口语义
+
+<a id="source-s3"></a>
+### [S3] lwIP 官方 IPv4 API 文档
+- 类型：upstream 官方 API 文档
+- 版本：lwIP 2.1.x Doxygen，访问日期 2026-10-03
+- URL/文档：[lwIP IPv4 API — ip4_route / ip4_route_src](https://www.nongnu.org/lwip/2_1_x/ip4_8h.html)
+- 使用位置：开篇 route contract、`ip4_route()` 默认扫描行为、source-based routing 边界
+- 支撑内容：官方说明 `ip4_route()` 线性搜索接口列表并按掩码匹配 destination；`ip4_route_src()` 的 source-based routing 需要通过 hook 完整实现
+
+<a id="source-s4"></a>
+### [S4] lwIP 官方 Hooks 文档
+- 类型：upstream 官方配置/API 文档
+- 版本：lwIP 2.1.x Doxygen，访问日期 2026-10-03
+- URL/文档：[lwIP Hooks](https://www.nongnu.org/lwip/2_1_x/group__lwip__opts__hooks.html)
+- 使用位置：route hook、source route hook、per-destination gateway 扩展边界
+- 支撑内容：定义 `LWIP_HOOK_IP4_ROUTE` / `LWIP_HOOK_IP4_ROUTE_SRC` 返回 outgoing netif，并定义 `LWIP_HOOK_ETHARP_GET_GW` 在已选 netif 上返回 destination-specific gateway
+

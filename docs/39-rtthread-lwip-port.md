@@ -8,9 +8,13 @@
 
 Stage 38 已经把 lwIP Port Contract 拆成四块：`lwipopts.h` 配置、源码构建选择、OS/Arch Port、Network Port。Stage 39 不再重复这些抽象的原理，而是直接拿 RT-Thread 当前源码回答一个问题：**RT-Thread 怎样把这些 contract 一项项落成可运行代码，并把一个 Ethernet Driver 最终接到 `tcpip_thread`。**
 
-本文 RT-Thread 源码固定到 `RT-Thread/rt-thread` commit `dc8aaa73f2dbea255325ec058a083aeeb5381d0a`（2026-09-28）。这一版本的 Kconfig 可以选择内置 lwIP 1.4.1、2.0.3、2.1.2，也可以选择 `latest` package；本文为了追一条确定的内置源码链，以 **RT-Thread vendored lwIP 2.1.2 + shared port layer** 为主要实现证据。[S1](#source-s1)[S5](#source-s5)
-
 RT-Thread 的完整 Device Framework、NetDev、SAL、DFS 并不是本篇目标。它们只在当前调用链真正出现时说明接口位置；Socket/SAL 与 NetDev 会留到 Stage 40～41。
+
+## 阅读源码前：RT-Thread 官方文档先给框架，不替代目标 commit
+
+RT-Thread 当前 User Guide 已经给出两张很适合先看的地图：Kernel Basics 说明 `INIT_PREV_EXPORT`、`INIT_DEVICE_EXPORT`、`INIT_COMPONENT_EXPORT` 等自动初始化阶段；Network Framework 则从系统层面说明 lwIP、SAL、Ethernet device 以及 `tcpip`/`erx`/`etx` 数据路径的职责。[S7](#source-s7) 这些页面适合先建立 RT-Thread 的术语和分层，不需要在本文重新写一遍框架教程。
+
+但官方总览不会回答当前固定 revision 中 `lwip_system_init()` 怎样映射 Kconfig、`sys_arch`、`eth_device`、`netifapi_netif_add()` 与 `tcpip_input()`。因此下面仍以 commit `dc8aaa7...` 的源码为唯一主线；live 文档只承担阅读前置，不用于替代版本锁定的实现事实。
 
 ## 1. 从 RT-Thread 初始化入口 `lwip_system_init()` 开始
 
@@ -1135,3 +1139,12 @@ lwIP Core
 - URL/文档：[RT-Thread vendored tcpip.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/lwip/lwip-2.1.2/src/api/tcpip.c)、[RT-Thread vendored netifapi.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/lwip/lwip-2.1.2/src/api/netifapi.c)、[RT-Thread vendored netif.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/lwip/lwip-2.1.2/src/core/netif.c)
 - 使用位置：“tcpip thread 启动”“thread-safe netif add”“tcpip_input RX bridge”
 - 支撑内容：证明 RT-Thread Port 如何继续调用标准 lwIP 2.1.2 Core/API，而不是在 Port 层重写 TCP/IP processing
+
+
+<a id="source-s7"></a>
+### [S7] RT-Thread User Guide — Kernel Basics 与 Network Framework
+- 类型：RT-Thread 官方在线文档
+- 版本：访问日期 2026-10-03；用于概念/框架导读，源码事实仍固定到本文目标 commit
+- URL/文档：[Kernel Basics](https://rt-thread.github.io/rt-thread/page_kernel_basics.html)、[Network Framework](https://rt-thread.github.io/rt-thread/page_component_network.html)
+- 使用位置：“阅读源码前”“自动初始化阶段”“RT-Thread 网络框架分层”
+- 支撑内容：解释 RT-Thread 自动初始化宏的阶段语义，以及官方对 lwIP/SAL/Ethernet RX/TX framework 的整体划分

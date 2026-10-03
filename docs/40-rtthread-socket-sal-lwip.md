@@ -2,377 +2,1331 @@
 
 # 教程 40：从 `socket()` 到 `lwip_socket()`——DFS fd、SAL Socket 与 lwIP Backend
 
-> 摘要：从 RT-Thread 的 BSD socket 入口追踪 DFS fd、SAL socket、NetDev 选择与 lwIP backend，解释三层句柄如何把 POSIX 文件语义接到 lwIP Socket API。
+> 摘要：沿 RT-Thread 标准 Socket 入口追踪 DFS fd、SAL socket、lwIP socket 与 Netconn，解释创建、连接、收发、poll 和关闭如何保持同一 backend 上下文。
 
 [TOC]
 
-Stage 39 已经把 Ethernet Driver 接到了 lwIP `tcpip_thread`。但应用通常不会直接调用 `lwip_socket()`：启用 RT-Thread 的 SAL 与 POSIX socket 支持后，应用写的仍然是标准 `socket()`、`connect()`、`read()`、`write()`、`poll()`，中间却多出 DFS、SAL 和 NetDev。
+Stage 39 已经回答“Ethernet Driver 怎样把 packet 送进 lwIP”。Stage 40 改从应用侧进入：**SAL（Socket Abstraction Layer，Socket 抽象层）**为不同网络协议栈提供统一 BSD Socket API；**DFS（Device File System，设备文件系统）**在启用 POSIX 兼容时提供统一文件描述符和 file operations；lwIP 则仍是实际执行 TCP/UDP Socket 的 backend。对嵌入式产品，这种分层允许应用继续使用 `socket()/connect()/read()/write()/poll()`，底层却可以由 lwIP、AT 或其他网络实现承担。[S1](#source-s1)[S2](#source-s2)
 
-Stage 40 只回答这条应用侧主线：**`socket(AF_INET, SOCK_STREAM, 0)` 为什么最后会进入 `lwip_socket()`，以及后续同一个文件描述符怎样继续走到 `lwip_connect()`、`lwip_sendto()`、`lwip_recvfrom()`。**
+本文只追一条真实主线：`socket(AF_INET, SOCK_STREAM, 0)` 为什么最终进入 `lwip_socket()`，随后同一个应用 fd 又怎样继续找到 `lwip_connect()`、`lwip_sendto()`、`lwip_recvfrom()` 和 `lwip_close()`。RT-Thread 源码固定到 commit `dc8aaa73f2dbea255325ec058a083aeeb5381d0a`（2026-09-28），lwIP backend 使用该提交内置 lwIP 2.1.2。[S1](#source-s1)[S6](#source-s6)
 
-本文 RT-Thread 源码继续固定到 `RT-Thread/rt-thread` commit `dc8aaa73f2dbea255325ec058a083aeeb5381d0a`（2026-09-28），lwIP backend 以该提交内置的 lwIP 2.1.2 为主要证据。[S1](#source-s1)[S6](#source-s6)
+## 阅读源码前：SAL 与 VFS/DFS 的框架关系直接看官方文档
 
-## 1. 真实入口就是应用调用的 `socket()`
+RT-Thread 官方 SAL 文档已经完整画出 Application → VFS/DFS → SAL → protocol stack 的分层，并用 `connect()` 示例说明标准 BSD API 怎样经 SAL operation table 调到 `lwip_connect()` 或其他 backend；官方 VFS 文档则负责解释统一 fd/file-operation 基础设施。[S7](#source-s7)[S8](#source-s8) 因此本文不再承担“什么是 SAL、为什么 socket 也能 read/write”这类框架教学。
 
-当 `RT_USING_SAL` 与 `SAL_USING_POSIX` 生效时，`components/net/sal/socket/net_sockets.c` 会编进系统；这里直接实现并导出标准 BSD 名称 `socket()`。[S1](#source-s1)[S2](#source-s2)
+这里真正需要源码回答的是另外三个实现问题：**一个应用 fd 怎样关联 SAL descriptor；backend 在创建时怎样被选择并保存；poll/close 等后续操作怎样继续复用同一个 provider。** live 文档用于建立框架，下面的 descriptor ownership 与 dispatch 顺序仍以固定 commit 的 `[S2]～[S6]` 为准。
 
-`socket()` 的执行顺序不是先进入 lwIP，而是先建立 RT-Thread 的文件描述符对象：
+## 1. 真实入口：`socket()` 先创建 DFS fd，而不是直接调用 lwIP
+
+启用 SAL POSIX 层后，应用调用的标准 `socket()` 实现在 `components/net/sal/socket/net_sockets.c`。下面直接进入该函数。[S2](#source-s2)
+
+```c
+int socket(int domain, int type, int protocol)
+{
+    /* create a BSD socket */
+    int fd;
+    int socket;
+    struct dfs_file *d;
+
+    /* allocate a fd */
+    fd = fd_new();
+    if (fd < 0)
+    {
+        rt_set_errno(-ENOMEM);
+
+        return -1;
+    }
+    d = fd_get(fd);
+
+#ifdef RT_USING_DFS_V2
+    d->fops = dfs_net_get_fops();
+#endif
+
+    d->vnode = (struct dfs_vnode *)rt_malloc(sizeof(struct dfs_vnode));
+    if (!d->vnode)
+    {
+        /* release fd */
+        fd_release(fd);
+        rt_set_errno(-ENOMEM);
+        return -1;
+    }
+    dfs_vnode_init(d->vnode, FT_SOCKET, dfs_net_get_fops());
+
+    /* create socket  and then put it to the dfs_file */
+    socket = sal_socket(domain, type, protocol);
+    if (socket >= 0)
+    {
+        d->flags = O_RDWR; /* set flags as read and write */
+
+        /* set socket to the data of dfs_file */
+        d->vnode->data = (void *)(size_t)socket;
+    }
+    else
+    {
+#ifdef RT_USING_DFS_V2
+        dfs_vnode_destroy(d->vnode);
+        d->vnode = RT_NULL;
+#endif
+        /* release fd */
+        fd_release(fd);
+        rt_set_errno(-ENOMEM);
+        return -1;
+    }
+
+    return fd;
+}
+```
+
+这段代码已经建立第一层 ownership：
 
 ```mermaid
 flowchart TD
-    A["application socket(AF_INET, SOCK_STREAM, 0)"] --> B["fd_new(): allocate DFS fd"]
-    B --> C["fd_get(): obtain dfs_file"]
-    C --> D["dfs_vnode_init(... FT_SOCKET ...)"]
-    D --> E["sal_socket(domain, type, protocol)"]
-    E --> F["store SAL socket in vnode->data"]
-    F --> G["return DFS fd to application"]
+    A["socket(AF_INET, SOCK_STREAM, 0)"] --> B["fd_new(): allocate DFS fd"]
+    B --> C["fd_get(): dfs_file"]
+    C --> D["allocate dfs_vnode"]
+    D --> E["dfs_vnode_init(... FT_SOCKET ...)"]
+    E --> F["sal_socket(domain,type,protocol)"]
+    F --> G["vnode->data = SAL socket id"]
+    G --> H["return DFS fd"]
 ```
 
-`socket()` 因此同时创建两种不同层次的对象：[S2](#source-s2)
-
-| 对象 | 谁分配 | 对应用是否可见 | 当前职责 |
-| --- | --- | --- | --- |
-| DFS fd / `dfs_file` / `dfs_vnode` | `socket()` 外层 | 是 | 让 socket 进入统一 fd、`read/write/close/poll/select` 体系 |
-| SAL socket | `sal_socket()` | 否 | 记录 domain/type/protocol、NetDev、backend operations 与 backend socket |
-
-这一步先解释了一个容易混淆的问题：**RT-Thread 应用拿到的整数 fd 不是 lwIP 自己的 socket index。**
-
-## 2. 为什么必须先建立 DFS fd：`SAL_USING_POSIX` 把网络句柄接进文件系统 fd 模型
-
-SAL 的 Kconfig 对 `SAL_USING_POSIX` 的约束是 `depends on DFS_USING_POSIX`；启用后，SAL 构建脚本会额外加入：
+应用最终拿到的是 `fd`。`sal_socket()` 返回的整数没有直接返回应用，而是保存到 `d->vnode->data`。因此从第一步开始就必须区分：
 
 ```text
-socket/net_sockets.c
-dfs_net/*.c
+应用整数 fd
+    !=
+SAL socket descriptor
 ```
 
-这不是为了让“网络变成文件系统”，而是为了复用统一的 descriptor 与 POSIX I/O 分发表。[S1](#source-s1)
+如果 `sal_socket()` 失败，外层会释放刚分配的 DFS fd/vnode；这说明 DFS 对象是本次 API 的最外层 owner。
 
-`socket()` 为新 fd 创建 `FT_SOCKET` vnode，并把 `dfs_net_get_fops()` 返回的 `_net_fops` 绑定进去。`components/net/sal/dfs_net/dfs_net.c` 中这组 file operations 只提供五类桥接：[S2](#source-s2)
+## 2. `dfs_net_getsocket()`：后续每个 BSD API 都靠 vnode 找回 SAL socket
 
-| DFS operation | 网络桥接 |
-| --- | --- |
-| `.read` | `dfs_net_read()` → `sal_recvfrom()` |
-| `.write` | `dfs_net_write()` → `sal_sendto()` |
-| `.close` | `dfs_net_close()` → `sal_closesocket()` |
-| `.ioctl` | `dfs_net_ioctl()` → `sal_ioctlsocket()` |
-| `.poll` | `dfs_net_poll()` → `sal_poll()` |
+`socket()` 把 SAL descriptor 放进 `vnode->data` 后，`connect()`、`recv()`、`send()` 等入口都需要把应用 fd 重新还原成 SAL descriptor。这个桥接函数位于 `dfs_net.c`。[S2](#source-s2)
 
-所以 `read(fd, buf, n)` 与 `recv(fd, buf, n, 0)` 最终可以到达同一个 backend receive operation，只是入口不同。
+```c
+int dfs_net_getsocket(int fd)
+{
+    int socket;
+    struct dfs_file *file;
 
-这里 DFS 的职责到此为止。文件系统 pathname、mount、block device、VFS lookup 等机制与本系列的 lwIP 主线无关，不继续下钻。
+    file = fd_get(fd);
+    if (file == NULL) return -1;
 
-## 3. 进入 `sal_socket()`：先分配 SAL socket，再决定 protocol family
+    if (file->vnode->type != FT_SOCKET) socket = -1;
+    else socket = (int)(size_t)file->vnode->data;
 
-`socket()` 建好 DFS 外壳后直接调用 `sal_socket(domain, type, protocol)`。[S2](#source-s2)
-
-`sal_socket()` 位于 `components/net/sal/src/sal_socket.c`。主流程是：[S3](#source-s3)
-
-```mermaid
-flowchart TD
-    A["sal_socket()"] --> B["socket_new(): allocate SAL descriptor"]
-    B --> C["sal_get_socket(): obtain struct sal_socket"]
-    C --> D["socket_init(): validate + choose protocol_family / netdev"]
-    D --> E["pf->skt_ops->socket(...)"]
-    E --> F["save backend descriptor in sock->user_data"]
-    F --> G["return SAL socket descriptor"]
+    return socket;
+}
 ```
 
-`struct sal_socket` 可以理解为 SAL 自己的 per-socket control object。这里最重要的字段不是网络协议内部状态，而是三组“路由信息”：[S3](#source-s3)
+它只做两件事：
 
-- `domain / type / protocol`：保存创建参数；
-- `netdev`：这个 socket 绑定到哪个 RT-Thread network interface device；
-- `protocol_family`：这个 NetDev 对应哪一组 socket/netdb operations；
-- `user_data`：下层 backend 返回的实际 socket descriptor。
+1. `fd_get(fd)` 找回 DFS 的 `struct dfs_file`；
+2. 确认 vnode 是 `FT_SOCKET` 后读取 `vnode->data`。
 
-因此 SAL 本身不重新实现 TCP。它做的是 **选择 backend + 保存 dispatch context + 转发 socket API**。
+因此 DFS 在这里回答的是：
 
-## 4. `socket_init()` 怎样决定 `AF_INET` 交给谁
+> **这个整数 fd 对应哪个 socket 对象？**
 
-进入 `socket_init()` 后，当前实现先验证 family/type/protocol 组合，然后按三层优先级选择 provider。[S3](#source-s3)
+它没有决定 TCP 还是 UDP，也没有决定 lwIP 还是 AT。backend 选择发生在下一层 SAL。
 
-第一层是 `sal_proto_family_find(family)`。当前头文件把这种注册表明确描述为“不需要 NetDev 的 protocol provider”；例如 AF_UNIX 可以走这一类路径。lwIP 与 AT 的常规网卡路径主要依赖 NetDev，而不是靠这个全局表完成选择。[S3](#source-s3)
+## 3. 进入 `sal_socket()` 前先看 `struct sal_socket`：它保存 backend 选择结果
 
-若没有命中全局 provider，第二层检查 `netdev_default`：
+`socket()` 的直接下一步是 `sal_socket()`。在进入函数前，先看它实际维护的 per-socket control object。[S3](#source-s3)
+
+```c
+struct sal_socket
+{
+    uint32_t magic;                    /* SAL socket magic word */
+
+    int socket;                        /* SAL socket descriptor */
+    int domain;
+    int type;
+    int protocol;
+
+    struct netdev *netdev;             /* SAL network interface device */
+    const struct sal_proto_family *protocol_family; /* selected protocol provider */
+
+    void *user_data;                   /* user-specific data */
+#ifdef SAL_USING_TLS
+    void *user_data_tls;               /* user-specific TLS data */
+#endif
+};
+```
+
+这些字段构成 per-socket dispatch context：`netdev` 与 `protocol_family` 保存创建时选中的接口/provider，`user_data` 保存 backend 返回的实际 socket descriptor；SAL 本身不重新实现 TCP state machine。
+
+## 4. 进入 `sal_socket()`：先分配 SAL descriptor，再调用 `socket_init()` 选择 provider
+
+回到 `net_sockets.c::socket()` 的直接调用点，下面进入 `sal_socket()`。[S3](#source-s3)
+
+```c
+int sal_socket(int domain, int type, int protocol)
+{
+    int retval;
+    int socket, proto_socket;
+    struct sal_socket *sock;
+    const struct sal_proto_family *pf;
+
+    /* allocate a new socket and registered socket options */
+    socket = socket_new();
+    if (socket < 0)
+    {
+        return -1;
+    }
+
+    /* get sal socket object by socket descriptor */
+    sock = sal_get_socket(socket);
+    if (sock == RT_NULL)
+    {
+        socket_delete(socket);
+        return -1;
+    }
+
+    /* Initialize sal socket object */
+    retval = socket_init(domain, type, protocol, &sock);
+    if (retval < 0)
+    {
+        LOG_E("SAL socket protocol family input failed, return error %d.", retval);
+        socket_delete(socket);
+        return retval;
+    }
+
+    /* valid the network interface socket opreation */
+    SAL_SOCKETOPS_VALID(sock, pf, socket);
+
+    proto_socket = pf->skt_ops->socket(domain, type, protocol);
+    if (proto_socket >= 0)
+    {
+#ifdef SAL_USING_TLS
+        if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, socket))
+        {
+            sock->user_data_tls = proto_tls->ops->socket(socket);
+            if (sock->user_data_tls == RT_NULL)
+            {
+                socket_delete(socket);
+                return -1;
+            }
+        }
+#endif
+        sock->user_data = (void *)(size_t)proto_socket;
+        return sock->socket;
+    }
+    socket_delete(socket);
+    return -1;
+}
+```
+
+当前主线的关键状态变化是：
 
 ```text
-netdev_default 存在
-+ netdev is UP
-+ netdev->sal_user_data 指向的 family/sec_family 匹配请求 family
+socket_new()
+  -> 分配 SAL descriptor
+
+socket_init()
+  -> 写 sock->netdev
+  -> 写 sock->protocol_family
+
+pf->skt_ops->socket()
+  -> 调真正 backend 创建 socket
+
+sock->user_data = proto_socket
+  -> 保存 backend descriptor
+```
+
+注意 `proto_socket` 与 SAL `socket` 是两个不同整数。`sock->user_data` 正是后续 `connect/send/recv/close` 能继续找到同一 backend socket 的关键。
+
+## 5. 进入 `socket_init()`：backend 只在创建阶段选择一次
+
+`sal_socket()` 调用 `socket_init()` 后，SAL 才真正确定 protocol provider。[S3](#source-s3)
+
+```c
+static int socket_init(int family, int type, int protocol, struct sal_socket **res)
+{
+    struct sal_socket *sock;
+    const struct sal_proto_family *pf;
+    struct netdev *netdv_def = netdev_default;
+    struct netdev *netdev = RT_NULL;
+    rt_bool_t flag = RT_FALSE;
+
+    /* Existing range checks for family and type */
+    if (family < 0 || family > AF_MAX)
+    {
+        LOG_E("Invalid family: %d (must be 0 ~ %d)", family, AF_MAX);
+        return -1;
+    }
+
+    if (type < 0 || type > SOCK_MAX)
+    {
+        LOG_E("Invalid type: %d (must be 0 ~ %d)", type, SOCK_MAX);
+        return -2;
+    }
+
+    /* Range check for protocol */
+    if (!VALID_PROTOCOL(protocol))
+    {
+        LOG_E("Invalid protocol: %d (must be 0 ~ %d)", protocol, IPPROTO_RAW);
+        rt_set_errno(EINVAL);
+        return -4;
+    }
+
+    sock = *res;
+    sock->domain = family;
+    sock->type = type;
+    sock->protocol = protocol;
+
+    /* Combo compatibility check */
+    if (!VALID_COMBO(family, type, protocol))
+    {
+        LOG_E("Invalid combo: domain=%d, type=%d, protocol=%d", family, type, protocol);
+        rt_set_errno(EINVAL);
+        return -4;
+    }
+
+    pf = sal_proto_family_find(family);
+    if (pf != RT_NULL)
+    {
+        sock->protocol_family = pf;
+        sock->netdev = RT_NULL;
+        return 0;
+    }
+
+    /* Existing netdev selection logic */
+    if (netdv_def && netdev_is_up(netdv_def))
+    {
+        /* check default network interface device protocol family */
+        pf = (struct sal_proto_family *)netdv_def->sal_user_data;
+        if (pf != RT_NULL && pf->skt_ops && (pf->family == family || pf->sec_family == family))
+        {
+            sock->netdev = netdv_def;
+            sock->protocol_family = pf;
+            flag = RT_TRUE;
+        }
+    }
+
+    if (flag == RT_FALSE)
+    {
+        /* get network interface device by protocol family */
+        netdev = netdev_get_by_family(family);
+        if (netdev == RT_NULL)
+        {
+            LOG_E("not find network interface device by protocol family(%d).", family);
+            return -3;
+        }
+
+        sock->netdev = netdev;
+        sock->protocol_family = (const struct sal_proto_family *)netdev->sal_user_data;
+        if (sock->protocol_family == RT_NULL || sock->protocol_family->skt_ops == RT_NULL)
+        {
+            return -3;
+        }
+    }
+
+    LOG_D("Socket init success: domain=%d, type=%d, protocol=%d, netdev=%s",
+          family, type, protocol, sock->netdev ? sock->netdev->name : "default");
+    return 0;
+}
+```
+
+Stage 41 会逐行分析这里的 NetDev 选择算法。Stage 40 只需要抓住生命周期结论：
+
+```text
+socket 创建时
     ↓
-优先使用 default NetDev
+选出 netdev + protocol_family
+    ↓
+保存进 struct sal_socket
+    ↓
+之后 connect/send/recv 不重新做 backend 选择
 ```
 
-第三层才调用 `netdev_get_by_family(family)`，从已注册且处于 UP 状态的 NetDev 中查找匹配 protocol family。[S3](#source-s3)
+这就是为什么一个已经创建好的 socket 不会因为稍后 `netdev_default` 改变就自动迁移到另一套协议栈。
 
-Stage 41 会专门拆这套 NetDev 选择算法。本篇只需要得到当前 `AF_INET` + lwIP 场景的结果：
+## 6. `lwip_inet_family`：SAL 如何把 `AF_INET` 映射到 lwIP operation table
+
+在当前 lwIP backend 中，`af_inet_lwip.c` 定义了两层表：一层是 Socket 操作，一层是 protocol family 描述。[S4](#source-s4)
+
+```c
+static const struct sal_socket_ops lwip_socket_ops =
+{
+    .socket      = inet_socket,
+    .closesocket = lwip_close,
+    .bind        = lwip_bind,
+    .listen      = lwip_listen,
+    .connect     = lwip_connect,
+    .accept      = inet_accept,
+    .sendto      = (int (*)(int, const void *, size_t, int, const struct sockaddr *, socklen_t))lwip_sendto,
+#if LWIP_VERSION >= 0x20102ff
+    .sendmsg     = (int (*)(int, const struct msghdr *, int))lwip_sendmsg,
+    .recvmsg     = (int (*)(int, struct msghdr *, int))lwip_recvmsg,
+#endif
+    .recvfrom    = (int (*)(int, void *, size_t, int, struct sockaddr *, socklen_t *))lwip_recvfrom,
+    .getsockopt  = lwip_getsockopt,
+    //TODO fix on 1.4.1
+    .setsockopt  = lwip_setsockopt,
+    .shutdown    = lwip_shutdown,
+    .getpeername = lwip_getpeername,
+    .getsockname = inet_getsockname,
+    .ioctlsocket = inet_ioctlsocket,
+    .socketpair  = RT_NULL,
+#ifdef SAL_USING_POSIX
+    .poll        = inet_poll,
+#endif
+};
+```
+
+紧接着是 family descriptor：[S4](#source-s4)
+
+```c
+static const struct sal_proto_family lwip_inet_family =
+{
+    .family     = AF_INET,
+#if LWIP_VERSION > 0x2000000
+    .sec_family = AF_INET6,
+#else
+    .sec_family = AF_INET,
+#endif
+    .skt_ops    = &lwip_socket_ops,
+    .netdb_ops  = &lwip_netdb_ops,
+};
+```
+
+因此 `socket_init()` 选中 `lwip_inet_family` 后，后续分发已经确定：
 
 ```text
-sock->netdev           = lwIP 对应 NetDev
-sock->protocol_family  = &lwip_inet_family
+SAL connect      -> lwip_connect
+SAL sendto       -> lwip_sendto
+SAL recvfrom     -> lwip_recvfrom
+SAL closesocket  -> lwip_close
+SAL poll         -> inet_poll
 ```
 
-## 5. `lwip_inet_family` 是 SAL 到 lwIP 的函数分发表
+只有 `.socket` 不是直接写 `lwip_socket`，而是先进入 `inet_socket()`，因为 POSIX poll integration 还需要额外安装 event callback。
 
-`components/net/sal/impl/af_inet_lwip.c` 定义 `lwip_inet_family`。它把 protocol family 与两张 operation table 关联起来：[S4](#source-s4)
+## 7. 进入 `inet_socket()`：真正创建 lwIP socket，并安装 poll 事件桥
+
+`sal_socket()` 通过 `pf->skt_ops->socket()` 到达 `inet_socket()`。[S4](#source-s4)
+
+```c
+static int inet_socket(int domain, int type, int protocol)
+{
+#ifdef SAL_USING_POSIX
+    int socket;
+
+    socket = lwip_socket(domain, type, protocol);
+    if (socket >= 0)
+    {
+        struct lwip_sock *lwsock;
+
+        lwsock = lwip_tryget_socket(socket);
+        lwsock->conn->callback = event_callback;
+
+        rt_wqueue_init(&lwsock->wait_head);
+    }
+
+    return socket;
+#else
+    return lwip_socket(domain, type, protocol);
+#endif /* SAL_USING_POSIX */
+}
+```
+
+这里完成第二次对象映射：
 
 ```text
-lwip_inet_family
-├── family      = AF_INET
-├── sec_family  = AF_INET6   （当前 lwIP 版本条件满足时）
-├── skt_ops     = &lwip_socket_ops
-└── netdb_ops   = &lwip_netdb_ops
+SAL socket
+  sock->user_data
+       ↓
+lwIP socket descriptor
+       ↓
+struct lwip_sock
+       ↓
+struct netconn
 ```
 
-`skt_ops` 中的映射很直接：[S4](#source-s4)
+同时 `lwsock->conn->callback = event_callback` 把 lwIP Netconn 的事件通知改接到 RT-Thread wait queue。这条异步桥后面解释 `poll()` 时再完整展开。
 
-| SAL operation | lwIP backend |
-| --- | --- |
-| `socket` | `inet_socket()` → `lwip_socket()` |
-| `connect` | `lwip_connect()` |
-| `bind` | `lwip_bind()` |
-| `listen` | `lwip_listen()` |
-| `accept` | `inet_accept()` → `lwip_accept()` |
-| `sendto` | `lwip_sendto()` |
-| `recvfrom` | `lwip_recvfrom()` |
-| `getsockopt` / `setsockopt` | `lwip_getsockopt()` / `lwip_setsockopt()` |
-| `shutdown` | `lwip_shutdown()` |
-| `poll` | `inet_poll()` |
+## 8. 进入 `lwip_socket()`：lwIP Socket 层再创建 Netconn
 
-这里的 `inet_socket()` 只在 `SAL_USING_POSIX` 下多做一件 RT-Thread integration：调用 `lwip_socket()` 成功后取得 `struct lwip_sock`，把 connection callback 接到 SAL/DFS 的 wait queue 事件桥上，并初始化 `wait_head`。[S4](#source-s4)
+`inet_socket()` 直接调用 vendored lwIP 2.1.2 `lwip_socket()`。下面进入该函数。[S6](#source-s6)
 
-因此真正的 backend socket 创建仍然是 `lwip_socket()`。
+```c
+int
+lwip_socket(int domain, int type, int protocol)
+{
+  struct netconn *conn;
+  int i;
 
-## 6. 三个整数不能混为一谈：DFS fd、SAL socket、lwIP socket
+  LWIP_UNUSED_ARG(domain); /* @todo: check this */
 
-当 `socket(AF_INET, SOCK_STREAM, 0)` 成功返回时，已经形成三级映射：
+  /* create a netconn */
+  switch (type) {
+    case SOCK_RAW:
+      conn = netconn_new_with_proto_and_callback(DOMAIN_TO_NETCONN_TYPE(domain, NETCONN_RAW),
+             (u8_t)protocol, DEFAULT_SOCKET_EVENTCB);
+      LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_socket(%s, SOCK_RAW, %d) = ",
+                                  domain == PF_INET ? "PF_INET" : "UNKNOWN", protocol));
+      break;
+    case SOCK_DGRAM:
+      conn = netconn_new_with_callback(DOMAIN_TO_NETCONN_TYPE(domain,
+                                       ((protocol == IPPROTO_UDPLITE) ? NETCONN_UDPLITE : NETCONN_UDP)),
+                                       DEFAULT_SOCKET_EVENTCB);
+      LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_socket(%s, SOCK_DGRAM, %d) = ",
+                                  domain == PF_INET ? "PF_INET" : "UNKNOWN", protocol));
+#if LWIP_NETBUF_RECVINFO
+      if (conn) {
+        /* netconn layer enables pktinfo by default, sockets default to off */
+        conn->flags &= ~NETCONN_FLAG_PKTINFO;
+      }
+#endif /* LWIP_NETBUF_RECVINFO */
+      break;
+    case SOCK_STREAM:
+      conn = netconn_new_with_callback(DOMAIN_TO_NETCONN_TYPE(domain, NETCONN_TCP), DEFAULT_SOCKET_EVENTCB);
+      LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_socket(%s, SOCK_STREAM, %d) = ",
+                                  domain == PF_INET ? "PF_INET" : "UNKNOWN", protocol));
+      break;
+    default:
+      LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_socket(%d, %d/UNKNOWN, %d) = -1\n",
+                                  domain, type, protocol));
+      set_errno(EINVAL);
+      return -1;
+  }
+
+  if (!conn) {
+    LWIP_DEBUGF(SOCKETS_DEBUG, ("-1 / ENOBUFS (could not create netconn)\n"));
+    set_errno(ENOBUFS);
+    return -1;
+  }
+
+  i = alloc_socket(conn, 0);
+
+  if (i == -1) {
+    netconn_delete(conn);
+    set_errno(ENFILE);
+    return -1;
+  }
+  conn->socket = i;
+  done_socket(&sockets[i - LWIP_SOCKET_OFFSET]);
+  LWIP_DEBUGF(SOCKETS_DEBUG, ("%d\n", i));
+  set_errno(0);
+  return i;
+}
+```
+
+对于本文 `SOCK_STREAM` 路径：
+
+```text
+lwip_socket()
+  -> netconn_new_with_callback(... NETCONN_TCP ...)
+  -> alloc_socket(conn, 0)
+  -> conn->socket = lwIP socket id
+```
+
+Stage 06 已经完整讲过 Socket → Netconn → `tcpip_thread`，因此这里停止继续下钻。Stage 40 新增的知识是：**RT-Thread 的 DFS/SAL 最终重新接回了原来那条 lwIP Socket 主线。**
+
+## 9. 创建结束后，三个 descriptor 怎样一一关联
+
+`lwip_socket()` 返回后，控制依次返回：
+
+```text
+lwip_socket id
+    ↓ return to inet_socket()
+inet_socket returns backend id
+    ↓ return to sal_socket()
+sock->user_data = backend id
+    ↓ return SAL descriptor
+socket() stores SAL descriptor in vnode->data
+    ↓ return DFS fd to application
+```
+
+因此一个成功创建的 TCP socket 形成：
 
 ```mermaid
 flowchart LR
-    A["Application DFS fd"] -->|"dfs_file.vnode->data"| B["SAL socket id"]
-    B -->|"struct sal_socket.user_data"| C["lwIP socket id"]
+    A["DFS fd"] -->|"dfs_file.vnode->data"| B["SAL socket id"]
+    B -->|"sal_socket.user_data"| C["lwIP socket id"]
     C --> D["struct lwip_sock"]
     D --> E["struct netconn"]
 ```
 
-这三个整数可能恰好数值相同，也可能不同；代码不能依赖“数字看起来一样”。真正的契约是每层通过自己的对象表完成转换。[S2](#source-s2)[S3](#source-s3)[S6](#source-s6)
+三个整数可能碰巧相同，但代码不能依赖数值相等；映射必须经各层对象表完成。
 
-它们的职责分别是：
+## 10. `connect(fd, ...)`：先从 DFS fd 找回 SAL socket，再从 `user_data` 找回 lwIP socket
 
-| 层 | descriptor 指向什么 | 下一层如何找到 |
-| --- | --- | --- |
-| DFS | `dfs_file` / socket vnode | `vnode->data` 取 SAL id |
-| SAL | `struct sal_socket` | `user_data` 取 backend id |
-| lwIP Socket | `struct lwip_sock` | 内部保存 `netconn` |
+应用继续调用标准 `connect()`。下面进入 `net_sockets.c::connect()`。[S2](#source-s2)
 
-这也是调试 RT-Thread socket 时不能只打印一个 `fd` 就判断“lwIP 的 socket 是多少”的原因。
-
-## 7. 进入 `lwip_socket()` 后重新接回 Stage 06 的 Socket → Netconn 主线
-
-SAL 的 `inet_socket()` 最终调用 vendored lwIP 2.1.2 的 `lwip_socket()`。[S4](#source-s4)[S6](#source-s6)
-
-`SOCK_STREAM` 分支会调用 `netconn_new_with_callback(... NETCONN_TCP ...)` 创建 `struct netconn`，随后 `alloc_socket()` 建立 lwIP 自己的 socket table entry，并把分配到的 lwIP socket index 写回 `conn->socket`。[S6](#source-s6)
-
-Stage 06 已经解释过 lwIP Socket API 如何封装 Netconn；因此这里不重新展开 `netconn_apimsg()` 与 `tcpip_thread`。新的关键关系只是：
-
-```text
-RT-Thread BSD socket
-    ↓ DFS / SAL dispatch
-lwip_socket()
-    ↓
-lwIP Socket layer
-    ↓
-Netconn
-    ↓
-tcpip_thread / TCP Core
+```c
+int connect(int s, const struct sockaddr *name, socklen_t namelen)
+{
+    int socket = dfs_net_getsocket(s);
+    return sal_connect(socket, name, namelen);
+}
 ```
 
-也就是说 Stage 40 并没有出现另一套 TCP 实现，只是在 Stage 06 的 lwIP Socket API 外面再增加 RT-Thread 的统一 descriptor 与 backend abstraction。
+第一步通过前面已经解释过的 `dfs_net_getsocket()` 得到 SAL descriptor。随后进入 `sal_connect()`。[S3](#source-s3)
 
-## 8. `connect(fd, ...)` 为什么能准确找到刚才那个 lwIP socket
+```c
+int sal_connect(int socket, const struct sockaddr *name, socklen_t namelen)
+{
+    struct sal_socket *sock;
+    const struct sal_proto_family *pf;
+    int ret;
 
-创建完成后，应用继续调用标准 `connect(fd, ...)`。`net_sockets.c` 中的 `connect()` 先执行：
+    /* get the socket object by socket descriptor */
+    SAL_SOCKET_OBJ_GET(sock, socket);
 
-```text
-dfs_net_getsocket(fd)
+    /* check the network interface is up status */
+    SAL_NETDEV_IS_UP(sock->netdev);
+    /* check the network interface socket opreation */
+    SAL_SOCKETOPS_VALID(sock, pf, connect);
+
+    ret = pf->skt_ops->connect((int)(size_t)sock->user_data, name, namelen);
+#ifdef SAL_USING_TLS
+    if (ret >= 0 && SAL_SOCKOPS_PROTO_TLS_VALID(sock, connect))
+    {
+        if (proto_tls->ops->connect(sock->user_data_tls) < 0)
+        {
+            return -1;
+        }
+
+        return ret;
+    }
+#endif
+
+    return ret;
+}
 ```
 
-`dfs_net_getsocket()` 通过 `fd_get()` 找到 `dfs_file`，确认 vnode 类型为 `FT_SOCKET`，再从 `vnode->data` 还原 SAL socket id。[S2](#source-s2)
+这里能直接看到“创建时选择、运行时复用”的 contract：
 
-随后 `connect()` 调用 `sal_connect(sal_socket, ...)`。[S2](#source-s2)
+```text
+SAL_SOCKET_OBJ_GET()
+    -> 取回创建时的 struct sal_socket
 
-`sal_connect()` 再执行三步：[S3](#source-s3)
+sock->protocol_family
+    -> 决定 pf->skt_ops
 
-1. 用 SAL descriptor 找回 `struct sal_socket`；
-2. 检查该 socket 的 NetDev 是否仍然 UP；
-3. 调用 `sock->protocol_family->skt_ops->connect()`，参数中的 backend descriptor 取自 `sock->user_data`。
+sock->user_data
+    -> 取回创建时的 lwIP socket id
+```
 
-对 lwIP provider，operation table 中的 `connect` 就是 `lwip_connect()`。[S4](#source-s4)
+对 `lwip_inet_family`，`pf->skt_ops->connect` 就是 `lwip_connect()`。
 
-因此同一个应用 fd 的 lookup 链为：
+## 11. 进入 `lwip_connect()`：再次回到 Stage 06/07 的 Netconn/TCP 路径
+
+下面进入 vendored lwIP `lwip_connect()`。[S6](#source-s6)
+
+```c
+int
+lwip_connect(int s, const struct sockaddr *name, socklen_t namelen)
+{
+  struct lwip_sock *sock;
+  err_t err;
+
+  sock = get_socket(s);
+  if (!sock) {
+    return -1;
+  }
+
+  if (!SOCK_ADDR_TYPE_MATCH_OR_UNSPEC(name, sock)) {
+    /* sockaddr does not match socket type (IPv4/IPv6) */
+    sock_set_errno(sock, err_to_errno(ERR_VAL));
+    done_socket(sock);
+    return -1;
+  }
+
+  LWIP_UNUSED_ARG(namelen);
+  if (name->sa_family == AF_UNSPEC) {
+    LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_connect(%d, AF_UNSPEC)\n", s));
+    err = netconn_disconnect(sock->conn);
+  } else {
+    ip_addr_t remote_addr;
+    u16_t remote_port;
+
+    /* check size, family and alignment of 'name' */
+    LWIP_ERROR("lwip_connect: invalid address", IS_SOCK_ADDR_LEN_VALID(namelen) &&
+               IS_SOCK_ADDR_TYPE_VALID_OR_UNSPEC(name) && IS_SOCK_ADDR_ALIGNED(name),
+               sock_set_errno(sock, err_to_errno(ERR_ARG)); done_socket(sock); return -1;);
+
+    SOCKADDR_TO_IPADDR_PORT(name, &remote_addr, remote_port);
+    LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_connect(%d, addr=", s));
+    ip_addr_debug_print_val(SOCKETS_DEBUG, remote_addr);
+    LWIP_DEBUGF(SOCKETS_DEBUG, (" port=%"U16_F")\n", remote_port));
+
+#if LWIP_IPV4 && LWIP_IPV6
+    /* Dual-stack: Unmap IPv4 mapped IPv6 addresses */
+    if (IP_IS_V6_VAL(remote_addr) && ip6_addr_isipv4mappedipv6(ip_2_ip6(&remote_addr))) {
+      unmap_ipv4_mapped_ipv6(ip_2_ip4(&remote_addr), ip_2_ip6(&remote_addr));
+      IP_SET_TYPE_VAL(remote_addr, IPADDR_TYPE_V4);
+    }
+#endif /* LWIP_IPV4 && LWIP_IPV6 */
+
+    err = netconn_connect(sock->conn, &remote_addr, remote_port);
+  }
+
+  if (err != ERR_OK) {
+    LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_connect(%d) failed, err=%d\n", s, err));
+    sock_set_errno(sock, err_to_errno(err));
+    done_socket(sock);
+    return -1;
+  }
+
+  LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_connect(%d) succeeded\n", s));
+  sock_set_errno(sock, 0);
+  done_socket(sock);
+  return 0;
+}
+```
+
+`lwip_connect()` 将 `sockaddr` 转为 lwIP `ip_addr_t + port`，最终调用 `netconn_connect()`。到这里，应用侧链路已经和 Stage 06/07 完全汇合：
+
+```text
+RT-Thread connect(fd)
+  -> DFS
+  -> SAL
+  -> lwip_connect(lwIP socket)
+  -> netconn_connect()
+  -> tcpip_thread
+  -> TCP active open
+```
+
+## 12. `recv()` / `send()`：BSD Socket wrapper 继续复用同一个 dispatch context
+
+标准 `recv()` 与 `send()` 仍然先还原 SAL descriptor。[S2](#source-s2)
+
+```c
+int recv(int s, void *mem, size_t len, int flags)
+{
+    int socket = dfs_net_getsocket(s);
+
+    return sal_recvfrom(socket, mem, len, flags, NULL, NULL);
+}
+```
+
+```c
+int send(int s, const void *dataptr, size_t size, int flags)
+{
+    int socket = dfs_net_getsocket(s);
+
+    return sal_sendto(socket, dataptr, size, flags, NULL, 0);
+}
+```
+
+进入 `sal_recvfrom()` 后，当前 socket 对象决定 backend。[S3](#source-s3)
+
+```c
+int sal_recvfrom(int socket, void *mem, size_t len, int flags,
+                 struct sockaddr *from, socklen_t *fromlen)
+{
+    struct sal_socket *sock;
+    const struct sal_proto_family *pf;
+
+    /* get the socket object by socket descriptor */
+    SAL_SOCKET_OBJ_GET(sock, socket);
+
+    /* check the network interface is up status  */
+    SAL_NETDEV_IS_UP(sock->netdev);
+    /* check the network interface socket opreation */
+    SAL_SOCKETOPS_VALID(sock, pf, recvfrom);
+
+#ifdef SAL_USING_TLS
+    if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, recv))
+    {
+        int ret;
+
+        if ((ret = proto_tls->ops->recv(sock->user_data_tls, mem, len)) < 0)
+        {
+            return -1;
+        }
+        return ret;
+    }
+    else
+    {
+        return pf->skt_ops->recvfrom((int)(size_t)sock->user_data, mem, len, flags, from, fromlen);
+    }
+#else
+    return pf->skt_ops->recvfrom((int)(size_t)sock->user_data, mem, len, flags, from, fromlen);
+#endif
+}
+```
+
+发送方向同样通过 `sock->user_data`：[S3](#source-s3)
+
+```c
+int sal_sendto(int socket, const void *dataptr, size_t size, int flags,
+               const struct sockaddr *to, socklen_t tolen)
+{
+    struct sal_socket *sock;
+    const struct sal_proto_family *pf;
+
+    /* get the socket object by socket descriptor */
+    SAL_SOCKET_OBJ_GET(sock, socket);
+
+    /* check the network interface is up status  */
+    SAL_NETDEV_IS_UP(sock->netdev);
+    /* check the network interface socket opreation */
+    SAL_SOCKETOPS_VALID(sock, pf, sendto);
+
+#ifdef SAL_USING_TLS
+    if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, send))
+    {
+        int ret;
+
+        if ((ret = proto_tls->ops->send(sock->user_data_tls, dataptr, size)) < 0)
+        {
+            return -1;
+        }
+        return ret;
+    }
+    else
+    {
+        return pf->skt_ops->sendto((int)sock->user_data, dataptr, size, flags, to, tolen);
+    }
+#else
+    return pf->skt_ops->sendto((int)(size_t)sock->user_data, dataptr, size, flags, to, tolen);
+#endif
+}
+```
+
+对当前 lwIP family，这两条最终进入 `lwip_recvfrom()` / `lwip_sendto()`。SAL 没有重新实现 TCP/UDP payload queue，只负责分发。
+
+## 13. `read()` / `write()` 为什么也能操作 socket：DFS file operations 直接桥到同一组 SAL API
+
+由于 `socket()` 已将 vnode 初始化为 `FT_SOCKET` 并绑定 `dfs_net_get_fops()`，POSIX `read/write` 会进入 `dfs_net.c` 的 network file operations。[S2](#source-s2)
+
+继续阅读 `dfs_net_read()`：
+
+```c
+#ifdef RT_USING_DFS_V2
+static ssize_t dfs_net_read(struct dfs_file* file, void *buf, size_t count, off_t *pos)
+#else
+static ssize_t dfs_net_read(struct dfs_file* file, void *buf, size_t count)
+#endif
+{
+    int ret;
+    int socket = (int)(size_t)file->vnode->data;
+
+    ret = sal_recvfrom(socket, buf, count, 0, NULL, NULL);
+    if (ret < 0)
+    {
+        ret = rt_get_errno();
+        return (ret > 0) ? (-ret) : ret;
+    }
+
+    return ret;
+}
+```
+
+继续阅读 `dfs_net_write()`：[S2](#source-s2)
+
+```c
+#ifdef RT_USING_DFS_V2
+static ssize_t dfs_net_write(struct dfs_file *file, const void *buf, size_t count, off_t *pos)
+#else
+static ssize_t dfs_net_write(struct dfs_file *file, const void *buf, size_t count)
+#endif
+{
+    int ret;
+    int socket = (int)(size_t)file->vnode->data;
+
+    ret = sal_sendto(socket, buf, count, 0, NULL, 0);
+    if (ret < 0)
+    {
+        ret = rt_get_errno();
+        return (ret > 0) ? (-ret) : ret;
+    }
+
+    return ret;
+}
+```
+
+因此两类 API 在 SAL 层汇合：
+
+```mermaid
+flowchart LR
+    A["recv()/send()"] --> B["dfs_net_getsocket(fd)"]
+    C["read()/write()"] --> D["dfs_file.vnode->data"]
+    B --> E["SAL socket id"]
+    D --> E
+    E --> F["sal_recvfrom()/sal_sendto()"]
+    F --> G["saved protocol_family + user_data"]
+    G --> H["lwip_recvfrom()/lwip_sendto()"]
+```
+
+DFS 只是让 Socket 复用统一 fd/file-operation infrastructure，并不改变 lwIP socket 的网络对象语义。
+
+## 14. `poll()` 的异步桥：为什么 `inet_socket()` 必须替换 Netconn callback
+
+同步 `send/recv` 只需调用 operation table；`poll()` 还需要“网络状态变化时唤醒等待线程”。这条链的注册点就是前面 `inet_socket()` 中：
+
+```c
+lwsock->conn->callback = event_callback;
+rt_wqueue_init(&lwsock->wait_head);
+```
+
+当 lwIP Netconn 发生 receive/send/error event 时，会进入 `event_callback()`。[S4](#source-s4)
+
+```c
+static void event_callback(struct netconn *conn, enum netconn_evt evt, u16_t len)
+{
+    int s;
+    struct lwip_sock *sock;
+    uint32_t event = 0;
+    SYS_ARCH_DECL_PROTECT(lev);
+
+    LWIP_UNUSED_ARG(len);
+
+    /* Get socket */
+    if (conn)
+    {
+        s = conn->socket;
+        if (s < 0)
+        {
+            /* Data comes in right away after an accept, even though
+             * the server task might not have created a new socket yet.
+             * Just count down (or up) if that's the case and we
+             * will use the data later. Note that only receive events
+             * can happen before the new socket is set up. */
+            SYS_ARCH_PROTECT(lev);
+            if (conn->socket < 0)
+            {
+                if (evt == NETCONN_EVT_RCVPLUS)
+                {
+                    conn->socket--;
+                }
+                SYS_ARCH_UNPROTECT(lev);
+                return;
+            }
+            s = conn->socket;
+            SYS_ARCH_UNPROTECT(lev);
+        }
+
+        sock = lwip_tryget_socket(s);
+        if (!sock)
+        {
+            return;
+        }
+    }
+    else
+    {
+        return;
+    }
+
+    SYS_ARCH_PROTECT(lev);
+    /* Set event as required */
+    switch (evt)
+    {
+    case NETCONN_EVT_RCVPLUS:
+        sock->rcvevent++;
+        break;
+    case NETCONN_EVT_RCVMINUS:
+        sock->rcvevent--;
+        break;
+    case NETCONN_EVT_SENDPLUS:
+        sock->sendevent = 1;
+        break;
+    case NETCONN_EVT_SENDMINUS:
+        sock->sendevent = 0;
+        break;
+    case NETCONN_EVT_ERROR:
+        sock->errevent = 1;
+        break;
+    default:
+        LWIP_ASSERT("unknown event", 0);
+        break;
+    }
+
+#if LWIP_VERSION >= 0x20100ff
+    if ((void*)(sock->lastdata.pbuf) || (sock->rcvevent > 0))
+#else
+    if ((void*)(sock->lastdata) || (sock->rcvevent > 0))
+#endif
+        event |= POLLIN;
+    if (sock->sendevent)
+        event |= POLLOUT;
+    if (sock->errevent)
+        event |= POLLERR;
+
+    SYS_ARCH_UNPROTECT(lev);
+
+    if (event)
+    {
+        rt_wqueue_wakeup(&sock->wait_head, (void*)(size_t)event);
+    }
+}
+```
+
+这里完成的是：
+
+```text
+lwIP Netconn event
+  -> 更新 lwip_sock rcvevent/sendevent/errevent
+  -> 转成 POLLIN/POLLOUT/POLLERR
+  -> rt_wqueue_wakeup()
+```
+
+另一方面，DFS 的 poll 入口只做桥接：[S2](#source-s2)
+
+```c
+static int dfs_net_poll(struct dfs_file *file, struct rt_pollreq *req)
+{
+    extern int sal_poll(struct dfs_file *file, struct rt_pollreq *req);
+
+    return sal_poll(file, req);
+}
+```
+
+进入 `sal_poll()`：[S3](#source-s3)
+
+```c
+int sal_poll(struct dfs_file *file, struct rt_pollreq *req)
+{
+    struct sal_socket *sock;
+    const struct sal_proto_family *pf;
+    int socket = (int)(size_t)file->vnode->data;
+
+    /* get the socket object by socket descriptor */
+    SAL_SOCKET_OBJ_GET(sock, socket);
+
+    /* check the network interface is up status  */
+    SAL_NETDEV_IS_UP(sock->netdev);
+    /* check the network interface socket opreation */
+    SAL_SOCKETOPS_VALID(sock, pf, poll);
+
+    return pf->skt_ops->poll(file, req);
+}
+```
+
+对 lwIP family，下一步进入 `inet_poll()`。[S4](#source-s4)
+
+```c
+static int inet_poll(struct dfs_file *file, struct rt_pollreq *req)
+{
+    int mask = 0;
+    struct lwip_sock *sock;
+    struct sal_socket *sal_sock;
+
+    sal_sock = sal_get_socket((int)(size_t)file->vnode->data);
+    if(!sal_sock)
+    {
+        return -1;
+    }
+
+    sock = lwip_tryget_socket((int)(size_t)sal_sock->user_data);
+    if (sock != NULL)
+    {
+        rt_base_t level;
+
+        rt_poll_add(&sock->wait_head, req);
+
+        level = rt_spin_lock_irqsave(&_spinlock);
+
+#if LWIP_VERSION >= 0x20100ff
+        if ((void*)(sock->lastdata.pbuf) || sock->rcvevent)
+#else
+        if ((void*)(sock->lastdata) || sock->rcvevent)
+#endif
+        {
+            mask |= POLLIN;
+        }
+        if (sock->sendevent)
+        {
+            mask |= POLLOUT;
+        }
+        if (sock->errevent)
+        {
+            mask |= POLLERR;
+            /* clean error event */
+            sock->errevent = 0;
+        }
+        rt_spin_unlock_irqrestore(&_spinlock, level);
+    }
+
+    return mask;
+}
+```
+
+于是 poll 的完整异步关系是：
 
 ```mermaid
 flowchart TD
-    A["connect(DFS fd)"] --> B["dfs_net_getsocket()"]
-    B --> C["SAL socket id"]
-    C --> D["sal_connect()"]
-    D --> E["sock->user_data = lwIP socket id"]
-    E --> F["lwip_connect()"]
-    F --> G["netconn_connect()"]
+    A["application poll(fd)"] --> B["DFS poll"]
+    B --> C["sal_poll()"]
+    C --> D["inet_poll(): register wait_head"]
+    E["lwIP Netconn event"] --> F["event_callback()"]
+    F --> G["set POLLIN/POLLOUT/POLLERR state"]
+    G --> H["rt_wqueue_wakeup()"]
+    H --> A
 ```
 
-最后两步重新进入 Stage 06/07 已经建立的 Netconn/TCP 主线。[S6](#source-s6)
+这说明 SAL POSIX 集成不仅是 descriptor 映射，还包含事件模型适配。
 
-## 9. `read()` / `write()` 与 `recv()` / `send()` 为什么最终会合流
+## 15. 为什么标准 `socket()` 与 lwIP 自己的兼容别名不会冲突
 
-RT-Thread 同时允许两类应用写法：
+RT-Thread `lwipopts.h` 在 `SAL_USING_POSIX` 条件下显式关闭 lwIP 的 BSD compatibility aliases：[S5](#source-s5)
+
+```c
+/*
+ * LWIP_COMPAT_SOCKETS==1: Enable BSD-style sockets functions names.
+ * (only used if you use sockets.c)
+ */
+#ifdef SAL_USING_POSIX
+#define LWIP_COMPAT_SOCKETS             0
+#else
+#ifndef LWIP_COMPAT_SOCKETS
+#define LWIP_COMPAT_SOCKETS             1
+#endif
+#endif
+```
+
+因此分层明确：
 
 ```text
-read(fd, buf, len);
-write(fd, buf, len);
+应用可见： socket() / connect() / send() / recv()
+              ↓ SAL/DFS
+backend：    lwip_socket() / lwip_connect() / lwip_sendto() / lwip_recvfrom()
 ```
 
-以及：
+这不是两套 Socket API 同时竞争同名符号，而是 SAL 有意占据标准 BSD 名称，lwIP 保留 `lwip_*` backend 名称。
+
+## 16. `closesocket()`：按 DFS → SAL → lwIP 的反方向释放
+
+创建顺序是：
 
 ```text
-recv(fd, buf, len, flags);
-send(fd, buf, len, flags);
+DFS fd
+  -> SAL socket
+  -> lwIP socket
+  -> Netconn
 ```
 
-第一类通过 DFS `_net_fops`：
+关闭时从最外层开始。先进入 `net_sockets.c::closesocket()`。[S2](#source-s2)
+
+```c
+int closesocket(int s)
+{
+    int error = 0;
+    int socket = -1;
+    struct dfs_file *d;
+
+    socket = dfs_net_getsocket(s);
+    if (socket < 0)
+    {
+        rt_set_errno(-ENOTSOCK);
+        return -1;
+    }
+
+    d = fd_get(s);
+    if (d == RT_NULL)
+    {
+        rt_set_errno(-EBADF);
+        return -1;
+    }
+
+    if (!d->vnode)
+    {
+        rt_set_errno(-EBADF);
+        return -1;
+    }
+
+#ifdef RT_USING_DFS_V2
+    if (dfs_file_close(d) == 0)
+#else
+    if (sal_closesocket(socket) == 0)
+#endif
+    {
+        error = 0;
+    }
+    else
+    {
+        rt_set_errno(-ENOTSOCK);
+        error = -1;
+    }
+
+    /* socket has been closed, delete it from file system fd */
+    fd_release(s);
+
+    return error;
+}
+```
+
+DFS V2 的 socket fops 会进入 `dfs_net_close()`；只有 vnode 最后一个引用才真正关闭 SAL socket。[S2](#source-s2)
+
+```c
+static int dfs_net_close(struct dfs_file* file)
+{
+    int socket;
+    int ret = 0;
+
+    if (file->vnode->ref_count == 1)
+    {
+        socket = (int)(size_t)file->vnode->data;
+        ret = sal_closesocket(socket);
+    }
+    return ret;
+}
+```
+
+继续进入 `sal_closesocket()`：[S3](#source-s3)
+
+```c
+int sal_closesocket(int socket)
+{
+    struct sal_socket *sock;
+    const struct sal_proto_family *pf;
+    int error = 0;
+
+    /* get the socket object by socket descriptor */
+    SAL_SOCKET_OBJ_GET(sock, socket);
+
+    /* clsoesocket operation not need to vaild network interface status */
+    /* valid the network interface socket opreation */
+    SAL_SOCKETOPS_VALID(sock, pf, closesocket);
+
+    if (pf->skt_ops->closesocket((int)(size_t)sock->user_data) == 0)
+    {
+#ifdef SAL_USING_TLS
+        if (SAL_SOCKOPS_PROTO_TLS_VALID(sock, closesocket))
+        {
+            if (proto_tls->ops->closesocket(sock->user_data_tls) < 0)
+            {
+                return -1;
+            }
+        }
+#endif
+        error = 0;
+    }
+    else
+    {
+        error = -1;
+    }
+
+    /* delete socket */
+    socket_delete(socket);
+
+    return error;
+}
+```
+
+对 lwIP family，`pf->skt_ops->closesocket` 就是 `lwip_close()`。进入 lwIP：[S6](#source-s6)
+
+```c
+int
+lwip_close(int s)
+{
+  struct lwip_sock *sock;
+  int is_tcp = 0;
+  err_t err;
+
+  LWIP_DEBUGF(SOCKETS_DEBUG, ("lwip_close(%d)\n", s));
+
+  sock = get_socket(s);
+  if (!sock) {
+    return -1;
+  }
+
+  if (sock->conn != NULL) {
+    is_tcp = NETCONNTYPE_GROUP(netconn_type(sock->conn)) == NETCONN_TCP;
+  } else {
+    LWIP_ASSERT("sock->lastdata == NULL", sock->lastdata.pbuf == NULL);
+  }
+
+#if LWIP_IGMP
+  /* drop all possibly joined IGMP memberships */
+  lwip_socket_drop_registered_memberships(s);
+#endif /* LWIP_IGMP */
+#if LWIP_IPV6_MLD
+  /* drop all possibly joined MLD6 memberships */
+  lwip_socket_drop_registered_mld6_memberships(s);
+#endif /* LWIP_IPV6_MLD */
+
+  err = netconn_prepare_delete(sock->conn);
+  if (err != ERR_OK) {
+    sock_set_errno(sock, err_to_errno(err));
+    done_socket(sock);
+    return -1;
+  }
+
+  free_socket(sock, is_tcp);
+  set_errno(0);
+  return 0;
+}
+```
+
+因此 teardown 的真实顺序是：
 
 ```text
-read  -> dfs_net_read  -> sal_recvfrom
-write -> dfs_net_write -> sal_sendto
+application fd
+ -> DFS file/vnode
+ -> SAL socket
+ -> lwIP socket
+ -> Netconn prepare/delete path
 ```
 
-第二类通过 `net_sockets.c` 的 BSD socket wrapper，先 `dfs_net_getsocket(fd)`，再进入同一组 `sal_recvfrom()` / `sal_sendto()`。[S2](#source-s2)
+`sal_closesocket()` 特意不检查 NetDev 是否 UP，因为即使链路已经断开，应用仍必须能够释放 socket 资源。
 
-而 SAL 最终仍通过当前 socket 保存的 `protocol_family->skt_ops` 转发。lwIP backend 对应 `lwip_recvfrom()` 与 `lwip_sendto()`。[S3](#source-s3)[S4](#source-s4)
+## 17. Stage 40 的完整心智模型
 
-因此 `read/write` 与 `recv/send` 的差异主要存在于上层 API 语义；到 SAL backend dispatch 后，它们已经汇合到同一个 lwIP socket object。
-
-## 10. `poll()` 为什么还需要 `inet_socket()` 给 lwIP socket 安装 event callback
-
-普通同步 `connect/send/recv` 只需要函数分发表，但 `poll/select` 还需要“状态变化时唤醒等待者”。
-
-`af_inet_lwip.c` 在 `SAL_USING_POSIX` 下的 `inet_socket()` 会取得刚创建的 `struct lwip_sock`，把其 Netconn callback 替换为 SAL 侧 `event_callback`，同时初始化 RT-Thread wait queue。[S4](#source-s4)
-
-之后：
-
-```text
-lwIP socket event
-    ↓
-event_callback()
-    ↓
-rt_wqueue_wakeup()
-    ↓
-DFS/SAL poll waiter becomes runnable
-```
-
-`dfs_net_poll()` 则把 `struct dfs_file` 传给 `sal_poll()`，SAL 再分派到 `lwip_socket_ops.poll = inet_poll()`。[S2](#source-s2)[S3](#source-s3)[S4](#source-s4)
-
-这说明 POSIX fd integration 不只是“多套一层编号”。为了让 `poll/select` 工作，还必须把 lwIP 的 socket event 接到 RT-Thread 的 wait queue。
-
-## 11. 为什么启用 SAL 后不会和 lwIP 自己的 `socket()` 名称冲突
-
-RT-Thread 的 `lwipopts.h` 对 `LWIP_COMPAT_SOCKETS` 有明确条件：[S5](#source-s5)
-
-```text
-SAL_USING_POSIX
-    ↓
-LWIP_COMPAT_SOCKETS = 0
-```
-
-没有 SAL POSIX 层时，lwIP 可以提供兼容的 BSD 函数名；启用 SAL POSIX 后，这些 unprefixed alias 被关闭，系统保留 `lwip_socket()`、`lwip_connect()` 等 backend 名称，而标准 `socket()`、`connect()` 名称由 SAL 的 `net_sockets.c` 提供。
-
-这正好形成清晰边界：
-
-```text
-Application API name       Backend API name
-socket()                   lwip_socket()
-connect()                  lwip_connect()
-send()/recv()              lwip_send*/lwip_recv*
-```
-
-如果移植时同时强行打开两个 provider 的同名 BSD alias，反而会破坏这套分层。
-
-## 12. `close()` 必须按相反顺序释放三层对象
-
-创建时形成：
-
-```text
-DFS fd -> SAL socket -> lwIP socket -> Netconn
-```
-
-关闭时必须反向拆除。
-
-RT-Thread `closesocket(fd)` 先通过 DFS fd 找到 SAL socket；DFS V2 路径调用 `dfs_file_close()`，其 socket fops 最终进入 `dfs_net_close()`。只有 vnode reference count 到最后一个引用时，`dfs_net_close()` 才调用 `sal_closesocket()`。[S2](#source-s2)
-
-SAL 再调用当前 protocol family 的 backend close；对 lwIP 就是 `lwip_close()`。lwIP 继续执行 `netconn_prepare_delete()` 与 socket table 回收。[S3](#source-s3)[S4](#source-s4)[S6](#source-s6)
-
-最后外层 `fd_release()` 回收 DFS descriptor。
-
-这条 teardown 顺序体现了三层 ownership：外层 fd 生命周期不能先于仍在使用的 SAL/backend object 被错误复用。
-
-## 13. 把 Stage 40 压缩成一条完整应用调用链
-
-现在可以把一次普通 TCP client 的应用侧路径连起来：
+把整个应用生命周期串起来：
 
 ```mermaid
 flowchart TD
-    A["socket()"] --> B["DFS fd + socket vnode"]
+    A["socket()"] --> B["DFS fd + FT_SOCKET vnode"]
     B --> C["sal_socket()"]
-    C --> D["socket_init(): choose NetDev/protocol_family"]
-    D --> E["lwip_socket_ops.socket"]
-    E --> F["lwip_socket() -> Netconn"]
-    B --> G["connect/read/write/poll/close"]
-    G --> H["DFS fd -> SAL socket"]
-    H --> I["SAL dispatch via stored protocol_family"]
-    I --> J["lwip_connect/send/recv/poll/close"]
+    C --> D["socket_init(): choose NetDev + protocol_family"]
+    D --> E["lwip_inet_family.skt_ops"]
+    E --> F["inet_socket()"]
+    F --> G["lwip_socket()"]
+    G --> H["Netconn"]
+
+    B --> I["connect/recv/send/read/write/poll/close"]
+    I --> J["DFS fd -> SAL socket id"]
+    J --> K["saved protocol_family + user_data"]
+    K --> L["lwip_connect/send/recv/poll/close"]
 ```
 
-Stage 39 解决的是“驱动怎样进入 lwIP”；Stage 40 解决的是“应用怎样进入 lwIP”。两篇从上下两端最终汇合到同一个 lwIP Core。
+Stage 39 解决“Driver → lwIP”，Stage 40 解决“Application → lwIP”。两条路径最终都汇入同一个 lwIP Core。
 
-下一篇 Stage 41 将把 `socket_init()` 中暂时略过的 NetDev 选择展开：同一系统同时存在 lwIP Ethernet、AT Wi-Fi/蜂窝网络时，`netdev_default`、`family/sec_family` 与 `netdev_get_by_family()` 怎样共同决定一个新 socket 最终进入哪个 backend。
+下一篇 Stage 41 继续展开这里唯一暂时保留的黑盒：`socket_init()` 为什么会选中某个 NetDev，以及系统同时存在 lwIP Ethernet 与 AT Wi-Fi/4G 时，`netdev_default`、`family/sec_family` 和 `netdev_get_by_family()` 怎样共同决定 backend。
 
 ## 资料来源
 
 <a id="source-s1"></a>
-### [S1] RT-Thread SAL 配置与构建脚本
-- 类型：RT-Thread 官方仓库源码
-- 版本：commit `dc8aaa73f2dbea255325ec058a083aeeb5381d0a`，2026-09-28
-- 定位：`components/net/sal/Kconfig`、`components/net/sal/SConscript`
-- URL/文档：[SAL Kconfig](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/Kconfig)、[SAL SConscript](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/SConscript)
-- 使用位置：“BSD socket 入口为何由 SAL 提供”“SAL_USING_POSIX/DFS 与 backend source selection”
-- 支撑内容：证明 SAL、NetDev、POSIX/DFS 与 lwIP adapter 的编译依赖关系
+### [S1] RT-Thread SAL / DFS 配置与官方组件说明
+- 类型：RT-Thread 官方仓库源码与官方文档
+- 版本：commit `dc8aaa73f2dbea255325ec058a083aeeb5381d0a`
+- 定位：`components/net/sal/Kconfig`、`components/dfs/Kconfig`、`documentation/6.components/sal/sal.md`、`documentation/6.components/filesystem/README.md`
+- URL/文档：[SAL Kconfig](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/Kconfig)、[SAL documentation](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/documentation/6.components/sal/sal.md)、[DFS documentation](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/documentation/6.components/filesystem/README.md)
+- 使用位置：“开场概念桥”“SAL/DFS 在系统中的职责边界”
+- 支撑内容：SAL=Socket Abstraction Layer；DFS 提供 RT-Thread 的文件描述符/虚拟文件系统基础设施
 
 <a id="source-s2"></a>
 ### [S2] RT-Thread BSD Socket 与 DFS bridge
 - 类型：RT-Thread 官方仓库源码
 - 版本：同上
-- 定位：`components/net/sal/socket/net_sockets.c`：`socket()`、`connect()`、`accept()`、`closesocket()`；`components/net/sal/dfs_net/dfs_net.c`：`dfs_net_getsocket()`、`dfs_net_read()`、`dfs_net_write()`、`dfs_net_close()`、`dfs_net_poll()`
+- 定位：`components/net/sal/socket/net_sockets.c`：`socket()`、`connect()`、`recv()`、`send()`、`closesocket()`；`components/net/sal/dfs_net/dfs_net.c`：`dfs_net_getsocket()`、`dfs_net_read()`、`dfs_net_write()`、`dfs_net_close()`、`dfs_net_poll()`
 - URL/文档：[net_sockets.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/socket/net_sockets.c)、[dfs_net.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/dfs_net/dfs_net.c)
-- 使用位置：“socket() 真实入口”“DFS fd 生命周期”“read/write/poll/close bridge”
-- 支撑内容：证明应用 fd 如何保存 SAL descriptor，以及 POSIX file operations 如何进入 SAL
+- 使用位置：“DFS fd 创建与回查”“read/write/poll/close bridge”
+- 支撑内容：证明标准 BSD/POSIX API 如何从 DFS descriptor 进入 SAL
 
 <a id="source-s3"></a>
 ### [S3] RT-Thread SAL Core
 - 类型：RT-Thread 官方仓库源码
 - 版本：同上
-- 定位：`components/net/sal/src/sal_socket.c`：`sal_init()`、`socket_init()`、`sal_socket()`、`sal_connect()`、`sal_sendto()`、`sal_recvfrom()`、`sal_poll()`；`components/net/sal/include/sal_low_lvl.h`
-- URL/文档：[sal_socket.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/src/sal_socket.c)、[sal_low_lvl.h](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/include/sal_low_lvl.h)
-- 使用位置：“SAL descriptor”“protocol family / NetDev 选择”“operation dispatch”
-- 支撑内容：证明 SAL socket table、backend selection 与 per-socket dispatch context 的真实实现
+- 定位：`components/net/sal/include/sal_low_lvl.h`：`struct sal_socket`、`struct sal_socket_ops`；`components/net/sal/src/sal_socket.c`：`socket_init()`、`sal_socket()`、`sal_connect()`、`sal_sendto()`、`sal_recvfrom()`、`sal_poll()`、`sal_closesocket()`
+- URL/文档：[sal_low_lvl.h](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/include/sal_low_lvl.h)、[sal_socket.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/src/sal_socket.c)
+- 使用位置：“SAL socket 对象”“backend selection”“per-socket dispatch context”“运行时操作与 teardown”
+- 支撑内容：证明 `netdev/protocol_family/user_data` 在创建时保存、后续操作复用
 
 <a id="source-s4"></a>
 ### [S4] RT-Thread lwIP SAL Adapter
 - 类型：RT-Thread 官方仓库源码
 - 版本：同上
-- 定位：`components/net/sal/impl/af_inet_lwip.c`：`inet_socket()`、`inet_accept()`、`inet_poll()`、`lwip_socket_ops`、`lwip_inet_family`、`sal_lwip_netdev_set_pf_info()`
+- 定位：`components/net/sal/impl/af_inet_lwip.c`：`event_callback()`、`inet_socket()`、`inet_poll()`、`lwip_socket_ops`、`lwip_inet_family`、`sal_lwip_netdev_set_pf_info()`
 - URL/文档：[af_inet_lwip.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/sal/impl/af_inet_lwip.c)
-- 使用位置：“SAL 怎样调用 lwIP”“poll event bridge”“lwIP family 映射”
-- 支撑内容：证明 SAL operation table 最终绑定 `lwip_socket/lwip_connect/lwip_sendto/lwip_recvfrom` 等 backend API
+- 使用位置：“SAL → lwIP operation table”“poll/event bridge”
+- 支撑内容：证明 SAL 怎样调用 `lwip_*`，以及 POSIX poll 如何接入 lwIP Netconn event
 
 <a id="source-s5"></a>
 ### [S5] RT-Thread lwIP `lwipopts.h`
@@ -380,14 +1334,31 @@ Stage 39 解决的是“驱动怎样进入 lwIP”；Stage 40 解决的是“应
 - 版本：同上
 - 定位：`components/net/lwip/port/lwipopts.h`：`LWIP_COMPAT_SOCKETS`
 - URL/文档：[RT-Thread lwipopts.h](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/lwip/port/lwipopts.h)
-- 使用位置：“为什么 SAL 与 lwIP 不产生 BSD socket 符号冲突”
-- 支撑内容：证明 `SAL_USING_POSIX` 下 lwIP compatibility socket names 被关闭
+- 使用位置：“标准 BSD 名称与 lwIP backend 名称为什么不冲突”
+- 支撑内容：证明 `SAL_USING_POSIX` 下关闭 lwIP compatibility socket aliases
 
 <a id="source-s6"></a>
 ### [S6] RT-Thread vendored lwIP 2.1.2 Socket / Netconn
 - 类型：RT-Thread 仓库内置 lwIP 源码
 - 版本：RT-Thread commit `dc8aaa73f2dbea255325ec058a083aeeb5381d0a` 中的 lwIP 2.1.2
-- 定位：`components/net/lwip/lwip-2.1.2/src/api/sockets.c`：`lwip_socket()`、`lwip_connect()`、`lwip_close()`；`src/api/api_lib.c`：`netconn_new_with_proto_and_callback()`
-- URL/文档：[lwIP sockets.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/lwip/lwip-2.1.2/src/api/sockets.c)、[lwIP api_lib.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/lwip/lwip-2.1.2/src/api/api_lib.c)
-- 使用位置：“lwip_socket() 之后的 Netconn bridge”“lwip_connect()/close()”
-- 支撑内容：证明 RT-Thread SAL 最终重新进入标准 lwIP Socket → Netconn → Core 路径
+- 定位：`components/net/lwip/lwip-2.1.2/src/api/sockets.c`：`lwip_socket()`、`lwip_connect()`、`lwip_close()`
+- URL/文档：[lwIP sockets.c](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/lwip/lwip-2.1.2/src/api/sockets.c)
+- 使用位置：“lwIP socket 创建/连接/关闭”“重新接回 Netconn 主线”
+- 支撑内容：证明 SAL 最终进入标准 lwIP Socket → Netconn → Core 路径
+
+
+<a id="source-s7"></a>
+### [S7] RT-Thread 官方 SAL 文档
+- 类型：RT-Thread 官方在线文档
+- 版本：访问日期 2026-10-03；用于框架导读，目标实现仍固定到本文 commit
+- URL/文档：[Socket Abstraction Layer: SAL](https://rt-thread.github.io/rt-thread/page_component_sal.html)
+- 使用位置：“阅读源码前”“SAL/VFS/协议栈分层”“标准 BSD API 到 backend 的总体关系”
+- 支撑内容：官方说明 SAL 的统一 BSD Socket API、protocol family/backend abstraction 与 POSIX/文件描述符集成定位
+
+<a id="source-s8"></a>
+### [S8] RT-Thread 官方 Virtual File System 文档
+- 类型：RT-Thread 官方在线文档
+- 版本：访问日期 2026-10-03
+- URL/文档：[Virtual File System](https://rt-thread.github.io/rt-thread/page_component_vfs.html)
+- 使用位置：“阅读源码前”“read/write 复用 fd/file-operation infrastructure”
+- 支撑内容：提供 RT-Thread VFS/设备抽象的通用背景；本文具体 socket vnode/fops 行为仍由 `[S2]` 目标源码证明

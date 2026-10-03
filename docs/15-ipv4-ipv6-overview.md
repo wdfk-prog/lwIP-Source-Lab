@@ -6,11 +6,28 @@
 
 [TOC]
 
-Stage 1～14 的文章没有单独安排一篇“IPv4 总论”，但实际学习主线一直主要运行在 IPv4 上：Stage 2 的 Ping 使用 IPv4，Stage 4 明确进入 `ip4_input()`，Stage 5～10 的 UDP/TCP 实验运行在当前 IPv4 Host/TAP 网络，Stage 13 使用 DHCPv4 获取地址，Stage 14 的当前 DNS 实验解析 A 记录。[S1](#source-s1)
+IP（Internet Protocol，网际协议）位于网络层，负责让一个 IP datagram 在不同链路和路由器之间被转发到目标 IP 节点。IPv4 与 IPv6 是 IP 的两个主要版本：IPv4 使用 32-bit address，IPv6 使用 128-bit address，同时重新设计了 Header、邻居发现、自动配置、multicast 与 fragmentation 等网络层机制。[S3](#source-s3)[S4](#source-s4)
 
-因此，本篇不是从零再讲一遍 IPv4，也不继续把 IPv6 拆成 Neighbor Discovery、SLAAC、MLD、DHCPv6 等多篇源码专题。目标是像厂商 Application Note 一样，先把 IPv4/IPv6 放回完整协议栈，建立一次端到端数据流，再解释两代网络层的关键差异、为什么会出现 IPv6，以及在 MCU Ethernet、Linux 网关和云连接中什么时候需要真正关心 IPv6。
+所谓“best effort”并不表示网络完全不可靠，而是 IP 层本身不承诺每个 datagram 一定送达、只送一次或按序到达；可靠传输、重传与有序 byte stream 等语义由 TCP 等更高层机制提供。这个边界解释了为什么 IPv4/IPv6 可以替换网络层机制，而 MQTT、HTTP、TLS 等应用层/安全层语义仍能继续复用。
 
-本篇是 **Theory of Operation / 工程总览**，不是源码调用链文章。源码只用于说明 lwIP 中对应模块在哪里；如果以后需要深入 `ip6_input()`、`nd6_input()` 或 `dhcp6_recv()`，再从真实入口单独继续源码阅读。
+## 0. 阅读本篇前：建议先看这些权威入口
+
+1. [RFC 8200 — Internet Protocol, Version 6 (IPv6) Specification](https://www.rfc-editor.org/rfc/rfc8200.html) 与 [RFC 4291 — IPv6 Addressing Architecture](https://www.rfc-editor.org/rfc/rfc4291.html)
+   - 用途：核对 IPv6 base header、128-bit addressing、address type 与 scope。[S4](#source-s4)
+2. [RFC 4861 — Neighbor Discovery for IP version 6](https://www.rfc-editor.org/rfc/rfc4861.html)
+   - 用途：理解 IPv6 为什么不是简单把 ARP 换个名字，而是引入更完整的 Neighbor Discovery（ND，邻居发现）体系。[S5](#source-s5)
+3. [RFC 4862 — IPv6 Stateless Address Autoconfiguration](https://www.rfc-editor.org/rfc/rfc4862.html)
+   - 用途：理解 SLAAC（Stateless Address Autoconfiguration，无状态地址自动配置）、link-local address 与 DAD（Duplicate Address Detection，重复地址检测）。[S6](#source-s6)
+4. [Microchip AN1120 — Ethernet Theory of Operation](https://ww1.microchip.com/downloads/en/AppNotes/01120a.pdf)
+   - 用途：从协议栈与封装关系理解 IP 为什么位于 Ethernet 与 TCP/UDP 之间。[S11](#source-s11)
+
+这些资料承担规范权威与继续深入；正文仍会独立建立 IPv4/IPv6 的工程心智模型。
+
+Stage 1～14 的主实验一直主要运行在 IPv4 上：Stage 2 的 Ping 使用 IPv4，Stage 4 明确进入 `ip4_input()`，Stage 5～10 的 UDP/TCP 实验运行在当前 IPv4 Host/TAP 网络，Stage 13 使用 DHCPv4 获取地址，Stage 14 的当前 DNS 实验解析 A Record。[S1](#source-s1)
+
+因此，本篇不是再写一篇“IPv4 从零教程”，也不把 IPv6 拆成多篇源码专题。目标是以 Theory-of-Operation 的方式，把两代网络层放进同一套职责框架：地址与 scope、邻居解析、Router Discovery、自动配置、控制报文、multicast、fragmentation、DNS 与过渡机制分别由谁承担；随后再回到 MCU Ethernet、Linux 网关和云连接场景判断需要掌握到什么深度。
+
+本篇不是源码调用链文章。lwIP 源码只用于标出实现入口；如果后续需要深入 `ip6_input()`、`nd6_input()`、`dhcp6_recv()` 或 `ip6_frag()`，应从各自真实入口另开 Source-driven 主线，而不是在这里混入第二条叙事。
 
 ## 1. 先把 IP 放回完整协议栈：MQTT、HTTP、RPC 并不直接“跑在 Ethernet 上”
 
@@ -95,7 +112,7 @@ Stage 13 则把“地址从哪里来”补齐为 DHCPv4；Stage 14 又把 hostna
 
 ## 3. IPv4 的基本工程模型：地址、前缀、网关、ARP、DHCP 与 NAT 分别处于哪里
 
-IPv4 address 是 32 bit。CIDR 使用 `/n` 表示前 `n` bit 是 network prefix，例如 `198.18.0.200/24` 表示前 24 bit 用于判断本地 subnet。[S3](#source-s3)
+IPv4 address 是 32 bit。CIDR（Classless Inter-Domain Routing，无类别域间路由）使用 `/n` 表示前 `n` bit 是 network prefix，例如 `198.18.0.200/24` 表示前 24 bit 用于判断本地 subnet。[S3](#source-s3)
 
 一个典型 MCU IPv4 配置可以抽象为：
 
@@ -115,7 +132,7 @@ DNS server   : 198.18.0.1
 - **ARP**：在当前 Ethernet link 上把 IPv4 next-hop 映射到 MAC address；
 - **DHCPv4**：可自动提供 IPv4 address、netmask、gateway、DNS 等配置；
 - **DNS**：把 hostname 解析成 IP address；
-- **NAT**：通常位于路由器/网关边界，用地址转换让私网节点共享或映射公网地址，并不是 IPv4 host 每次发送 packet 都必须执行的协议步骤。
+- **NAT（Network Address Translation，网络地址转换）**：通常位于路由器/网关边界，用地址转换让私网节点共享或映射公网地址，并不是 IPv4 host 每次发送 packet 都必须执行的协议步骤。
 
 RFC 1918 定义了私有 IPv4 地址空间，RFC 3022 描述了传统 NAT；它们缓解了公网 IPv4 地址消耗并形成今天非常常见的“设备在私网，网关做 NAT”的部署方式，但 NAT 不是 IPv4 基础报文格式的一部分。[S3](#source-s3)
 
@@ -128,7 +145,7 @@ IPv4 的 32-bit 地址空间和早期地址分配方式在互联网快速扩张�
 ```text
 CIDR
 私有地址 RFC 1918
-NAT / NAPT
+NAT / NAPT（Network Address and Port Translation，网络地址与端口转换）
 ```
 
 这些机制让 IPv4 的生命周期远远超过早期预测，也解释了为什么今天很多 MCU 局域网产品仍然可以只使用 IPv4。
@@ -139,9 +156,9 @@ NAT / NAPT
 - base header 固定化，并通过 Extension Header 扩展可选网络层信息；
 - IPv6 本身不定义 broadcast address，更多依赖 multicast；
 - ARP 不再用于 IPv6，邻居发现进入 ICMPv6 Neighbor Discovery；
-- Router Advertisement 与 SLAAC 成为重要的地址/路由自动配置机制；
+- Router Advertisement 与 SLAAC（Stateless Address Autoconfiguration，无状态地址自动配置）成为重要的地址/路由自动配置机制；
 - Router 不再替 IPv6 source 做 fragmentation；
-- ICMPv6 承担的职责比 IPv4 ICMP 更广，Neighbor Discovery 本身就建立在 ICMPv6 上。
+- ICMPv6（Internet Control Message Protocol for IPv6）承担的职责比 IPv4 ICMP 更广，Neighbor Discovery 本身就建立在 ICMPv6 上。
 
 因此 IPv6 是一套新的网络层工作模型，而不是“把 `uint32_t ip` 换成 16-byte array”这么简单。
 
@@ -156,11 +173,11 @@ NAT / NAPT
 | Header checksum | IPv4 Header 有 checksum | IPv6 base header 无 header checksum |
 | 本地地址解析 | ARP | ICMPv6 Neighbor Discovery |
 | Broadcast | 支持 IPv4 broadcast | IPv6 不定义 broadcast address |
-| Multicast | IGMP 管理 IPv4 multicast membership | IPv6 大量依赖 multicast，MLD 管理 listener membership |
-| 自动配置 | 静态 / DHCPv4 / AutoIP 等 | link-local + SLAAC，可结合 DHCPv6 等 |
-| Internet Control | ICMPv4 | ICMPv6，且 ND/RA 等直接建立在其上 |
+| Multicast | IGMP（Internet Group Management Protocol）管理 IPv4 multicast membership | IPv6 大量依赖 multicast，MLD（Multicast Listener Discovery）管理 listener membership |
+| 自动配置 | 静态 / DHCPv4 / AutoIP（IPv4 link-local self-configuration）等 | link-local + SLAAC，可结合 DHCPv6（DHCP for IPv6）等 |
+| Internet Control | ICMPv4 | ICMPv6，且 ND / Router Advertisement（RA）等直接建立在其上 |
 | Router fragmentation | 某些 IPv4 情况下 router 可以分片 | IPv6 router 不分片；source 承担 fragmentation |
-| DNS 地址记录 | A | AAAA |
+| DNS 地址记录 | A（IPv4 address record） | AAAA（IPv6 address record） |
 
 表格只建立地图。真正重要的是下一节开始的“同一职责由谁承担”。
 
@@ -176,7 +193,7 @@ IPv4:
 
 IPv6:
 接口可以先拥有 link-local address
-再通过 RA/SLAAC 等获得其他地址
+再通过 Router Advertisement / SLAAC 等获得其他地址
 ```
 
 link-local 不是“一个缩短版公网 IPv6 地址”。它具有 link scope，同一个 `fe80::...` destination 在多网卡系统里还可能需要额外的 interface/zone 信息才能确定从哪个 link 发送。
@@ -185,7 +202,7 @@ link-local 不是“一个缩短版公网 IPv6 地址”。它具有 link scope�
 
 1. IPv6 地址不是只有“公网地址”一种；
 2. link-local 是理解 ND、Router Discovery、SLAAC 的基础；
-3. 地址存在不等于地址生命周期和可用状态完全相同，DAD 等机制会进一步确认地址是否可正常使用。[S6](#source-s6)
+3. 地址存在不等于地址生命周期和可用状态完全相同，DAD（Duplicate Address Detection，重复地址检测）等机制会进一步确认地址是否可正常使用。[S6](#source-s6)
 
 ## 7. ARP 没有被“改名”为 ND：Neighbor Discovery 承担的职责更多
 

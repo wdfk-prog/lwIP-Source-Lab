@@ -10,6 +10,12 @@ Stage 01～37 一直使用“已经能运行”的 lwIP：Unix Port 已经提供
 
 Stage 38 不重新讲 Stage 11 的 `tcpip_thread/sys_arch` 原理，也不重新讲 Stage 20～22 的 DMA/PHY 细节，而是建立一套可以迁移到 RT-Thread、FreeRTOS、ThreadX 或其他平台的 Port 心智模型。本文源码基线为用户提供的更新 `lwip.zip`；`opt.h`、`init.c`、`sys.h`、`Filelists.cmake`、`netif.h` 与 Doxygen Porting 文档的 Git blob 均已与 upstream commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 对照一致。[S1](#source-s1)[S2](#source-s2)[S3](#source-s3)[S4](#source-s4)
 
+## 阅读源码前：先把 upstream Porting 文档当成 contract
+
+Stage 38 的职责不是替代 lwIP 官方 Porting 文档。upstream 2.1.x Doxygen 已经分别给出 bare-metal `NO_SYS` mainloop、OS abstraction 与 `struct netif` 的公开接口说明：`NO_SYS=1` 需要在 mainloop 喂包并周期执行 `sys_check_timeouts()`；OS Port 需要实现 `sys_arch` 的 semaphore、mailbox、mutex、thread 与 time contract；`netif_add()` 则明确规定 `state/init/input` 怎样把具体网卡接入协议栈。[S7](#source-s7)
+
+阅读这些官方页面时只需要先回答三个问题：**Core 在什么执行上下文运行、OS 需要补哪些 primitives、Driver 通过哪个 `netif` 边界交包。** 本篇随后使用目标源码快照解释配置、构建和 Port contract 怎样组合；涉及具体默认值和函数行为时，仍以固定 commit 的 `[S1]～[S6]` 为实现证据，而不是把 live Doxygen 当作目标快照本身。
+
 ## 1. “移植 lwIP”不是改 TCP/IP Core，而是补齐四个工程边界
 
 把目标板上的 lwIP 拆开，真正需要项目决定的主要是四类问题：
@@ -569,3 +575,12 @@ Stage 39 将直接拿 RT-Thread 当前源码逐项回答这些问题。重点不
 - URL/文档：[lwIP netif.h](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/src/include/lwip/netif.h)
 - 使用位置：“Network Port”“RX/TX 边界”
 - 支撑内容：定义 lwIP Core 与具体 network driver 之间的接口对象和函数指针边界
+
+
+<a id="source-s7"></a>
+### [S7] lwIP 2.1.x 官方 Porting API 文档
+- 类型：lwIP 官方 Doxygen 在线文档
+- 版本：2.1.x 文档站，访问日期 2026-10-03；仅作为 Porting 学习导引，目标实现仍以 `[S1]～[S6]` 固定 commit 为准
+- URL/文档：[Mainloop mode (NO_SYS)](https://www.nongnu.org/lwip/2_1_x/group__lwip__nosys.html)、[OS abstraction layer](https://www.nongnu.org/lwip/2_1_x/group__sys__os.html)、[Network interface (NETIF)](https://www.nongnu.org/lwip/2_1_x/group__netif.html)
+- 使用位置：“阅读源码前”“NO_SYS/OS Port/netif 三个边界”
+- 支撑内容：提供 upstream 面向 Port 作者的公开接口说明，帮助先建立 contract，再阅读目标源码

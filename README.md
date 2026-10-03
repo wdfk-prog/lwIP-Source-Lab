@@ -35,7 +35,7 @@ Linux TAP
     ↓
 完成主链后回看整体机制
 
-Theory of Operation 总览篇（Stage 00、15、38）
+Theory of Operation 总览篇（Stage 00、15、31、38、45）
     ↓
 先建立系统位置和完整数据流
     ↓
@@ -129,8 +129,8 @@ scripts/build.sh all
 
 | Stage | 教程 | 核心问题 |
 |---:|---|---|
-| 00 | [从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](docs/00-ethernet-physical-layer-and-network-stack.md) | 沿物理介质、PHY、MAC、DMA/Driver 到 lwIP netif 建立 Ethernet 收发心智模型，并解释速率协商、抗干扰、冲突与 MAC 过滤。 |
-| 01 | [从 upstream `master` 到第一条可读源码链——Linux Host、构建树与源码地图](docs/01-linux-lwip-lab.md) | 建立固定追踪 upstream master 的 Linux Host 学习仓库，理解源码、构建树、compile database 与后续源码阅读之间的关系。 |
+| 00 | [从网线上的电信号到 lwIP——PHY、MAC、DMA 与 `netif` 的完整边界](docs/00-ethernet-physical-layer-and-network-stack.md) | 从 Ethernet Frame、PHY/MAC 分层出发，沿 DMA/Driver、pbuf、netif 建立完整软硬件边界，并区分链路、接口、IP 与上层就绪状态。 |
+| 01 | [从 upstream `master` 到第一条可读源码链——Linux Host、构建树与源码地图](docs/01-linux-lwip-lab.md) | 沿 submodule、Host 依赖、Debug build tree、compile database 与 VS Code 索引走完第一次可构建、可跳转的源码阅读环境。 |
 | 02 | [从 `main()` 到第一次 Ping——`netif`、TAP、ARP 与 ICMP 的完整源码链](docs/02-netif-tap-first-ping.md) | 从 Unix example_app 的真实入口出发，沿 netif、TAP、ARP、IPv4、ICMP 与收发路径追踪一次真实 Ping，并用实际 PCAP 与源码逐字段互证。 |
 | 03 | [从 `low_level_input()` 到 `pbuf_free()`——`pbuf` 的数据视图、Chain 与引用计数](docs/03-pbuf.md) | 从 TAP 接收路径里的第一次 pbuf allocation 出发，理解 payload、长度、Chain、类型与引用计数如何共同描述一个 packet。 |
 | 04 | [从 `ethernet_input()` 到 Echo Reply——Ethernet、ARP、IPv4 与 ICMP 的分层数据通路](docs/04-ethernet-arp-ipv4-icmp.md) | 用 Stage 2 的真实四帧 Ping 抓包对照 lwIP 源码，理解 EtherType、ARP opcode、IPv4 Protocol、ICMP Type 和 pbuf 数据视图如何逐层驱动分发。 |
@@ -147,7 +147,7 @@ scripts/build.sh all
 | 15 | [IPv4 与 IPv6——从网络层工作原理到嵌入式工程取舍](docs/15-ipv4-ipv6-overview.md) | 从前 14 篇已经建立的 IPv4 主线出发，对照 IPv6 的地址、邻居发现、自动配置、ICMP、分片、DNS 与过渡机制，并说明 MCU、Linux 与云场景需要掌握到什么程度。 |
 | 16 | [从 MTU 到 `ip4_frag()` / `ip4_reass()`——IPv4 分片、重组、超时与内存压力](docs/16-ipv4-fragmentation-reassembly.md) | 沿 IPv4 发送与接收源码链，理解 MTU 如何触发分片、Offset/MF/ID 如何组织片段，以及 lwIP 怎样排序、重组、超时清理并限制资源占用。 |
 | 17 | [从 `IP_ADD_MEMBERSHIP` 到 `igmp_input()`——IPv4 Multicast、IGMPv2、MAC Filter 与组成员状态机](docs/17-igmp-ipv4-multicast.md) | 从 RTP Socket 的 IP_ADD_MEMBERSHIP 入口追踪 IGMPv2 加组、Report/Query/Leave、100 ms Timer、报告抑制与 multicast MAC 映射。 |
-| 18 | [从 `udp_sendto()` 到 `netif->output()`——Multi-netif 路由选择、Default Netif、Gateway 与 IPv6 Source Selection](docs/18-multi-netif-routing.md) | 从 UDP/TCP 真实发送入口追踪多 netif 出口选择、默认接口、IPv4 Gateway、IPv6 ND 路由与源地址选择，并说明显式绑定接口和 route hook 的边界。 |
+| 18 | [从 `udp_sendto()` 到 `etharp_output()`——Multi-netif IPv4 路由、Default Netif、Gateway 与下一跳](docs/18-multi-netif-routing.md) | 从 UDP/TCP 发送入口追踪 IPv4 multi-netif 出口选择、默认接口、源地址与 Gateway 下一跳，区分 route selection 与 ARP next-hop selection，并说明 route/gateway hook 的边界。 |
 | 19 | [从 `ip_chksum_pseudo()` 到 `netif->linkoutput()`——lwIP 校验和、Checksum Offload 与驱动边界](docs/19-checksum-hardware-offload.md) | 沿 UDP/TCP 的真实收发路径解释 lwIP Internet checksum、pseudo header、per-netif checksum 控制，并明确软件校验和与 MAC/DMA 硬件卸载之间的驱动职责边界。 |
 | 20 | [从 `netif->linkoutput()` 到 `pbuf_custom`——Ethernet Driver、DMA Buffer、所有权与 Zero-copy](docs/20-ethernet-dma-zero-copy.md) | 从 lwIP 的 linkoutput 边界进入真实 Ethernet Driver，追踪 pbuf chain、DMA buffer、custom pbuf、Cache 一致性与 zero-copy 的所有权闭环。 |
 | 21 | [从 DMA Descriptor Ring 到 `netif->input()`——ISR、Polling、TX Completion 与 Backpressure](docs/21-ethernet-descriptor-ring-backpressure.md) | 沿真实 Ethernet Driver 边界解释 TX/RX descriptor ring、OWN 状态、ISR 与 polling、资源回收、RX starvation 和 backpressure 如何影响 lwIP。 |
@@ -157,13 +157,13 @@ scripts/build.sh all
 | 25 | [从 `autoip_start()` 到 `ACD_IP_OK`——IPv4 Link-Local、169.254/16、ARP Probe/Announce、Conflict 与 DHCP Cooperation](docs/25-autoip-ipv4-link-local.md) | 从 AutoIP 入口追踪 169.254 地址选择、AutoIP/ACD 双层状态机、ARP Probe/Announce、冲突防御、DHCP cooperation 与链路变化。 |
 | 26 | [从 `snmp_example_init()` 到 `mib2_counters`——SNMPv2c、OID Tree、GET/GETNEXT/GETBULK 与 MIB2](docs/26-snmp-mib2.md) | 从 SNMP 示例入口追踪 UDP 161、ASN.1/PDU 解析、GET/GETNEXT/GETBULK、OID Tree、MIB2 interface/counter 映射与 RAW/NETCONN 线程边界。 |
 | 27 | [从 `lwiperf_start_tcp_server_default()` 到 TCP ACK——lwIP 吞吐量、窗口、pbuf、线程与 Driver 瓶颈定位](docs/27-lwiperf-performance-bottleneck.md) | 从 lwiperf Raw TCP 入口追踪收发、ACK 驱动的续传、窗口与发送队列，再把 pbuf/memp、tcpip_thread、DMA ring、checksum offload 与 PHY 速率接成一条性能瓶颈证据链。 |
-| 28 | [从 `pppos_create()` 到 `ppp_input()`——PPP Core、PPPoS 串口字节流、异步 HDLC Framing 与 FCS](docs/28-ppp-core-pppos-framing.md) | 从 upstream PPPoS example 追踪 PPP netif 创建、LCP 启动、串口 RX 跨线程输入、异步 HDLC 解帧、Protocol 分发，以及 TX 的 ACCM escaping、PFC/ACFC 与 FCS。 |
+| 28 | [从 `pppos_create()` 到 `ppp_input()`——PPP Core、PPPoS 串口字节流与 HDLC-like Framing](docs/28-ppp-core-pppos-framing.md) | 从 upstream PPPoS example 追踪 PPP netif 创建、串口 RX 跨线程输入、HDLC-like 解帧、FCS、Protocol 分发，以及 TX 的 ACCM、PFC/ACFC 与 serial output。 |
 | 29 | [从 `lcp_open()` 到 `np_up()`——LCP、PAP/CHAP、IPCP、IPv6CP 与 PPP 协商状态机](docs/29-ppp-lcp-auth-ipcp-ipv6cp.md) | 沿 PPP phase 与 generic FSM 追踪 LCP 配置协商、PAP/CHAP 认证、Network phase、IPCP/IPv6CP 配置与网络协议启用，明确各层职责与 RUNNING 条件。 |
 | 30 | [从 `ipcp_up()` 到 `ppp_link_status_cb()`——PPP 地址、DNS、Default Route、Link Down 与 Reconnect](docs/30-ppp-address-dns-route-reconnect.md) | 从 IPCP/IPv6CP OPENED 追踪 netif 地址、peer DNS、default netif、link up/down、PPPERR 回调、关闭与应用侧重连责任，建立 PPP 网络配置生命周期。 |
-| 31 | [从 `slipif_init()` 到 `pppos_create()`——SLIP 与 PPPoS 的串口封装、错误检测、协商与工程边界](docs/31-slip-vs-pppos.md) | 从 lwIP 的 SLIP 与 PPPoS 两条真实串口路径对比 framing、Protocol 分发、FCS、地址配置、认证、线程桥接与错误语义，明确最小 IP framing 与完整 PPP 控制面的边界。 |
+| 31 | [SLIP vs PPPoS——串口 IP Framing、错误检测、协商与工程边界](docs/31-slip-vs-pppos.md) | 用统一的数据流、控制面与实现边界比较 SLIP 和 PPPoS 的 framing、错误检测、Protocol 分发、地址/认证能力、执行上下文与生命周期。 |
 | 32 | [从 `httpd_init()` 到 `http_sent()`——HTTPD、altcp、fsdata 与 HTTP 连接生命周期](docs/32-httpd-altcp.md) | 从 HTTPD 真实入口追踪监听、连接状态、request parsing、fsdata 文件映射、TCP 背压与 ACK 驱动续传，理解 altcp 怎样解耦 HTTP 与传输层。 |
 | 33 | [从 `https_ex_init()` 到 `http_recv()`——altcp、mbedTLS、TLS Handshake 与 HTTPS 数据通路](docs/33-altcp-tls-https.md) | 从 upstream HTTPS example 追踪 TLS config、TLS outer/TCP inner、mbedTLS handshake、BIO I/O 与解密后的 HTTP callback，理解 HTTPS 如何复用 Stage 32。 |
-| 34 | [从 `mqtt_example_init()` 到 `mqtt_message_received()`——MQTT CONNECT、SUBSCRIBE、PUBLISH 与回调数据通路](docs/34-mqtt.md) | 从 upstream MQTT example 追踪 CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH、request queue、ring buffer 与 incoming publish callback。 |
+| 34 | [MQTT 从协议流程到 lwIP 源码——连接、订阅、发布与回调链](docs/34-mqtt.md) | 从 Client/Broker、Control Packet、QoS、Keep Alive、Will、Clean Session 等协议基线进入真实 MQTT example，再把 CONNECT/CONNACK、SUBSCRIBE/SUBACK、PUBLISH 与回调逐步映射到 lwIP 源码。 |
 | 35 | [从 `tls_config` 到 `mqtt_cyclic_timer()`——MQTT over TLS、Keep Alive、Timeout 与应用侧 Reconnect](docs/35-mqtt-tls-reconnect-keepalive.md) | 沿 MQTT TLS 分支追踪 TLS handshake、Keep Alive、request timeout、断线清理和 connection callback，明确应用侧 reconnect/resubscribe 责任。 |
 | 36 | [从 `sntp_example_init()` 到 `sntp_process()`——SNTP、DHCP/DNS、Timer 与系统时间同步](docs/36-sntp-system-time.md) | 从 upstream SNTP example 追踪 Server 来源、DNS/UDP request、response 校验、retry/update Timer 与系统时间 Port，并说明可信时间与 TLS certificate validity 的工程关系。 |
 | 37 | [从 `httpc_get_file_dns()` 到 Body Callback——HTTP/HTTPS Client、DNS、altcp 与下载数据通路](docs/37-http-https-client.md) | 从 HTTP client 公共入口追踪 DNS、altcp/TCP、GET、Header/Body callback，并用 TLS allocator 把同一条 httpc 主线切换成 HTTPS，建立 REST/配置拉取/OTA 下载的网络侧基础。 |
@@ -174,7 +174,7 @@ scripts/build.sh all
 | 42 | [从 `rt_hw_stm32_eth_init()` 到 `tcpip_input()`——STM32H750 + RT-Thread + lwIP Ethernet Port](docs/42-stm32h750-rtthread-lwip-ethernet-port.md) | 以 STM32H750 Art-Pi + LAN8720A 为真实案例，追踪 BSP/HAL、`eth_device`、`netif`、RX/TX bridge 与 `tcpip_input()`，把通用 Port Contract 落到具体 MCU Ethernet。 |
 | 43 | [从 `ETH_IRQHandler()` 到 `HAL_ETH_Transmit()`——STM32H7 Ethernet DMA、Descriptor、Cache 与 Zero-copy 边界](docs/43-stm32h7-ethernet-dma-cache-zero-copy.md) | 沿 STM32H750 Ethernet RX/TX 数据面追踪 DMA descriptor OWN、D-Cache 一致性、RX copy、TX scatter-gather 与当前 zero-copy 边界。 |
 | 44 | [从 `phy_monitor_thread_entry()` 到 `dhcp_network_changed()`——STM32H750 PHY Link、Auto-negotiation 与 DHCP 恢复](docs/44-stm32-phy-link-dhcp-recovery.md) | 沿 LAN8720A Link/Auto-negotiation、STM32 MAC 重配置、RT-Thread `eth_device` 与 lwIP `netif` 追踪网线插拔后的 Link 与 DHCP 恢复。 |
-| 45 | [从 Link Up 到 MQTT Reconnect——STM32 + RT-Thread + lwIP MCU Cloud Lifecycle](docs/45-mcu-cloud-lifecycle.md) | 把 Link、DHCP、DNS、SNTP、TLS、MQTT 与 reconnect/resubscribe 组织成完整 MCU 上云状态链，明确协议栈自动恢复与应用编排边界。 |
+| 45 | [从 Link Up 到 MQTT Reconnect——STM32 + RT-Thread + lwIP MCU Cloud Lifecycle](docs/45-mcu-cloud-lifecycle.md) | 以 readiness、事件所有权、failure domain 与单一 Cloud Orchestrator 组织 Link/IP/Time/DNS/TLS/MQTT 恢复链，明确协议栈局部自动行为和产品长期运行责任。 |
 
 完整索引见 [docs/00-series-index.md](docs/00-series-index.md)。
 

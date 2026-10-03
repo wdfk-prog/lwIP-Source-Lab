@@ -6,9 +6,48 @@
 
 [TOC]
 
-PHY Link 生命周期描述的是“物理链路是否可用”如何逐层变成协议栈可见的网络状态。它从外部 PHY 的 Link/Auto-negotiation 状态开始，经 MAC speed/duplex 配置、RT-Thread `eth_device` 事件桥接，最终到达 lwIP `NETIF_FLAG_LINK_UP` 与 DHCP client。Stage 22 已经讲过 PHY 与自动协商的通用原理；Stage 44 不重复 PHY 教科书，而是沿 STM32H750 Art-Pi 的真实源码追踪一次 **Link Down → Link Up → DHCP 恢复**。[S1](#source-s1)[S6](#source-s6)
+PHY（Physical Layer Transceiver，物理层收发器）负责检测网线侧物理连接并完成 10/100M、半双工/全双工等链路能力协商。**Auto-Negotiation（自动协商）** 是链路两端交换能力并得到共同工作模式的过程；LAN8720A 的 **BMSR（Basic Mode Status Register，基本模式状态寄存器）** 暴露 Link Status 与 Auto-Negotiation Complete 等状态。lwIP 中的 `NETIF_FLAG_LINK_UP` 则是软件层的 Link 标志，它不等于 `NETIF_FLAG_UP`，更不等于已经获得 IP 地址。DHCP（Dynamic Host Configuration Protocol，动态主机配置协议）要在 Link 恢复后继续完成地址获取或旧租约验证，才可能真正达到 IP Ready。[S3](#source-s3)[S4](#source-s4)[S6](#source-s6)[S7](#source-s7)
 
-源码继续固定为 RT-Thread commit `dc8aaa73f2dbea255325ec058a083aeeb5381d0a`（2026-09-28），硬件仍是 STM32H750 Art-Pi + LAN8720A。[S1](#source-s1)[S5](#source-s5) 当前 Art-Pi 没有启用 `PHY_USING_INTERRUPT_MODE`，因此主路径是 PHY monitor thread 每 1 秒轮询一次；driver 同时保留 PHY interrupt 模式，本文只在需要消歧时说明该分支。[S1](#source-s1)[S5](#source-s5)
+Stage 22 已经建立 PHY/Auto-Negotiation 通用模型，Stage 13 已经讲过 DHCP 协议主线。Stage 44 只追当前 STM32H750 Art-Pi 的具体恢复链：**PHY 状态变化如何经过 STM32 Driver、RT-Thread `eth_device`、`erx` 与 lwIP `netif`，最后触发 `dhcp_network_changed()`。**
+
+## 阅读源码前：建议提前阅读
+
+1. [LAN8720A/LAN8720Ai Data Sheet](https://ww1.microchip.com/downloads/en/DeviceDoc/00002165B.pdf)
+   - 用途：重点看 BMSR Link Status、Auto-Negotiation Complete，以及 Link Status 的 latch-low（曾经变低后会锁存低状态，直到软件读取清除历史状态）语义。[S6](#source-s6)
+2. [RFC 2131 — Dynamic Host Configuration Protocol](https://www.rfc-editor.org/rfc/rfc2131.html)
+   - 用途：理解 Link 恢复后为什么客户端可能先验证已有地址，而不是机械地重新走一遍完整地址发现流程。[S7](#source-s7)
+3. [RT-Thread Network Framework](https://rt-thread.github.io/rt-thread/page_component_network.html)
+   - 用途：先把 `eth_device`、`erx`（RT-Thread Ethernet RX 接收线程）、lwIP 与 NetDev 放到同一网络框架中。[S9](#source-s9)
+4. [RT-Thread `drv_eth.c`（固定 commit）](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/bsp/stm32/libraries/HAL_Drivers/drivers/drv_eth.c)
+   - 用途：本文当前板级 `phy_monitor_thread_entry()`、`phy_linkchange()`、MAC stop/start 与 Link event 的直接源码证据。[S1](#source-s1)
+
+## 先看完整恢复流程：物理 Link 与 IP Ready 中间隔着多层状态
+
+当前 Art-Pi 没有启用 `PHY_USING_INTERRUPT_MODE`，所以 PHY monitor thread 每 1 秒轮询一次；这个 1 秒只是当前 Driver 的软件策略，不是 Ethernet/LAN8720A 协议规定的检测周期。[S1](#source-s1)[S5](#source-s5)
+
+```mermaid
+sequenceDiagram
+    participant PHY as LAN8720A PHY
+    participant DRV as STM32 Driver
+    participant PORT as RT-Thread eth_device/erx
+    participant NETIF as lwIP netif
+    participant DHCP as lwIP DHCP
+
+    PHY-->>DRV: Link status / Auto-Negotiation result
+    DRV->>DRV: update MAC speed/duplex and start/stop MAC
+    DRV-->>PORT: eth_device_linkchange(up/down)
+    PORT-->>NETIF: netif_set_link_up/down()
+    NETIF-->>DHCP: dhcp_network_changed() on Link Up
+    DHCP-->>NETIF: keep/verify/reacquire IPv4 configuration
+```
+
+这张图里有三个不能混成一个布尔量的状态：
+
+- **PHY Link**：网线侧是否已经建立物理连接；
+- **lwIP Link Up**：协议栈是否认为该接口的数据链路当前可用；
+- **IP Ready**：DHCP 或静态配置是否已经提供可用 IP/netmask/gateway。
+
+Stage 44 的源码会从最左侧 `phy_monitor_thread_entry()` 开始，把这三个状态如何逐层推进讲完整。业务层 DNS/TLS/MQTT 如何在 IP Ready 之后恢复，留给 Stage 45。
 
 ## 1. PHY 监测入口来自 Stage 42 已经创建的 `phy` 线程
 
@@ -413,24 +452,9 @@ all TCP/MQTT connections synchronously closed
 
 真正的 TCP/MQTT 失败会随后通过发送错误、TCP timeout、MQTT keepalive/server watchdog 等机制暴露。Stage 45 会把“底层 Link 已恢复”和“云连接已经恢复”明确拆成两个状态。
 
-## 12. RT-Thread NetDev 也会同步 Link 状态，但它不是新的 PHY 检测器
+## 12. NetDev 只是同步 Link 状态，不重新检测 PHY
 
-RT-Thread vendored `netif_set_link_up/down()` 在标准 lwIP 行为之后增加了 NetDev 同步：[S3](#source-s3)
-
-```text
-netdev_low_level_set_link_status(netdev, true/false)
-```
-
-NetDev 再维护 `NETDEV_FLAG_LINK_UP`，并可通过 `status_callback` 发出：
-
-```text
-NETDEV_CB_STATUS_LINK_UP
-NETDEV_CB_STATUS_LINK_DOWN
-```
-
-Link Down 时 NetDev 还会清除 `NETDEV_FLAG_INTERNET_UP`。[S8](#source-s8)
-
-这并不代表 NetDev 又独立检测了一次 PHY。它只是把已经由 PHY → `eth_device` → lwIP 建立的状态，再同步到 RT-Thread 统一 network interface abstraction，供 SAL/应用层观察。
+RT-Thread vendored `netif_set_link_up/down()` 会调用 `netdev_low_level_set_link_status()`，NetDev 据此维护 `NETDEV_FLAG_LINK_UP` 并触发 `NETDEV_CB_STATUS_LINK_UP/DOWN`；Link Down 还会清 `NETDEV_FLAG_INTERNET_UP`。[S3](#source-s3)[S8](#source-s8) RT-Thread 官方 Network Framework 将 NetDev/SAL 放在协议栈与应用之间的统一抽象层，[S9](#source-s9) 因而这里的 NetDev 是状态镜像与应用观察入口，不是第二个 PHY detector。
 
 ```mermaid
 flowchart LR
@@ -579,3 +603,11 @@ MQTT 还没收到 CONNACK
 - URL/文档：[NetDev header](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/netdev/include/netdev.h)、[NetDev source](https://github.com/RT-Thread/rt-thread/blob/dc8aaa73f2dbea255325ec058a083aeeb5381d0a/components/net/netdev/src/netdev.c)
 - 使用位置：“NetDev Link 状态同步”“应用层可观察事件”
 - 支撑内容：证明 lwIP Link 状态如何同步到 NetDev flag/callback，以及 Link Down 会清除 NetDev internet-up flag
+
+<a id="source-s9"></a>
+### [S9] RT-Thread 官方 Network Framework
+- 类型：RT-Thread 官方框架文档
+- 版本：在线文档，访问日期 2026-10-03
+- URL/文档：[RT-Thread Network Framework](https://rt-thread.github.io/rt-thread/page_component_network.html)
+- 使用位置：开篇框架边界、NetDev 状态同步与 `erx`/协议栈关系
+- 支撑内容：给出 RT-Thread 网络框架分层，并说明 Ethernet 接收通过 `erx` 线程进入协议栈；用于区分框架职责与本篇目标 commit 的具体 PHY/Link 实现

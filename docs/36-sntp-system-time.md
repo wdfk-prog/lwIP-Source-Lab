@@ -6,9 +6,82 @@
 
 [TOC]
 
-Stage 13 已经追过 DHCP，Stage 14 已经追过 DNS，Stage 33～35 又把 TLS、HTTPS 与 MQTT over TLS 接到了 lwIP。Stage 36 不重新讲 UDP 或 DNS，而是从 upstream 的真实入口 `sntp_example_init()` 出发，回答设备联网后经常紧接着出现的一个问题：**IP 地址已经拿到了，为什么云设备还要先建立“可信时间”，lwIP 的 SNTP client 又是怎样把 DHCP/DNS、UDP、Timer 和系统时钟串起来的。** [S1](#source-s1)[S2](#source-s2)
+SNTP（Simple Network Time Protocol，简单网络时间协议）是 NTP（Network Time Protocol，网络时间协议）的简化客户端使用方式。设备通常作为 Client，经 UDP 向时间 Server 发送请求，从响应里的 NTP timestamp 得到 wall clock 时间，再通过平台 hook 更新系统时钟。MCU/IoT 产品常在 TLS/Cloud 建连前先完成这一步，因为证书有效期判断、日志时间和业务时间戳都依赖一个足够可信的系统时间。[S6](#source-s6)[S9](#source-s9)
 
-本文源码使用用户提供的更新 `lwip.zip` 快照；与 upstream `master` commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 对比后，本文涉及的 SNTP 源码文件 Git blob 完全一致，因此继续以该 commit 作为公开可追溯版本基线。[S1](#source-s1)[S2](#source-s2)
+Stage 13 已经追过 **DHCP（Dynamic Host Configuration Protocol）**，它负责自动获得网络参数，并可通过 Option 42 提供 NTP Server 地址；Stage 14 已经追过 **DNS（Domain Name System，域名系统）**，它负责把 Server hostname 解析成 IP address。这里的 **Timer** 是 lwIP `sys_timeout()` 定时机制，用于安排首次 request、receive timeout、retry 和下一轮 poll。Stage 36 采用 Source-driven 主线，从 upstream 的 `sntp_example_init()` 出发，把这些已有模块接到 SNTP 时间同步上。[S1](#source-s1)[S2](#source-s2)[S3](#source-s3)[S4](#source-s4)
+
+## 0. 进入源码前先建立 SNTP/NTP 最小协议模型
+
+### 0.1 建议提前阅读：规范用于校对，正文仍可独立阅读
+
+1. [Cisco — Simple Network Time Protocol](https://www.cisco.com/c/en/us/td/docs/routers/ios-xe/system-management/system-management/m_bsm-sntpv4.html)
+   - 用途：快速建立“SNTP 是轻量 client-side time synchronization”的工程模型。[S9](#source-s9)
+2. [RFC 5905 — Network Time Protocol Version 4](https://www.rfc-editor.org/rfc/rfc5905.html)
+   - 用途：确认 NTPv4 线上报文、时间表示、Client/Server 角色以及 Server 拒绝/限速响应等规范语义。[S6](#source-s6)
+3. [RFC 4330 — Simple Network Time Protocol Version 4](https://www.rfc-editor.org/rfc/rfc4330.html)
+   - 用途：解释为什么当前 lwIP `sntp.c` 的历史注释仍引用这个已被 RFC 5905 取代的文档。[S5](#source-s5)
+
+当前协议语义以 RFC 5905 为主要规范锚点；RFC 4330 只承担目标源码历史背景。
+
+### 0.2 一次 SNTP poll 到底发生什么
+
+本文只讨论 upstream example 选择的 **poll mode（轮询模式）**：Client 主动向 Server 的 **UDP port 123** 发送 NTP-format request，Server 返回 response。NTP 的基本报文有 48-byte base header；lwIP 当前 `SNTP_MSG_LEN` 也固定为 48 bytes。[S2](#source-s2)[S6](#source-s6)
+
+第一字节把三个概念编码在一起：
+
+- **LI（Leap Indicator）**：与闰秒/时钟告警相关的 2-bit 字段；
+- **VN（Version Number）**：NTP version；
+- **Mode**：当前报文角色。本文主线中 Client request 使用 Client mode，正常 Server response 使用 Server mode。[S6](#source-s6)
+
+**Stratum（层级）**描述 Server 距离参考时钟的层次。当前 lwIP 把 `stratum == 0` 作为 Kiss-o'-Death（KoD）处理：该响应表示当前 Server 不应像正常时间源一样被使用，multiple-server 构建会标记该 Server 并尝试其他 Server，单 Server 构建则进入 retry policy。[S2](#source-s2)[S6](#source-s6)
+
+### 0.3 NTP Timestamp：不是 Unix `time_t`
+
+NTP timestamp 是 64-bit fixed-point 时间表示，由 **32-bit seconds + 32-bit fractional seconds** 组成，epoch 与 Unix epoch 不同。[S6](#source-s6) 一次 request/response 中常讨论四个时刻：
+
+- **Originate Timestamp（T1）**：Client 发送 request 的时刻，在 response 中用于把回包关联回原 request；
+- **Receive Timestamp（T2）**：Server 收到 request 的时刻；
+- **Transmit Timestamp（T3）**：Server 发出 response 的时刻；
+- **Destination Timestamp（T4）**：Client 收到 response 的本地时刻。
+
+当前 lwIP 的最小同步路径最终主要从 response timestamp 计算系统时间；当 `SNTP_CHECK_RESPONSE >= 2` 时还会比较 response 的 Originate Timestamp 与上一次 request 中保存的 transmit timestamp，`SNTP_COMP_ROUNDTRIP` 则使用更多时间戳信息做 round-trip compensation。[S2](#source-s2)[S3](#source-s3) 后文到 `sntp_initialize_request()` 与 `sntp_process()` 时再看这些 wire fields 如何映射到 C 数据。
+
+### 0.4 协议总流程：从 Server 来源到系统时间更新
+
+```mermaid
+sequenceDiagram
+    participant App as "SNTP application"
+    participant Core as "lwIP SNTP client"
+    participant DNS as "DNS resolver"
+    participant S as "Time Server UDP/123"
+
+    App->>Core: sntp_example_init()
+    Note over Core: 选择 Server 来源<br/>DHCP address, configured IP, or hostname
+    opt hostname configured
+        Core->>DNS: resolve server name
+        DNS-->>Core: server IP address
+    end
+    Core->>S: NTP-format request<br/>Client Mode
+    S-->>Core: NTP-format response<br/>Server Mode, Stratum, timestamps
+    Note over Core: 校验 source, length, Mode<br/>optional Originate Timestamp check
+    Core->>Core: sntp_process()<br/>convert timestamp and update system time
+    Note over Core: schedule next poll or retry
+```
+
+图里出现的 **DHCP address** 指 DHCP Option 42 下发的 NTP Server address；这只有在相应 compile-time option 与 runtime `sntp_servermode_dhcp()` 都满足时才会真正进入 `sntp_servers[]`，后文会从源码证明这一点。[S3](#source-s3)[S4](#source-s4)
+
+### 0.5 协议动作怎样映射到 lwIP 源码
+
+| SNTP 阶段 | 协议/控制动作 | lwIP 主要入口 | 关键对象/字段 | 下一步 |
+| --- | --- | --- | --- | --- |
+| 选择 Server | DHCP/configured IP/hostname | `sntp_example_init()`、`dhcp_set_ntp_servers()`、`sntp_setserver()` | `sntp_servers[]` | `sntp_init()` |
+| 创建 Client | 建立 UDP endpoint | `sntp_init()` | SNTP UDP PCB | 安排第一次 request |
+| 获取地址 | hostname → IP | `sntp_request()` → `dns_gethostbyname()` | current server entry | `sntp_dns_found()` |
+| 发送 request | Client Mode request → UDP/123 | `sntp_send_request()` → `sntp_initialize_request()` | 48-byte `sntp_msg` | 等 response / timeout |
+| 校验 response | Server Mode、source、length、Stratum、optional Originate check | `sntp_recv()` | `sntp_timestamps` | 正常处理、KoD 或 retry |
+| 更新时间 | NTP timestamp → platform clock | `sntp_process()` → `SNTP_SET_SYSTEM_TIME*` | seconds/fraction | 安排下一次 poll |
+
+从下一节开始，正文沿这张表的实际调用顺序进入源码。
 
 ## 1. 从 `sntp_example_init()` 开始：example 先决定 Server 从哪里来
 
@@ -64,8 +137,7 @@ sntp_servermode_dhcp(1);
 当 `LWIP_DHCP_GET_NTP_SRV` 被启用后，Stage 13 里已经存在的 DHCP option parser 会开始接受 DHCP Option 42（NTP Server）。`dhcp.h` 同时要求系统提供：
 
 ```c
-extern void dhcp_set_ntp_servers(u8_t num_ntp_servers,
-                                 const ip4_addr_t* ntp_server_addrs);
+extern void dhcp_set_ntp_servers(u8_t num_ntp_servers, const ip4_addr_t* ntp_server_addrs);
 ```
 
 SNTP module 正好实现了这个 callback。[S2](#source-s2)[S4](#source-s4)
@@ -166,13 +238,74 @@ SNTP_STARTUP_DELAY = 1
 
 ## 5. 进入 `sntp_request()`：DNS 只是 Server 地址获取的一条分支
 
-`sntp_request()` 先检查当前 `sntp_servers[sntp_current_server]`。[S2](#source-s2)
+`sntp_request()` 本身已经完整体现了“域名路径 / 已知 IP 路径 / 地址失败重试”三种结果。[S2](#source-s2)
 
-当 `SNTP_SERVER_DNS=1` 且当前 Server 配置了名称时，它调用：
+```c
+static void
+sntp_request(void *arg)
+{
+  ip_addr_t sntp_server_address;
+  err_t err;
 
-```text
-dns_gethostbyname()
+  LWIP_UNUSED_ARG(arg);
+
+  /* initialize SNTP server address */
+#if SNTP_SERVER_DNS
+  if (sntp_servers[sntp_current_server].name) {
+    /* always resolve the name and rely on dns-internal caching & timeout */
+    ip_addr_set_zero(&sntp_servers[sntp_current_server].addr);
+    err = dns_gethostbyname(sntp_servers[sntp_current_server].name, &sntp_server_address,
+                            sntp_dns_found, NULL);
+    if (err == ERR_INPROGRESS) {
+      /* DNS request sent, wait for sntp_dns_found being called */
+      LWIP_DEBUGF(SNTP_DEBUG_STATE, ("sntp_request: Waiting for server address to be resolved.\n"));
+      return;
+    } else if (err == ERR_OK) {
+      sntp_servers[sntp_current_server].addr = sntp_server_address;
+    }
+  } else
+#endif /* SNTP_SERVER_DNS */
+  {
+    sntp_server_address = sntp_servers[sntp_current_server].addr;
+    err = (ip_addr_isany_val(sntp_server_address)) ? ERR_ARG : ERR_OK;
+  }
+
+  if (err == ERR_OK) {
+    LWIP_DEBUGF(SNTP_DEBUG_TRACE, ("sntp_request: current server address is %s\n",
+                                   ipaddr_ntoa(&sntp_server_address)));
+    sntp_send_request(&sntp_server_address);
+  } else {
+    /* address conversion failed, try another server */
+    LWIP_DEBUGF(SNTP_DEBUG_WARN_STATE, ("sntp_request: Invalid server address, trying next server.\n"));
+    sys_untimeout(sntp_try_next_server, NULL);
+    sys_timeout((u32_t)SNTP_RETRY_TIMEOUT, sntp_try_next_server, NULL);
+  }
+}
 ```
+
+当 `dns_gethostbyname()` 返回 `ERR_INPROGRESS` 时，本次 `sntp_request()` 到这里结束；后续不是同步返回到该函数，而是 DNS resolver 完成后触发之前传入的 `sntp_dns_found()`。在 `SNTP_SERVER_DNS=1` 的构建中，继续进入这个 callback：[S2](#source-s2)
+
+```c
+static void
+sntp_dns_found(const char *hostname, const ip_addr_t *ipaddr, void *arg)
+{
+  LWIP_UNUSED_ARG(hostname);
+  LWIP_UNUSED_ARG(arg);
+
+  if (ipaddr != NULL) {
+    /* Address resolved, send request */
+    LWIP_DEBUGF(SNTP_DEBUG_STATE, ("sntp_dns_found: Server address resolved, sending request\n"));
+    sntp_servers[sntp_current_server].addr = *ipaddr;
+    sntp_send_request(ipaddr);
+  } else {
+    /* DNS resolving failed -> try another server */
+    LWIP_DEBUGF(SNTP_DEBUG_WARN_STATE, ("sntp_dns_found: Failed to resolve server address resolved, trying next server\n"));
+    sntp_try_next_server(NULL);
+  }
+}
+```
+
+解析成功时 callback 把地址写回当前 `sntp_servers[]` 项并立即进入 `sntp_send_request()`；解析失败则进入 `sntp_try_next_server()`。因此异步桥接完整链路是：
 
 这里和 Stage 14 的异步 DNS 模型完全一致：
 
@@ -208,27 +341,34 @@ sntp_send_request(const ip_addr_t *server_addr)
   if (p != NULL) {
     struct sntp_msg *sntpmsg = (struct sntp_msg *)p->payload;
     LWIP_DEBUGF(SNTP_DEBUG_STATE, ("sntp_send_request: Sending request to server\n"));
+    /* initialize request message */
     sntp_initialize_request(sntpmsg);
+    /* send request */
     udp_sendto(sntp_pcb, p, server_addr, SNTP_PORT);
+    /* free the pbuf after sending it */
     pbuf_free(p);
 #if SNTP_MONITOR_SERVER_REACHABILITY
+    /* indicate new packet has been sent */
     sntp_servers[sntp_current_server].reachability <<= 1;
-#endif
+#endif /* SNTP_MONITOR_SERVER_REACHABILITY */
+    /* set up receive timeout: try next server or retry on timeout */
     sys_untimeout(sntp_try_next_server, NULL);
     sys_timeout((u32_t)SNTP_RECV_TIMEOUT, sntp_try_next_server, NULL);
 #if SNTP_CHECK_RESPONSE >= 1
+    /* save server address to verify it in sntp_recv */
     ip_addr_copy(sntp_last_server_address, *server_addr);
-#endif
+#endif /* SNTP_CHECK_RESPONSE >= 1 */
   } else {
     LWIP_DEBUGF(SNTP_DEBUG_SERIOUS, ("sntp_send_request: Out of memory, trying again in %"U32_F" ms\n",
                                      (u32_t)SNTP_RETRY_TIMEOUT));
+    /* out of memory: set up a timer to send a retry */
     sys_untimeout(sntp_request, NULL);
     sys_timeout((u32_t)SNTP_RETRY_TIMEOUT, sntp_request, NULL);
   }
 }
 ```
 
-`SNTP_MSG_LEN` 在当前实现中固定为 48 字节，`SNTP_PORT` 对应标准 NTP/SNTP UDP 端口 123。[S2](#source-s2)[S3](#source-s3)[S5](#source-s5)
+RFC 5905 已经定义 NTPv4 的 base packet 与 UDP transport；这里不重新展开报文字段，只看当前 lwIP 如何落实它：`SNTP_MSG_LEN` 固定为 48 字节，`SNTP_PORT` 映射到标准 UDP/123。[S2](#source-s2)[S3](#source-s3)[S6](#source-s6)
 
 `pbuf_free(p)` 紧跟在 `udp_sendto()` 后并不代表数据已经从 PHY 发完；这里遵循 Raw UDP API 对发送数据复制/引用的既有 contract。Stage 03/05 已经讲过 pbuf 与 UDP send path，本篇只关注 SNTP 自己增加的状态。
 
@@ -242,21 +382,47 @@ sntp_try_next_server()
 
 所以一次 poll request 从发送那一刻就带着“如果没收到有效响应怎么办”的 Timer。
 
-## 7. `sntp_initialize_request()`：真正重要的是 Mode 与 Timestamp
+## 7. `sntp_initialize_request()`：把标准 Mode/Timestamp 映射到 lwIP 字段
 
-`sntp_send_request()` 先调用 `sntp_initialize_request()` 构造 48 字节报文。[S2](#source-s2)
+`sntp_send_request()` 先调用 `sntp_initialize_request()` 构造 48 字节报文。[S2](#source-s2) 下面直接进入该函数：
 
-当前代码把第一个字节设置成：
+```c
+static void
+sntp_initialize_request(struct sntp_msg *req)
+{
+  memset(req, 0, SNTP_MSG_LEN);
+  req->li_vn_mode = SNTP_LI_NO_WARNING | SNTP_VERSION | SNTP_MODE_CLIENT;
 
-```text
-LI = no warning
-VN = 4
-Mode = client
+#if SNTP_CHECK_RESPONSE >= 2 || SNTP_COMP_ROUNDTRIP
+  {
+    s32_t secs;
+    u32_t sec, frac;
+    /* Get the transmit timestamp */
+    SNTP_GET_SYSTEM_TIME_NTP(secs, frac);
+    sec  = lwip_htonl((u32_t)secs);
+    frac = lwip_htonl(frac);
+
+# if SNTP_CHECK_RESPONSE >= 2
+    sntp_last_timestamp_sent.sec  = sec;
+    sntp_last_timestamp_sent.frac = frac;
+# endif
+    req->transmit_timestamp[0] = sec;
+    req->transmit_timestamp[1] = frac;
+  }
+#endif /* SNTP_CHECK_RESPONSE >= 2 || SNTP_COMP_ROUNDTRIP */
+}
 ```
 
-其中 Mode=3 表示 client。若打开 `SNTP_CHECK_RESPONSE >= 2` 或 `SNTP_COMP_ROUNDTRIP`，request 还会把本地发送时刻写入 Transmit Timestamp，并保存下来供 response 的 Originate Timestamp 校验或 round-trip compensation 使用。
+RFC 5905 已经定义 `LI | VN | Mode` 与 64-bit NTP timestamp 的线格式；源码篇只需要把这些标准对象对回当前实现。[S6](#source-s6)
 
-NTP/SNTP timestamp 不是 Unix `time_t` 的原样表示。当前 lwIP 实现内部把 NTP 时间处理成 32-bit seconds + 32-bit fraction，并用 2036 epoch 的 signed offset 技巧覆盖约 1968～2104 的日期范围。[S2](#source-s2) 这是当前实现的数据表示策略，不需要应用直接操作这些字段；正常产品只需要实现“系统时间怎么读/写”的宏接口。
+| 标准对象 | 当前 lwIP 落点 | 本文继续关注的实现含义 |
+| --- | --- | --- |
+| client mode | `SNTP_MODE_CLIENT` | request 以 client mode 发出 |
+| protocol version | `SNTP_VERSION` | 与 `LI` 一起写入 `li_vn_mode` |
+| transmit timestamp | `req->transmit_timestamp[0/1]` | 只有开启强化 response check 或 round-trip compensation 时才写入本地发送时刻 |
+| originate timestamp check | `sntp_last_timestamp_sent` | response 路径可用它校验请求/响应对应关系 |
+
+前面的协议基线已经说明 NTP timestamp 与 Unix `time_t` 不是同一种时间表示；这里继续关注 lwIP 自己的数据表示策略：`sntp.c` 使用 signed 32-bit seconds 相对 2036 epoch，再通过 `DIFF_SEC_1970_2036` 与 Unix epoch 互转，使当前实现覆盖约 1968～2104 的日期范围。[S2](#source-s2) 应用通常无需直接处理这些 wire fields，只需要正确实现系统时间读写宏。
 
 ## 8. 回包入口早在 `sntp_init()` 已经绑定：UDP 最终调用 `sntp_recv()`
 
@@ -287,19 +453,50 @@ flowchart TD
 
 默认 `SNTP_CHECK_RESPONSE=0`，因此 source address/port 和 Originate Timestamp 的强化校验默认没有全部打开。[S3](#source-s3) 这同样是当前 lwIP 的尺寸/健壮性折中，不是协议允许任意 response 的意思。
 
-## 9. Stratum 0：`sntp_recv()` 把 Kiss-of-Death 当成 Server 切换信号
+## 9. `stratum == 0`：当前 lwIP 怎样处理 Kiss-o'-Death
 
-当 response `stratum == 0` 时，当前实现进入 `SNTP_ERR_KOD` 路径，注释明确把它视为 Kiss-of-Death（KoD）。[S2](#source-s2)[S6](#source-s6)
+RFC 5905 的 KoD 语义不仅包含 Stratum 0，还使用 Reference ID 携带 kiss code。[S6](#source-s6) 当前 lwIP 这条 receive path 更简化：`sntp_recv()` 只读取 `stratum`，只要发现 `stratum == 0` 就标记为 `SNTP_ERR_KOD`，并没有在这个分支继续解析 kiss code。[S2](#source-s2) 因此这里应理解成 **目标实现的简化 KoD 判定**，而不是把“任意 Stratum 0 都等价于完整标准 KoD 处理”泛化为协议规则。
 
-如果支持多个 Server：
+当前 `sntp_recv()` 检出 `stratum == 0` 后先把结果标成 `SNTP_ERR_KOD`；函数尾部再调用 `sntp_kod_try_next_server()`，它给当前 server 置 `kod_received` 后进入 `sntp_try_next_server()`。[S2](#source-s2) 多 Server 构建下继续阅读 `sntp_try_next_server()`：
 
-```text
-current server gets kod_received = 1
-    ↓
-sntp_try_next_server()
-    ↓
-寻找下一个未被 KoD 标记且有地址/名称的 Server
+```c
+static void
+sntp_try_next_server(void *arg)
+{
+  u8_t old_server, i;
+  LWIP_UNUSED_ARG(arg);
+
+  old_server = sntp_current_server;
+  for (i = 0; i < SNTP_MAX_SERVERS - 1; i++) {
+    sntp_current_server++;
+    if (sntp_current_server >= SNTP_MAX_SERVERS) {
+      sntp_current_server = 0;
+    }
+    if (sntp_servers[sntp_current_server].kod_received) {
+      /* KOD received, don't use this server */
+      continue;
+    }
+    if (!ip_addr_isany(&sntp_servers[sntp_current_server].addr)
+#if SNTP_SERVER_DNS
+        || (sntp_servers[sntp_current_server].name != NULL)
+#endif
+       ) {
+      LWIP_DEBUGF(SNTP_DEBUG_STATE, ("sntp_try_next_server: Sending request to server %"U16_F"\n",
+                                     (u16_t)sntp_current_server));
+      /* new server: reset retry timeout */
+      SNTP_RESET_RETRY_TIMEOUT();
+      /* instantly send a request to the next server */
+      sntp_request(NULL);
+      return;
+    }
+  }
+  /* no other valid server found */
+  sntp_current_server = old_server;
+  sntp_retry(NULL);
+}
 ```
+
+所以多个 Server 时并不是简单“server index + 1”：它跳过已收到 KoD 的条目，也跳过没有地址/名称的空条目；找到可用项后重置 retry timeout 并重新进入 `sntp_request()`。没有其他可用 Server 时恢复旧索引并进入 `sntp_retry()`。
 
 如果只有一个 Server，则退化为 retry/backoff。
 
@@ -317,16 +514,7 @@ timestamps->xmit
 seconds + fraction
 ```
 
-若 `SNTP_COMP_ROUNDTRIP=1`，还会结合：
-
-```text
-T1  client originate
-T2  server receive
-T3  server transmit
-T4  client destination
-```
-
-计算 clock offset。当前默认该功能关闭。[S2](#source-s2)[S3](#source-s3)
+若 `SNTP_COMP_ROUNDTRIP=1`，当前实现会把本地发送/接收时刻与 Server receive/transmit timestamp 一起用于 clock-offset compensation；四时间戳模型的协议算法直接参考 RFC 5905，本文只追它在 `sntp_process()` 中的实现分支。[S2](#source-s2)[S3](#source-s3)[S6](#source-s6) 当前默认该功能关闭。
 
 继续阅读 `sntp_process()` 的末尾，无论是否做 round-trip compensation，最终都会到达：
 
@@ -387,12 +575,44 @@ sntp_set_system_time(u32_t sec)
 
 ## 12. 一次同步成功后并不会结束：下一次请求由 Timer 再次启动
 
-`sntp_recv()` 在正确 response 后：
+继续阅读 `sntp_recv()` 的成功分支，周期调度不是概念层推断，而是函数在处理完时间戳后直接重新注册 `sntp_request()` timeout：[S2](#source-s2)
 
-1. 调用 `sntp_process()` 更新系统时间；
-2. 清理当前 retry/receive timeout；
-3. 重置 retry timeout；
-4. 用 `SNTP_UPDATE_DELAY` 安排下一次 `sntp_request()`。[S2](#source-s2)
+```c
+  if (err == ERR_OK) {
+    /* correct packet received: process it it */
+    sntp_process(&timestamps);
+
+#if SNTP_MONITOR_SERVER_REACHABILITY
+    /* indicate that server responded */
+    sntp_servers[sntp_current_server].reachability |= 1;
+#endif /* SNTP_MONITOR_SERVER_REACHABILITY */
+    /* Set up timeout for next request (only if poll response was received)*/
+    if (sntp_opmode == SNTP_OPMODE_POLL) {
+      u32_t sntp_update_delay;
+      sys_untimeout(sntp_try_next_server, NULL);
+      sys_untimeout(sntp_request, NULL);
+
+      /* Correct response, reset retry timeout */
+      SNTP_RESET_RETRY_TIMEOUT();
+
+      sntp_update_delay = (u32_t)SNTP_UPDATE_DELAY;
+      sys_timeout(sntp_update_delay, sntp_request, NULL);
+      LWIP_DEBUGF(SNTP_DEBUG_STATE, ("sntp_recv: Scheduled next time request: %"U32_F" ms\n",
+                                     sntp_update_delay));
+    }
+  } else if (err == SNTP_ERR_KOD) {
+    /* KOD errors are only processed in case of an explicit poll response */
+    if (sntp_opmode == SNTP_OPMODE_POLL) {
+      /* Kiss-of-death packet. Use another server or increase UPDATE_DELAY. */
+      sntp_kod_try_next_server(NULL);
+    }
+  } else {
+    /* ignore any broken packet, poll mode: retry after timeout to avoid flooding */
+  }
+}
+```
+
+这段代码依次完成：更新系统时间、标记 reachability、取消当前失败/请求 timeout、重置 retry timeout，并用 `SNTP_UPDATE_DELAY` 安排下一次 `sntp_request()`。
 
 当前默认值包括：[S3](#source-s3)
 
@@ -544,28 +764,28 @@ Stage 36 到这里建立的是：**SNTP client 本身只负责获取和计算时
 - 支撑内容：证明 DHCP-NTP 需要 compile-time option 与 runtime servermode 两层条件
 
 <a id="source-s5"></a>
-### [S5] RFC 4330 — Simple Network Time Protocol Version 4
-- 类型：协议规范
+### [S5] RFC 4330 — Simple Network Time Protocol Version 4（历史兼容背景）
+- 类型：已废止的历史协议文档
 - 版本：RFC 4330，2006；已被 RFC 5905 取代，但当前 lwIP SNTP 源码仍明确以 RFC 4330 描述其 minimal SNTPv4 implementation
 - URL/文档：[RFC 4330](https://www.rfc-editor.org/rfc/rfc4330.html)
-- 使用位置：“SNTPv4 报文”“UDP/123”“poll/Server response”“Timer 规范背景”
-- 支撑内容：提供 lwIP 当前实现所引用的 SNTPv4 协议背景
+- 使用位置：“阅读源码前的版本边界”“解释目标源码中的历史 RFC 引用”
+- 支撑内容：说明目标 lwIP 注释为何仍引用 SNTPv4 文档；当前协议语义以 RFC 5905 为主
 
 <a id="source-s6"></a>
 ### [S6] RFC 5905 — Network Time Protocol Version 4
-- 类型：后续标准
+- 类型：IETF Standards Track / 当前主要规范锚点
 - 版本：RFC 5905，2010
 - URL/文档：[RFC 5905](https://www.rfc-editor.org/rfc/rfc5905.html)
-- 使用位置：“KoD / Server reachability / 当前标准背景”
-- 支撑内容：说明 RFC 4330 已被 NTPv4 规范更新；本文实现行为仍以目标 lwIP 源码为准
+- 使用位置：SNTP/NTP 初学者基线、48-byte base packet / UDP 123、Mode/Timestamp、KoD 与 round-trip compensation
+- 支撑内容：RFC 5905 明确取代 RFC 4330，并提供当前 NTPv4 on-wire format、timestamp、client/server mode 与 KoD 等规范语义
 
 <a id="source-s7"></a>
-### [S7] Mbed TLS X.509 verification time interface
-- 类型：TLS library 官方源码/API 文档
-- 版本：Mbed TLS development documentation，访问于 2026-10-02
-- URL/文档：[Mbed TLS x509.h](https://github.com/Mbed-TLS/mbedtls/blob/development/include/mbedtls/x509.h)、[Mbed TLS x509_crt.h](https://github.com/Mbed-TLS/mbedtls/blob/development/include/mbedtls/x509_crt.h)
+### [S7] Mbed TLS 2.28 X.509 time verification
+- 类型：TLS library 官方版本化 API 文档
+- 版本：Mbed TLS 2.28.x API documentation
+- URL/文档：[Mbed TLS 2.28 X.509 API](https://mbed-tls.readthedocs.io/projects/api/en/v2.28.9/api/file/x509_8h/)、[Mbed TLS external time dependencies](https://mbed-tls.readthedocs.io/en/latest/kb/development/what-external-dependencies-does-mbedtls-rely-on/)
 - 使用位置：“SNTP 为什么与 TLS/Cloud 有工程关系”
-- 支撑内容：X.509 verify flags 包含 expired/future，且 time helper 会用系统时间判断证书有效期
+- 支撑内容：X.509 time helpers 使用系统时间判断 `valid_from`/`valid_to`；启用相应 time/date 配置时，证书验证会标记 expired/future
 
 <a id="source-s8"></a>
 ### [S8] lwIP Multithreading / Common pitfalls
@@ -575,3 +795,11 @@ Stage 36 到这里建立的是：**SNTP client 本身只负责获取和计算时
 - URL/文档：[lwIP multithreading guidance](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/doc/doxygen/main_page.h)
 - 使用位置：“SNTP Raw API 的 RTOS execution context”
 - 支撑内容：说明 callback-style/core API 在 OS mode 下应由 TCPIP thread 或 core locking 保护
+
+<a id="source-s9"></a>
+### [S9] Cisco Simple Network Time Protocol
+- 类型：厂商官方工程文档
+- 版本：Cisco IOS XE System Management Configuration Guide，访问于 2026-10-03
+- URL/文档：[Cisco Simple Network Time Protocol](https://www.cisco.com/c/en/us/td/docs/routers/ios-xe/system-management/system-management/m_bsm-sntpv4.html)
+- 使用位置：SNTP/NTP 工程背景与初学者基线
+- 支撑内容：提供 SNTP 作为简化 client-only NTP、与 NTP 的职责差异及工程使用背景，作为 RFC 之前的快速阅读入口

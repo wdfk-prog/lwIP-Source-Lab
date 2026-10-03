@@ -2,15 +2,72 @@
 
 # 教程 07：从 `tcpecho_raw_init()` 到 `ESTABLISHED`——TCP 三次握手与 PCB 状态机
 
-> 摘要：从 upstream Raw TCP Echo 的监听入口出发，沿 TCP 输入、监听与状态处理链追踪 passive open，理解 LISTEN PCB、连接 PCB、Sequence Number 和三次握手状态迁移。
+> 摘要：从 TCP passive open 的三次握手模型出发，沿 Raw TCP Echo 监听入口追踪 LISTEN PCB、SYN_RCVD 连接 PCB、Sequence/ACK 与 accept callback。
 
 [TOC]
 
-本文源码块采用统一约定：除非代码块前明确标注为“上游连续源码片段”，其余 C 代码块一律视为按当前 revision 裁剪的“执行路径阅读版”。阅读版只删除与当前主线无关的注释、条件编译或旁支，不重排保留语句，也不使用省略号伪装缺失源码；示意代码会另行标注。
+TCP（Transmission Control Protocol，传输控制协议）是在 IP 之上提供可靠、有序 **byte stream（字节流）**的面向连接传输协议。与 Stage 5 的 UDP 不同，TCP 在发送普通应用数据前先建立连接，并用 Sequence Number（序列号）、Acknowledgment Number（确认号）以及重传等机制维护双方对同一字节流的状态。[S6](#source-s6)
 
-Stage 6 已经把应用 API 和 lwIP Core 的线程边界分开。现在进入 TCP Core，但先只解决一个问题：**一个还不存在的 TCP connection，怎样从监听端口变成 `ESTABLISHED` 的连接 PCB？**
+建立连接时，**SYN（Synchronize）**用于同步初始序列号；**ACK（Acknowledgment）**表示确认号字段有效，并告诉对端“下一次期望哪个 sequence number”。本篇只研究服务端 **passive open（被动打开）**：lwIP 的 listener 处于 `LISTEN`（等待连接）状态；远端客户端执行 **active open（主动打开）**并发出 SYN 后，lwIP 为该远端创建 `SYN_RCVD`（已收到 SYN、已发 SYN/ACK、等待最终 ACK）的 connection PCB；final ACK 有效后进入 `ESTABLISHED`（连接已建立）。连接关闭相关状态不在本篇展开。
 
-当前系列核对的 upstream `master` 为 `d08f4773edd0182b7910fc8f046eed82ffcd67c9`。本篇沿 upstream `tcpecho_raw` 的 passive open 主线阅读；它是 example application 的一种用法，不代表应用必须使用 Raw API。[S1](#source-s1)
+## 阅读源码前：建议提前阅读
+
+1. [RFC 9293 — Transmission Control Protocol](https://www.rfc-editor.org/rfc/rfc9293.html)：重点看 TCP Header、Sequence Number/ACK 的定义，以及 3.5 节 Figure 6 的 Basic Three-Way Handshake。[S6](#source-s6)
+2. [Wireshark Wiki — TCP 3-way handshaking](https://wiki.wireshark.org/TCP_3_way_handshaking)：用于把三次握手的三个 segment 对应到抓包；relative sequence number（相对序列号）只是分析工具为便于阅读而换算的显示值，不改变线上真实序列号。[S12](#source-s12)
+3. [lwIP 2.1.x — TCP Raw API](https://www.nongnu.org/lwip/2_1_x/group__tcp__raw.html)：用于先认识 `tcp_bind()`、`tcp_listen()`、`tcp_accept()` 等公开 Raw API；本文实现细节仍以固定 commit 为准。[S13](#source-s13)
+
+## 进入源码前先把三次握手讲清楚
+
+### Endpoint、connection、segment 与四元组
+
+TCP endpoint 由本地 IP/port 描述；一条已经建立的 TCP connection 则由 **四元组**唯一标识：local IP、local port、remote IP、remote port。TCP 在线上发送的协议数据单元称为 **segment（报文段）**，每个 segment 都有 TCP Header；Header 中的 flags（标志位）说明当前 segment 是否携带 SYN、ACK 等控制语义。[S6](#source-s6)
+
+本篇只需要先理解两个 flag：
+
+- **SYN（Synchronize）**：用于同步双方的初始序列号并建立连接；SYN 自身会占用一个 sequence number。
+- **ACK（Acknowledgment）**：表示 TCP Header 中的 Acknowledgment Number 有效；这个数值表示“下一次期望收到的 sequence number”。
+
+每一端建立连接时选择一个 **ISN（Initial Sequence Number，初始序列号）**。如果客户端 ISN 为 `C_ISN`，服务端收到 SYN 后确认 `C_ISN + 1`；如果服务端 ISN 为 `S_ISN`，客户端 final ACK 确认 `S_ISN + 1`。[S6](#source-s6)
+
+### 三次握手为什么是三步
+
+```mermaid
+sequenceDiagram
+    participant C as Client active open
+    participant L as Server listener (port 7)
+    participant P as Server connection PCB
+
+    C->>L: SYN, SEQ=C_ISN
+    L->>P: create connection, LISTEN -> SYN_RCVD
+    P-->>C: SYN + ACK, SEQ=S_ISN, ACK=C_ISN+1
+    C->>P: ACK, ACK=S_ISN+1
+    Note over P: SYN_RCVD -> ESTABLISHED, then accept callback
+```
+
+第一步只是客户端声明自己的初始 sequence space；第二步服务端同时确认客户端 SYN 并发送自己的 SYN；第三步客户端确认服务端 SYN。到 final ACK 被服务端接受时，双方才都知道“对端已经收到自己的 SYN”。[S6](#source-s6)
+
+### 本篇只跟服务端 passive-open 状态
+
+```mermaid
+stateDiagram-v2
+    [*] --> LISTEN: tcp_listen()
+    LISTEN --> SYN_RCVD: RX SYN / 创建 connection PCB / 排队 SYN-ACK
+    SYN_RCVD --> ESTABLISHED: RX valid ACK / accept callback
+```
+
+这里有一个 lwIP 实现细节要提前记住：**LISTEN 状态属于 `struct tcp_pcb_listen`；收到 SYN 后创建的 `SYN_RCVD`/`ESTABLISHED` connection 使用另一个 `struct tcp_pcb`。** 因此状态变化不能简单理解成“同一个对象从 LISTEN 原地改成 ESTABLISHED”。[S3](#source-s3)[S5](#source-s5)
+
+### 协议动作怎样映射到 lwIP 源码
+
+| 协议阶段 | 线上动作 | lwIP 入口/处理函数 | 关键 PCB/状态 | 下一步 |
+| --- | --- | --- | --- | --- |
+| 准备被动打开 | 本地 port 7 进入监听 | `tcp_new_ip_type()` → `tcp_bind()` → `tcp_listen()` → `tcp_accept()` | LISTEN PCB | 等待 SYN |
+| 收到第一次握手 | RX SYN | `tcp_input()` → `tcp_listen_input()` | 新 connection PCB，`SYN_RCVD` | `tcp_enqueue_flags(TCP_SYN | TCP_ACK)` |
+| 发送第二次握手 | TX SYN/ACK | `tcp_output()` / `tcp_output_segment()` | connection PCB 的发送/接收 sequence state | 等待 final ACK |
+| 收到第三次握手 | RX ACK | `tcp_input()` → `tcp_process()` 的 `SYN_RCVD` 分支 | `ESTABLISHED` | `TCP_EVENT_ACCEPT()` |
+| 应用接管连接 | accept event | `tcpecho_raw_accept()` | connection PCB 注册 recv/sent/poll callbacks | Stage 8 进入数据面 |
+
+下面从真实入口 `tcpecho_raw_init()` 开始，逐步验证这张映射表。
 
 ## 1. 真正入口：`tcpecho_raw_init()` 先建立监听端点
 
@@ -42,7 +99,7 @@ flowchart LR
     C --> D["tcp_accept()\n注册 accept callback"]
 ```
 
-这里第一次出现 **PCB**。PCB 是 Protocol Control Block，协议控制块。它不是一个 packet，也不是 Linux file descriptor，而是 lwIP 在内存里保存某个协议 endpoint/connection 状态的对象。UDP 有 `udp_pcb`，TCP 则有 `tcp_pcb`。TCP 的 Sequence Number、窗口、重传队列、状态等都最终落在 PCB 中。[S2](#source-s2)
+前面的协议模型已经使用 connection PCB。这里把它落到实现对象：PCB（Protocol Control Block，协议控制块）不是 packet 或 Linux file descriptor，而是 lwIP 保存 endpoint/connection 运行状态的对象。TCP 的 sequence state、窗口、重传队列和连接状态最终都落在 `tcp_pcb`/`tcp_pcb_listen` 中。[S2](#source-s2)
 
 `tcp_bind()` 只说明“本地端口 7 属于这个 endpoint”；真正把它变成 listener 的是 `tcp_listen()`。
 
@@ -91,42 +148,22 @@ tcp_listen(tcpecho_raw_pcb); /* 错误理解：忽略返回的新对象 */
 
 一个 listener 可以先后产生很多 connection PCB；不能把它们理解成“同一个 PCB 状态不断变”。
 
-## 3. TCP state 第一次真正有意义：LISTEN 等待 SYN
+## 3. TCP state 在 lwIP 里怎样落到 PCB 对象
 
-lwIP 在 `tcpbase.h` 中定义 TCP state：[S4](#source-s4)
+TCP 状态本身已经由 RFC 9293 和前置资料定义，本节不再重讲状态机原理，只确认 **lwIP 用什么对象保存这些状态，以及本篇 passive open 会经过哪些值**。[S4](#source-s4)[S6](#source-s6)
 
-```c
-enum tcp_state {
-  CLOSED      = 0,
-  LISTEN      = 1,
-  SYN_SENT    = 2,
-  SYN_RCVD    = 3,
-  ESTABLISHED = 4,
-  FIN_WAIT_1  = 5,
-  FIN_WAIT_2  = 6,
-  CLOSE_WAIT  = 7,
-  CLOSING     = 8,
-  LAST_ACK    = 9,
-  TIME_WAIT   = 10
-};
-```
+`tcpbase.h` 中的 `enum tcp_state` 包含完整 TCP 生命周期；当前主线只用到下面四个位置：
 
-本篇 passive open 只需要先抓住四个概念：
+| lwIP 状态/对象 | 当前源码里的含义 | 本篇在哪一步看到 |
+| --- | --- | --- |
+| `CLOSED` / 普通 `tcp_pcb` | listener 转换前的普通 PCB | `tcp_new_ip_type()` 之后 |
+| `LISTEN` / `tcp_pcb_listen` | 等待远端 SYN 的监听对象 | `tcp_listen()` 之后 |
+| `SYN_RCVD` / 新 `tcp_pcb` | `tcp_listen_input()` 收到 SYN 后为该远端创建的 connection PCB | 第 5～7 节 |
+| `ESTABLISHED` / connection `tcp_pcb` | final ACK 通过 `tcp_process()` 后的已建立连接 | 第 8～9 节 |
 
-- `CLOSED`：还没有建立连接；普通 PCB 创建后最初处于这里。
-- `LISTEN`：服务端等待远端发起 connection。
-- `SYN_RCVD`：已经收到对端 SYN，也已经准备/发送 SYN-ACK，等待最终 ACK。
-- `ESTABLISHED`：握手完成，可以按正常连接收发数据。
+`SYN_SENT` 属于 active open，即本地主动调用 `tcp_connect()` 后的路径。本篇主线是服务端 passive open，因此只在第 11 节做最小源码对照。
 
-`SYN_SENT` 属于 active open，即本地主动调用 `tcp_connect()` 发出 SYN 时的状态。本篇主线是服务端 passive open，因此只在后面做最小对照，不把两条主线混在一起。
-
-```mermaid
-stateDiagram-v2
-    [*] --> CLOSED
-    CLOSED --> LISTEN: tcp_listen()
-    LISTEN --> SYN_RCVD: 收到 SYN / 创建 connection PCB / 发 SYN-ACK
-    SYN_RCVD --> ESTABLISHED: 收到符合预期的 ACK
-```
+这里的重点不是重新记一张 TCP 状态图，而是先确认一个 lwIP 特有事实：**listener PCB 与后来创建的 connection PCB 不是同一个对象。** 后面的状态迁移必须跟着正确的 PCB 看。
 
 ## 4. 第一个 SYN 到达前：先把 `TAP RX -> tcpip_thread -> IPv4 -> TCP` 补完整
 
@@ -512,6 +549,8 @@ listener 查找完成后仍在 `tcp_input()`。命中 listener 时，`tcp_input(
 到这里才能准确说：第一个 SYN 从 `tcp_input()` 被 demultiplex 到监听端点。
 ## 5. SYN 到来：`tcp_listen_input()` 怎样创建 connection PCB
 
+协议总流程现在走到第一次握手：Client SYN 已经穿过 Ethernet/IPv4/TCP 输入链并命中 listener。接下来要验证的是 `LISTEN -> SYN_RCVD` 为什么不是 listener 原地变状态，而是创建新的 connection PCB。
+
 命中 listener 后，`tcp_listen_input()` 并不会把 listener 本身改成 `SYN_RCVD`。先看它收到 SYN 时的真实连续代码。[S5](#source-s5)
 
 ```c
@@ -632,6 +671,8 @@ Stage 8 会继续深入 `snd_nxt`、`lastack`、发送队列。本篇只需要�
 
 ## 7. SYN-ACK 不是 `tcp_listen_input()` 直接拼一块 Ethernet frame
 
+协议总流程现在走到第二次握手：`SYN_RCVD` connection PCB 已建立，服务端需要发送 SYN/ACK。下面沿实际调用链看控制 segment 如何排队，再由 TCP output 进入 IP/Ethernet TX。
+
 新 PCB 建好以后，`tcp_listen_input()` 调用：[S5](#source-s5)
 
 ```c
@@ -667,6 +708,8 @@ IP / ARP / Ethernet / TAP
 `unsent`、`unacked` 的对象迁移在 Stage 8 再展开。
 
 ## 8. 第三个 ACK：`tcp_process()` 如何真正完成 `SYN_RCVD -> ESTABLISHED`
+
+协议总流程现在走到第三次握手：服务端已经发出 SYN/ACK，下面的 final ACK 决定 connection PCB 是否真正进入 `ESTABLISHED` 并触发 accept event。
 
 Host 收到 SYN-ACK 后发送最终 ACK。这个 frame 会完整重复前面的 RX 链：`tapif_thread -> tcpip_input -> tcpip_thread -> ethernet_input -> ip4_input -> tcp_input`。区别在于此时四元组已经能够命中刚才注册到 `tcp_active_pcbs` 的 `npcb`，因此不再走 listen PCB 查找。[S5](#source-s5)
 
@@ -945,3 +988,17 @@ ACK 回来释放发送资源
 - 使用位置：`NO_SYS=0`、`LWIP_TCPIP_CORE_LOCKING_INPUT=0` 的当前执行路径
 - 支撑内容：限定本文的 RX mailbox/thread 路径是当前 Unix example 配置，而不是所有 lwIP Port 的唯一输入模型
 
+<a id="source-s12"></a>
+### [S12] Wireshark Wiki — TCP 3-way handshaking
+- URL/文档：[TCP 3-way handshaking](https://wiki.wireshark.org/TCP_3_way_handshaking)
+- 使用位置：“阅读源码前”、三次握手观察
+- 支撑内容：提供 SYN、SYN/ACK、ACK 与 relative sequence number 的抓包视角；正文仍独立建立握手和状态模型
+
+
+<a id="source-s13"></a>
+### [S13] lwIP 官方 TCP Raw API 文档
+- 类型：lwIP 官方 Doxygen 文档
+- 版本：2.1.x 文档；正文源码事实以固定 commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 为准
+- URL/文档：[lwIP — TCP Raw API](https://www.nongnu.org/lwip/2_1_x/group__tcp__raw.html)
+- 使用位置：“阅读源码前”、监听 Raw API 导航
+- 支撑内容：说明 `tcp_bind()`、`tcp_listen()`、`tcp_accept()` 等公开 API 的定位；listener/connection PCB 的对象替换与握手状态机由 [S1]～[S7] 的目标源码证明

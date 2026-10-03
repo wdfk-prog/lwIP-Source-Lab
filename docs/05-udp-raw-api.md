@@ -2,11 +2,78 @@
 
 # 教程 05：从 `udpecho_raw_init()` 到 Echo Reply——UDP Raw API、PCB 与回调数据通路
 
-> 摘要：从 upstream Raw UDP Echo 的真实初始化入口开始，追踪 PCB 建立、端口匹配、pbuf ownership、回调执行和 UDP Echo 回包路径。
+> 摘要：从 UDP 数据报与端口分发模型出发，沿 Raw API 真实入口追踪 PCB 建立、接收匹配、回调、回包与 pbuf ownership。
 
 [TOC]
 
-Stage 4 已经走到 `ip4_input()` 的 `Protocol` 分发。现在只改变一个条件：IPv4 Header 的 `Protocol` 不再是 `1`（ICMP），而是 `17`（UDP）。Ethernet、ARP、IPv4 前半段仍然复用，新的主线从 `udp_input()` 开始。[S1](#source-s1)[S2](#source-s2)
+UDP（User Datagram Protocol，用户数据报协议）是 IP 之上的无连接传输协议。它把应用一次提交的一条消息作为一个 **datagram（数据报）**发送，并在接收端保留这条消息的边界；UDP 自身不先建立连接，也不保证可靠到达、顺序或自动重传。[S4](#source-s4)[S6](#source-s6) 本篇从 upstream Raw UDP Echo 的真实入口出发，重点回答：一个发往 UDP port 7 的 datagram，怎样被 `udp_pcb` 匹配、交给回调，再沿同一 PCB 发回发送端。
+
+Stage 4 已经走到 `ip4_input()` 的上层协议分发。本篇只改变一个关键字段：IPv4 Header 的 `Protocol` 为 `17` 时，payload 交给 UDP；Ethernet、ARP 与 IPv4 前半段不再重复展开。[S3](#source-s3)[S4](#source-s4)
+
+## 阅读源码前：建议提前阅读
+
+下面资料用于提前建立规范和 API 位置感，不是继续阅读正文的强制条件：
+
+1. [RFC 768 — User Datagram Protocol](https://www.rfc-editor.org/rfc/rfc768.html)：重点看 UDP Header，以及 Source Port（源端口）、Destination Port（目标端口）、Length（UDP Header + payload 总长度）、Checksum（校验字段）四个字段。[S4](#source-s4)
+2. [lwIP 2.1.x — UDP Raw API](https://www.nongnu.org/lwip/2_1_x/group__udp__raw.html)：用于先认识 `udp_new()`、`udp_bind()`、`udp_recv()` 与 `udp_sendto()` 这些公开 API；本文的源码事实仍以固定 commit 为准。[S8](#source-s8)
+3. [IANA — Service Name and Transport Protocol Port Number Registry](https://www.iana.org/assignments/service-names-port-numbers?search=echo)：用于确认示例使用的 UDP port 7 注册名为 `echo`。[S7](#source-s7)
+4. [Cloudflare — 什么是 UDP？](https://www.cloudflare.com/zh-cn/learning/ddos/glossary/user-datagram-protocol-udp/)：第一次接触 UDP 时，可用于快速理解“无连接、datagram、可靠性由上层决定”的整体边界。[S6](#source-s6)
+
+## 先建立 UDP Echo 的协议模型
+
+### Datagram、endpoint 与 port 分别是什么
+
+UDP 的基本数据单位是 **datagram**。一个 datagram 由 8-byte UDP Header 加应用 payload 组成；`Length` 表示 UDP Header 与 payload 的总长度，`Checksum` 用于检测传输中的数据损坏。[S4](#source-s4)
+
+UDP **endpoint（端点）**可以理解为“IP 地址 + UDP port”。Port 是 UDP Header 中的 16-bit 端口号，用来把到达同一台主机的 datagram 分发给不同应用端点。对本例最重要的是方向：
+
+| UDP Header 字段 | 谁填写 | 接收端如何使用 |
+| --- | --- | --- |
+| Source Port | 发送端 | 回包时作为目标 port；若 PCB 绑定了特定远端 endpoint，还会参与远端匹配 |
+| Destination Port | 发送端 | 选择本地 UDP endpoint；本例最终匹配 `pcb->local_port == 7` |
+| Length | 发送端 | 描述当前 UDP datagram 的总长度 |
+| Checksum | 发送端 | 校验 UDP 伪首部（由 IP 源/目标地址、协议号等组成且不作为额外字节在线上传输）、UDP Header 与 payload；当前正文只关注 lwIP 在 RX/TX 路径中的验证与生成位置 |
+
+这里的 **PCB（Protocol Control Block，协议控制块）**是 lwIP Core 保存一个协议端点运行时状态的对象。UDP 的 `struct udp_pcb` 记录 local/remote IP、local/remote port、flags 和接收 callback；它不是 packet buffer，也不是 Socket API 的整数 fd。[S2](#source-s2)
+
+**`pbuf`（packet buffer）**是 Stage 3 已经建立的 packet 数据与元数据容器；本篇只关心 UDP 如何改变 `p->payload` 的数据视图以及 callback 最终由谁释放 RX `pbuf`。
+
+### 为什么 UDP Echo 不需要三次握手
+
+UDP 是无连接协议。Host 不需要先和 lwIP 建立 UDP connection，就可以直接发送 datagram。假设 Host 使用一个临时源端口 `53000`，目标是 `198.18.0.200:7`：
+
+```text
+Host endpoint              lwIP Echo endpoint
+198.18.0.1:53000  ------>  198.18.0.200:7
+                    UDP datagram
+```
+
+IPv4 层先根据 `Protocol = 17` 把 payload 交给 UDP；UDP 再根据 Destination Port、目标 IP 以及 PCB 的连接属性选择接收 PCB。Echo callback 收到 payload 后，以原 packet 的 Source IP/Source Port 作为回包目标，因此 Echo Reply 返回 `198.18.0.1:53000`。[S2](#source-s2)[S3](#source-s3)
+
+这条最小成功交互可以先画成纯协议流程：
+
+```mermaid
+sequenceDiagram
+    participant H as Host 198.18.0.1:53000
+    participant U as lwIP UDP endpoint 198.18.0.200:7
+
+    H->>U: UDP datagram, SrcPort=53000, DstPort=7
+    Note over U: 按目标 IP/port 匹配 PCB，移除 UDP Header
+    U-->>H: UDP Echo Reply, SrcPort=7, DstPort=53000
+```
+
+### 协议动作怎样映射到 lwIP 源码
+
+| 协议阶段 | 协议对象/动作 | lwIP 实现位置 | 关键对象 | 完成后的下一步 |
+| --- | --- | --- | --- | --- |
+| 建立本地端点 | 绑定本地 UDP port 7 | `udp_new_ip_type()` → `udp_bind()` | `struct udp_pcb` | 注册 RX callback |
+| 等待 datagram | 保存接收处理函数 | `udp_recv()` | `pcb->recv` / `recv_arg` | packet 到达后由 Core 调用 |
+| IPv4 分发 | `Protocol = 17` | `ip4_input()` → `udp_input()` | RX `pbuf` | 解析 UDP Header |
+| UDP 分发 | Destination Port / IP / connected 条件匹配 | `udp_input()` | `udp_pcbs` 链表 | 选出接收 PCB |
+| 应用接收 | payload 交给 Echo callback | `pcb->recv()` → `udpecho_raw_recv()` | RX `pbuf` | 调用 `udp_sendto()` |
+| Echo TX | 构造新的 UDP Header 并进入 IP output | `udp_sendto()` | 同一 RX payload + TX Header | 返回 Host 后释放 RX pbuf 引用 |
+
+下面进入真实入口 `udpecho_raw_init()`，并按这张表的执行顺序逐步下钻。
 
 ## 1. Raw API 的第一个真实入口：`udpecho_raw_init()`
 
@@ -33,9 +100,9 @@ flowchart LR
     E --> F["保存 RX callback + callback arg"]
 ```
 
-这里第一次出现 PCB。PCB = Protocol Control Block，可以理解为 lwIP Core 为一个协议端点保存的运行时控制对象。对 UDP 来说，它记录 local/remote IP、port、flags 和接收 callback 等状态。[S2](#source-s2)
+前面的协议模型已经定义 PCB。进入实现后，这个抽象具体落在 `struct udp_pcb`，其中保存 local/remote IP、port、flags 和接收 callback 等状态。[S2](#source-s2)
 
-PCB 不是 socket fd，也不是 packet buffer：
+再次把三个容易混淆的对象放在一起：
 
 | 对象 | 生命周期 | 主要内容 |
 | --- | --- | --- |
@@ -56,19 +123,11 @@ Raw API 直接操作 PCB，所以应用代码必须遵守 lwIP Core 的线程上
 
 一个 UDP endpoint 可以连续接收很多 pbuf，但通常只对应一个长期存在的 PCB。
 
-## 3. `udp_bind()`：为什么 port 7 会成为 RX 匹配条件
+## 3. `udp_bind()`：把标准 UDP Destination Port 映射成 PCB 条件
 
-`udp_bind(pcb, IP_ANY_TYPE, 7)` 把 PCB 的 local endpoint 配置成“任意本地地址 + UDP port 7”。[S2](#source-s2)
+`udp_bind(pcb, IP_ANY_TYPE, 7)` 把 PCB 的 local endpoint 配置成“任意本地地址 + UDP port 7”。[S2](#source-s2) IANA 注册表中 port 7 的 UDP service name 是 `echo`，这正是 upstream 示例选择该端口的背景。[S7](#source-s7)
 
-这里的 port 是 L4 的 16-bit 端口号，用来区分同一个 IP 上的不同 UDP endpoint。它和 Ethernet MAC、IPv4 address 是不同层次：
-
-```text
-L2: MAC address
-L3: IPv4 address
-L4: UDP port
-```
-
-因此一个 Host 可以把多个 UDP datagram 都发到 `198.18.0.200`，再通过 destination port 决定由哪个 UDP PCB 接收。
+在前面的协议模型里，Destination Port 负责选择接收端点；在 lwIP 中，这个标准语义进一步落实为 `udp_input()` 对 `pcb->local_port` 的匹配条件。
 
 ## 4. `udp_recv()` 并不收包，它只是注册 callback
 
@@ -90,6 +149,8 @@ L4: UDP port
 Raw API 是 callback 模型，不是“应用线程阻塞在 recv()”模型。Stage 6 的 Netconn 会专门改变这一点。
 
 ## 5. 一个 UDP datagram 怎样走到 `udp_input()`
+
+到这里完成的是协议总流程中的“本地 endpoint 已建立并注册 callback”。现在协议从初始化阶段转入 RX：Host 真正发送 datagram，下面继续追它怎样进入 UDP Core。
 
 Host 发送到 `198.18.0.200:7` 后，前半段仍然是：[S3](#source-s3)
 
@@ -117,16 +178,9 @@ p->payload -> UDP Header
 
 ## 6. `udp_input()` 到底怎样找到应该调用哪个 PCB callback
 
-最基本的 UDP Header 是：[S4](#source-s4)
+前面的协议模型已经说明 UDP Header 的四个字段。进入 `udp_input()` 后，当前分发首先依赖 Source Port 与 Destination Port；下面直接看这两个字段怎样进入 PCB 匹配。[S4](#source-s4)
 
-```text
-Source Port
-Destination Port
-Length
-Checksum
-```
-
-这里最容易产生一个误解：**不是 TAP RX thread 自己拿 UDP destination port 去找 callback。** 当前 `LWIP_TCPIP_CORE_LOCKING_INPUT=0` 路径中，TAP/driver RX context 只负责把 `pbuf` 经 `tcpip_input()` 投递进 `tcpip_mbox`；真正运行 `ethernet_input() -> ip4_input() -> udp_input()` 的是 `tcpip_thread`。[S3](#source-s3)
+这里最容易产生一个实现层误解：**不是 TAP RX thread 自己拿 UDP Destination Port 去找 callback。** 当前 `LWIP_TCPIP_CORE_LOCKING_INPUT=0` 路径中，TAP/driver RX context 只负责把 `pbuf` 经 `tcpip_input()` 投递进 `tcpip_mbox`；真正运行 `ethernet_input() -> ip4_input() -> udp_input()` 的是 `tcpip_thread`。[S3](#source-s3)
 
 因此本节讨论的 PCB 查找实际发生在：
 
@@ -411,6 +465,8 @@ udp_sendto(pcb, p, ...)
 
 ## 9. Echo TX：UDP Header 在哪里加回来
 
+协议总流程已经完成 RX 分发并进入 Echo callback；现在从接收方向切换到回包方向。callback 把原发送端地址和 Source Port 作为目标交给 `udp_sendto()`，下面继续追 UDP Header 如何重新构造。
+
 `udp_sendto()` 进入 UDP Core 后，会选择 source address/interface、准备 checksum，然后为 UDP Header 腾出空间并填写 source port、destination port、length/checksum，最后进入 IP output。[S2](#source-s2)
 
 因此 callback 传入时：
@@ -505,3 +561,28 @@ Stage 6 会从同一个 UDP Echo 问题出发，改用 Netconn：application thr
 - URL/文档：[`contrib/examples/example_app/lwipopts.h`](https://github.com/lwip-tcpip/lwip/blob/d08f4773edd0182b7910fc8f046eed82ffcd67c9/contrib/examples/example_app/lwipopts.h)
 - 使用位置：当前 `NO_SYS`、UDP 和 Core threading 配置
 - 支撑内容：限定本文描述的是当前 Unix `example_app` 构建，而不是所有 lwIP Port 的唯一线程模型
+
+<a id="source-s6"></a>
+### [S6] Cloudflare UDP 入门资料
+- 类型：公开技术学习资料
+- URL/文档：[Cloudflare — 什么是 UDP？](https://www.cloudflare.com/zh-cn/learning/ddos/glossary/user-datagram-protocol-udp/)
+- 使用位置：“阅读源码前”、UDP 协议模型
+- 支撑内容：提供面向初学者的 UDP 无连接 datagram 与可靠性边界补充说明；正文仍独立建立当前源码所需的协议模型
+
+<a id="source-s7"></a>
+### [S7] IANA Service Name and Transport Protocol Port Number Registry
+- 类型：IANA 官方注册表
+- 版本：访问时注册表（2026-09-30 更新）
+- URL/文档：[IANA — echo service / port 7](https://www.iana.org/assignments/service-names-port-numbers?search=echo)
+- 使用位置：`udp_bind(..., 7)`
+- 支撑内容：确认 `echo` 同时注册于 TCP/UDP port 7；本文据此解释 upstream Raw UDP Echo 示例为何绑定本地 UDP port 7
+
+
+
+<a id="source-s8"></a>
+### [S8] lwIP 官方 UDP Raw API 文档
+- 类型：lwIP 官方 Doxygen 文档
+- 版本：2.1.x 文档；正文源码事实以固定 commit `d08f4773edd0182b7910fc8f046eed82ffcd67c9` 为准
+- URL/文档：[lwIP — UDP Raw API](https://www.nongnu.org/lwip/2_1_x/group__udp__raw.html)
+- 使用位置：“阅读源码前”、公开 API 导航
+- 支撑内容：说明 `udp_new()`、`udp_bind()`、`udp_recv()`、`udp_sendto()` 属于 lwIP UDP Raw API；具体执行链由 [S1]～[S3] 的目标源码证明
